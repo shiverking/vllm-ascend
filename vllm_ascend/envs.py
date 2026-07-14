@@ -114,9 +114,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
     # Experimental, non-sensitive switch for the AscendC QKV split + Q/K RMSNorm
     # + MRoPE kernel. 0 (default): use the existing Triton kernel. 1: use the
-    # AscendC kernel for supported BF16 MRoPE inputs and fall back to Triton for
-    # unsupported inputs. This is intended for operator development and
-    # performance comparison on Ascend 910B/C hardware.
+    # AscendC kernel for supported MRoPE inputs and fall back to Triton for
+    # unsupported inputs. Valid input dtypes are FP16 on Ascend 310P and FP16 or
+    # BF16 on Ascend 910B/C. This is intended for operator development and
+    # performance comparison; it does not contain sensitive data.
     "VLLM_ASCEND_ENABLE_ASCENDC_MROPE": lambda: bool(
         int(os.getenv("VLLM_ASCEND_ENABLE_ASCENDC_MROPE", "0"))
     ),

@@ -7,9 +7,9 @@ positions/cos_sin_cache gather + split QKV + Q/K RMSNorm + MRoPE
 ```
 
 The implementation is intentionally opt-in and keeps the existing Triton kernel as a fallback.
-The first version supports the Qwen3-ASR BF16 path: no Q/K bias, no gate, a contiguous
-`positions` tensor with shape `[3, num_tokens]`, and head/rope dimensions that are multiples
-of 16 and no larger than 256.
+The first version supports Qwen3-ASR with FP16 inputs on Ascend 310P and FP16 or BF16 inputs
+on Ascend 910B/C: no Q/K bias, no gate, a contiguous `positions` tensor with shape
+`[3, num_tokens]`, and head/rope dimensions that are multiples of 16 and no larger than 256.
 
 ## Build
 
@@ -23,6 +23,17 @@ export COMPILE_CUSTOM_KERNELS=1
 export SOC_VERSION=ascend910b1
 pip install --no-build-isolation -v -e .
 ```
+
+For Atlas 300I/310P3, use the lowercase value expected by this repository:
+
+```bash
+export SOC_VERSION=ascend310p3
+export COMPILE_CUSTOM_KERNELS=1
+pip install --no-build-isolation -v -e .
+```
+
+The 310P build continues to exclude the other generic kernels that are not supported there;
+it compiles only the FP16 MRoPE experimental kernel into `vllm_ascend_kernels`.
 
 Verify registration before starting a model:
 
@@ -50,6 +61,12 @@ python tools/ascendc_mrope_probe.py --num-tokens 128
 python tools/ascendc_mrope_probe.py --num-tokens 1024
 ```
 
+The probe automatically selects FP16 on 310P. It can also be selected explicitly:
+
+```bash
+python tools/ascendc_mrope_probe.py --dtype float16 --num-tokens 128
+```
+
 The probe compares outputs with Triton and reports latency for Triton (including the external
 cache gather) and AscendC (with gather inside the kernel).
 
@@ -62,10 +79,17 @@ export VLLM_ASCEND_ENABLE_ASCENDC_MROPE=1
 vllm serve <Qwen3-ASR-model-path> --dtype bfloat16
 ```
 
+Use FP16 on 310P:
+
+```bash
+export VLLM_ASCEND_ENABLE_ASCENDC_MROPE=1
+vllm serve <Qwen3-ASR-model-path> --dtype float16
+```
+
 On the first actual call, the server log must contain:
 
 ```text
-Using experimental AscendC split QKV + Q/K RMSNorm + MRoPE kernel.
+Using experimental AscendC split QKV + Q/K RMSNorm + MRoPE kernel with torch.float16 inputs.
 ```
 
 If an input is unsupported or the extension was not rebuilt, the log contains:
@@ -81,7 +105,7 @@ unset VLLM_ASCEND_ENABLE_ASCENDC_MROPE
 ```
 
 For profiling, collect an msprof or torch-npu profiler trace and search for
-`npu_split_qkv_rmsnorm_mrope` or `split_qkv_rmsnorm_mrope_kernel`. Confirm that
+`npu_split_qkv_rmsnorm_mrope` or `split_qkv_rmsnorm_mrope_fp16_kernel`. Confirm that
 `triton_split_qkv_rmsnorm_mrope` is absent from the same Qwen3 attention path when the AscendC
 branch is active.
 

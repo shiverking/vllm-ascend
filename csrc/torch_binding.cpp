@@ -420,8 +420,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
     int64_t rope_dim)
 {
     TORCH_CHECK(qkv.dim() == 2, "qkv must be a 2D tensor");
-    TORCH_CHECK(qkv.scalar_type() == at::kBFloat16,
-                "experimental AscendC MRoPE kernel currently supports bfloat16 only");
+    TORCH_CHECK(qkv.scalar_type() == at::kHalf || qkv.scalar_type() == at::kBFloat16,
+                "experimental AscendC MRoPE kernel supports float16 and bfloat16 only");
+#ifdef ASCEND_PLATFORM_310P
+    TORCH_CHECK(qkv.scalar_type() == at::kHalf,
+                "experimental AscendC MRoPE kernel supports float16 only on Ascend 310P");
+#endif
     TORCH_CHECK(q_weight.scalar_type() == qkv.scalar_type() &&
                 k_weight.scalar_type() == qkv.scalar_type() &&
                 cos_sin_cache.scalar_type() == qkv.scalar_type(),
@@ -488,11 +492,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
     const uint32_t section_h = static_cast<uint32_t>(mrope_section[1]);
     const uint32_t section_w = static_cast<uint32_t>(mrope_section[2]);
     const uint32_t total_work = static_cast<uint32_t>(num_tokens * (num_q_heads + 2 * num_kv_heads));
+    const AscendType input_type = get_dtype_from_torch(qkv.scalar_type());
 
     at_npu::native::OpCommand cmd;
     cmd.Name("npu_split_qkv_rmsnorm_mrope");
     cmd.SetCustomHandler([
-        stream, qkv_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr,
+        input_type, stream, qkv_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr,
         positions_ptr, q_out_ptr, k_out_ptr, v_out_ptr, num_tokens,
         num_q_heads, num_kv_heads, head_size, rope_dim, epsilon, section_t,
         section_h, section_w, is_interleaved, total_work,
@@ -508,7 +513,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
             : static_cast<uint32_t>(aiv_num);
 
         split_qkv_rmsnorm_mrope_impl(
-            stream, qkv_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr,
+            input_type, stream, qkv_ptr, q_weight_ptr, k_weight_ptr, cos_sin_cache_ptr,
             positions_ptr, q_out_ptr, k_out_ptr, v_out_ptr,
             static_cast<uint32_t>(num_tokens), static_cast<uint32_t>(max_positions),
             static_cast<uint32_t>(num_q_heads), static_cast<uint32_t>(num_kv_heads),

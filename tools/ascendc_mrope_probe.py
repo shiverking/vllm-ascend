@@ -7,7 +7,7 @@ from collections.abc import Callable
 import torch
 
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import enable_custom_op, is_310p
 
 
 def timed_ms(fn: Callable[[], object], warmup: int, iterations: int) -> float:
@@ -31,7 +31,20 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iterations", type=int, default=100)
     parser.add_argument("--interleaved", action="store_true")
+    parser.add_argument(
+        "--dtype",
+        choices=("auto", "float16", "bfloat16"),
+        default="auto",
+        help="auto selects float16 on 310P and bfloat16 on other Ascend devices",
+    )
     args = parser.parse_args()
+
+    dtype_name = "float16" if args.dtype == "auto" and is_310p() else args.dtype
+    if dtype_name == "auto":
+        dtype_name = "bfloat16"
+    if is_310p() and dtype_name == "bfloat16":
+        raise ValueError("Ascend 310P supports only float16 in this experimental kernel")
+    dtype = torch.float16 if dtype_name == "float16" else torch.bfloat16
 
     if not enable_custom_op() or not hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope"):
         raise RuntimeError(
@@ -50,15 +63,15 @@ def main() -> None:
     qkv = torch.randn(
         args.num_tokens,
         q_size + 2 * kv_size,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="npu",
     )
-    q_weight = torch.randn(args.head_size, dtype=torch.bfloat16, device="npu")
-    k_weight = torch.randn(args.head_size, dtype=torch.bfloat16, device="npu")
+    q_weight = torch.randn(args.head_size, dtype=dtype, device="npu")
+    k_weight = torch.randn(args.head_size, dtype=dtype, device="npu")
     cos_sin_cache = torch.randn(
         args.max_positions,
         rope_dim,
-        dtype=torch.bfloat16,
+        dtype=dtype,
         device="npu",
     )
     positions = torch.randint(
@@ -109,13 +122,13 @@ def main() -> None:
         torch.testing.assert_close(
             ascendc_output,
             triton_output,
-            atol=0 if name == "v" else 2e-2,
-            rtol=0 if name == "v" else 2e-2,
+            atol=0 if name == "v" else (3e-2 if dtype == torch.float16 else 2e-2),
+            rtol=0 if name == "v" else (3e-2 if dtype == torch.float16 else 2e-2),
         )
 
     triton_ms = timed_ms(run_triton, args.warmup, args.iterations)
     ascendc_ms = timed_ms(run_ascendc, args.warmup, args.iterations)
-    print("AscendC operator is registered and produced matching outputs.")
+    print(f"AscendC operator is registered and produced matching {dtype_name} outputs.")
     print(f"Triton (including cache gather): {triton_ms:.4f} ms")
     print(f"AscendC (gather fused):          {ascendc_ms:.4f} ms")
     print(f"Speedup:                         {triton_ms / ascendc_ms:.3f}x")

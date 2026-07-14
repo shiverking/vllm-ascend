@@ -15,6 +15,7 @@
  */
 
 #include "kernel_operator.h"
+#include "types.h"
 
 using namespace AscendC;
 
@@ -22,6 +23,7 @@ namespace {
 
 constexpr uint32_t BYTES_PER_BLOCK = 32;
 
+template <typename T>
 class SplitQkvRmsNormMropeKernel {
 public:
     __aicore__ inline SplitQkvRmsNormMropeKernel() = default;
@@ -68,28 +70,28 @@ public:
         workPerToken_ = numQHeads_ + 2 * numKvHeads_;
         totalWork_ = numTokens_ * workPerToken_;
 
-        qkvGlobal_.SetGlobalBuffer(static_cast<__gm__ bfloat16_t*>(qkv), numTokens_ * qkvStride_);
-        qWeightGlobal_.SetGlobalBuffer(static_cast<__gm__ bfloat16_t*>(qWeight), headSize_);
-        kWeightGlobal_.SetGlobalBuffer(static_cast<__gm__ bfloat16_t*>(kWeight), headSize_);
+        qkvGlobal_.SetGlobalBuffer(static_cast<__gm__ T*>(qkv), numTokens_ * qkvStride_);
+        qWeightGlobal_.SetGlobalBuffer(static_cast<__gm__ T*>(qWeight), headSize_);
+        kWeightGlobal_.SetGlobalBuffer(static_cast<__gm__ T*>(kWeight), headSize_);
         cosSinCacheGlobal_.SetGlobalBuffer(
-            static_cast<__gm__ bfloat16_t*>(cosSinCache), maxPositions_ * ropeDim_);
+            static_cast<__gm__ T*>(cosSinCache), maxPositions_ * ropeDim_);
         positionsGlobal_.SetGlobalBuffer(static_cast<__gm__ int64_t*>(positions), 3 * numTokens_);
-        qOutGlobal_.SetGlobalBuffer(static_cast<__gm__ bfloat16_t*>(qOut), numTokens_ * qSize_);
-        kOutGlobal_.SetGlobalBuffer(static_cast<__gm__ bfloat16_t*>(kOut), numTokens_ * kvSize_);
-        vOutGlobal_.SetGlobalBuffer(static_cast<__gm__ bfloat16_t*>(vOut), numTokens_ * kvSize_);
+        qOutGlobal_.SetGlobalBuffer(static_cast<__gm__ T*>(qOut), numTokens_ * qSize_);
+        kOutGlobal_.SetGlobalBuffer(static_cast<__gm__ T*>(kOut), numTokens_ * kvSize_);
+        vOutGlobal_.SetGlobalBuffer(static_cast<__gm__ T*>(vOut), numTokens_ * kvSize_);
 
-        alignedHeadSize_ = AlignElements(headSize_, sizeof(bfloat16_t));
-        alignedRopeDim_ = AlignElements(ropeDim_, sizeof(bfloat16_t));
+        alignedHeadSize_ = AlignElements(headSize_, sizeof(T));
+        alignedRopeDim_ = AlignElements(ropeDim_, sizeof(T));
 
-        pipe_.InitBuffer(inputBuf_, alignedHeadSize_ * sizeof(bfloat16_t));
-        pipe_.InitBuffer(weightBuf_, alignedHeadSize_ * sizeof(bfloat16_t));
+        pipe_.InitBuffer(inputBuf_, alignedHeadSize_ * sizeof(T));
+        pipe_.InitBuffer(weightBuf_, alignedHeadSize_ * sizeof(T));
         pipe_.InitBuffer(weightFloatBuf_, alignedHeadSize_ * sizeof(float));
         pipe_.InitBuffer(normalizedBuf_, alignedHeadSize_ * sizeof(float));
         pipe_.InitBuffer(rotatedBuf_, alignedHeadSize_ * sizeof(float));
-        pipe_.InitBuffer(outputBuf_, alignedHeadSize_ * sizeof(bfloat16_t));
-        pipe_.InitBuffer(tCacheBuf_, alignedRopeDim_ * sizeof(bfloat16_t));
-        pipe_.InitBuffer(hCacheBuf_, alignedRopeDim_ * sizeof(bfloat16_t));
-        pipe_.InitBuffer(wCacheBuf_, alignedRopeDim_ * sizeof(bfloat16_t));
+        pipe_.InitBuffer(outputBuf_, alignedHeadSize_ * sizeof(T));
+        pipe_.InitBuffer(tCacheBuf_, alignedRopeDim_ * sizeof(T));
+        pipe_.InitBuffer(hCacheBuf_, alignedRopeDim_ * sizeof(T));
+        pipe_.InitBuffer(wCacheBuf_, alignedRopeDim_ * sizeof(T));
         pipe_.InitBuffer(tCacheFloatBuf_, alignedRopeDim_ * sizeof(float));
         pipe_.InitBuffer(hCacheFloatBuf_, alignedRopeDim_ * sizeof(float));
         pipe_.InitBuffer(wCacheFloatBuf_, alignedRopeDim_ * sizeof(float));
@@ -124,9 +126,9 @@ private:
         const int64_t hPosition = positionsGlobal_.GetValue(numTokens_ + tokenIdx);
         const int64_t wPosition = positionsGlobal_.GetValue(2 * numTokens_ + tokenIdx);
 
-        LocalTensor<bfloat16_t> tCache = tCacheBuf_.Get<bfloat16_t>();
-        LocalTensor<bfloat16_t> hCache = hCacheBuf_.Get<bfloat16_t>();
-        LocalTensor<bfloat16_t> wCache = wCacheBuf_.Get<bfloat16_t>();
+        LocalTensor<T> tCache = tCacheBuf_.Get<T>();
+        LocalTensor<T> hCache = hCacheBuf_.Get<T>();
+        LocalTensor<T> wCache = wCacheBuf_.Get<T>();
 
         DataCopy(tCache, cosSinCacheGlobal_[tPosition * ropeDim_], alignedRopeDim_);
         DataCopy(hCache, cosSinCacheGlobal_[hPosition * ropeDim_], alignedRopeDim_);
@@ -172,17 +174,17 @@ private:
     }
 
     __aicore__ inline void NormalizeAndRotate(
-        GlobalTensor<bfloat16_t>& output,
+        GlobalTensor<T>& output,
         uint32_t inputOffset,
         uint32_t outputOffset,
         bool useQWeight)
     {
-        LocalTensor<bfloat16_t> input = inputBuf_.Get<bfloat16_t>();
-        LocalTensor<bfloat16_t> weight = weightBuf_.Get<bfloat16_t>();
+        LocalTensor<T> input = inputBuf_.Get<T>();
+        LocalTensor<T> weight = weightBuf_.Get<T>();
         LocalTensor<float> weightFloat = weightFloatBuf_.Get<float>();
         LocalTensor<float> normalized = normalizedBuf_.Get<float>();
         LocalTensor<float> rotatedOutput = rotatedBuf_.Get<float>();
-        LocalTensor<bfloat16_t> outputLocal = outputBuf_.Get<bfloat16_t>();
+        LocalTensor<T> outputLocal = outputBuf_.Get<T>();
 
         DataCopy(input, qkvGlobal_[inputOffset], alignedHeadSize_);
         if (useQWeight) {
@@ -254,7 +256,7 @@ private:
 
     __aicore__ inline void CopyVHead(uint32_t tokenIdx, uint32_t headIdx)
     {
-        LocalTensor<bfloat16_t> input = inputBuf_.Get<bfloat16_t>();
+        LocalTensor<T> input = inputBuf_.Get<T>();
         const uint32_t inputOffset = tokenIdx * qkvStride_ + qSize_ + kvSize_ + headIdx * headSize_;
         const uint32_t outputOffset = tokenIdx * kvSize_ + headIdx * headSize_;
         DataCopy(input, qkvGlobal_[inputOffset], alignedHeadSize_);
@@ -276,14 +278,14 @@ private:
     TBuf<TPosition::VECCALC> hCacheFloatBuf_;
     TBuf<TPosition::VECCALC> wCacheFloatBuf_;
 
-    GlobalTensor<bfloat16_t> qkvGlobal_;
-    GlobalTensor<bfloat16_t> qWeightGlobal_;
-    GlobalTensor<bfloat16_t> kWeightGlobal_;
-    GlobalTensor<bfloat16_t> cosSinCacheGlobal_;
+    GlobalTensor<T> qkvGlobal_;
+    GlobalTensor<T> qWeightGlobal_;
+    GlobalTensor<T> kWeightGlobal_;
+    GlobalTensor<T> cosSinCacheGlobal_;
     GlobalTensor<int64_t> positionsGlobal_;
-    GlobalTensor<bfloat16_t> qOutGlobal_;
-    GlobalTensor<bfloat16_t> kOutGlobal_;
-    GlobalTensor<bfloat16_t> vOutGlobal_;
+    GlobalTensor<T> qOutGlobal_;
+    GlobalTensor<T> kOutGlobal_;
+    GlobalTensor<T> vOutGlobal_;
 
     uint32_t numTokens_;
     uint32_t maxPositions_;
@@ -309,7 +311,8 @@ private:
 
 }  // namespace
 
-extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_kernel(
+template <typename T>
+__aicore__ inline void RunSplitQkvRmsNormMrope(
     __gm__ void* qkv,
     __gm__ void* qWeight,
     __gm__ void* kWeight,
@@ -331,7 +334,7 @@ extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_kernel(
     uint32_t isInterleaved,
     uint32_t blockDim)
 {
-    SplitQkvRmsNormMropeKernel op;
+    SplitQkvRmsNormMropeKernel<T> op;
     op.Init(qkv, qWeight, kWeight, cosSinCache, positions, qOut, kOut, vOut,
             numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
             epsilon, mropeSectionT, mropeSectionH, mropeSectionW, isInterleaved,
@@ -339,9 +342,70 @@ extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_kernel(
     op.Process();
 }
 
+extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_fp16_kernel(
+    __gm__ void* qkv,
+    __gm__ void* qWeight,
+    __gm__ void* kWeight,
+    __gm__ void* cosSinCache,
+    __gm__ void* positions,
+    __gm__ void* qOut,
+    __gm__ void* kOut,
+    __gm__ void* vOut,
+    uint32_t numTokens,
+    uint32_t maxPositions,
+    uint32_t numQHeads,
+    uint32_t numKvHeads,
+    uint32_t headSize,
+    uint32_t ropeDim,
+    float epsilon,
+    uint32_t mropeSectionT,
+    uint32_t mropeSectionH,
+    uint32_t mropeSectionW,
+    uint32_t isInterleaved,
+    uint32_t blockDim)
+{
+    RunSplitQkvRmsNormMrope<half>(
+        qkv, qWeight, kWeight, cosSinCache, positions, qOut, kOut, vOut,
+        numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
+        epsilon, mropeSectionT, mropeSectionH, mropeSectionW, isInterleaved,
+        blockDim);
+}
+
+#ifndef ASCEND_PLATFORM_310P
+extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_bf16_kernel(
+    __gm__ void* qkv,
+    __gm__ void* qWeight,
+    __gm__ void* kWeight,
+    __gm__ void* cosSinCache,
+    __gm__ void* positions,
+    __gm__ void* qOut,
+    __gm__ void* kOut,
+    __gm__ void* vOut,
+    uint32_t numTokens,
+    uint32_t maxPositions,
+    uint32_t numQHeads,
+    uint32_t numKvHeads,
+    uint32_t headSize,
+    uint32_t ropeDim,
+    float epsilon,
+    uint32_t mropeSectionT,
+    uint32_t mropeSectionH,
+    uint32_t mropeSectionW,
+    uint32_t isInterleaved,
+    uint32_t blockDim)
+{
+    RunSplitQkvRmsNormMrope<bfloat16_t>(
+        qkv, qWeight, kWeight, cosSinCache, positions, qOut, kOut, vOut,
+        numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
+        epsilon, mropeSectionT, mropeSectionH, mropeSectionW, isInterleaved,
+        blockDim);
+}
+#endif
+
 namespace vllm_ascend {
 
 void split_qkv_rmsnorm_mrope_impl(
+    AscendType type,
     void* stream,
     void* qkv,
     void* qWeight,
@@ -364,11 +428,23 @@ void split_qkv_rmsnorm_mrope_impl(
     bool isInterleaved,
     uint32_t blockDim)
 {
-    split_qkv_rmsnorm_mrope_kernel<<<blockDim, nullptr, stream>>>(
-        qkv, qWeight, kWeight, cosSinCache, positions, qOut, kOut, vOut,
-        numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
-        epsilon, mropeSectionT, mropeSectionH, mropeSectionW,
-        static_cast<uint32_t>(isInterleaved), blockDim);
+    if (type == AscendType::FP16) {
+        split_qkv_rmsnorm_mrope_fp16_kernel<<<blockDim, nullptr, stream>>>(
+            qkv, qWeight, kWeight, cosSinCache, positions, qOut, kOut, vOut,
+            numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
+            epsilon, mropeSectionT, mropeSectionH, mropeSectionW,
+            static_cast<uint32_t>(isInterleaved), blockDim);
+        return;
+    }
+#ifndef ASCEND_PLATFORM_310P
+    if (type == AscendType::BF16) {
+        split_qkv_rmsnorm_mrope_bf16_kernel<<<blockDim, nullptr, stream>>>(
+            qkv, qWeight, kWeight, cosSinCache, positions, qOut, kOut, vOut,
+            numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
+            epsilon, mropeSectionT, mropeSectionH, mropeSectionW,
+            static_cast<uint32_t>(isInterleaved), blockDim);
+    }
+#endif
 }
 
 }  // namespace vllm_ascend

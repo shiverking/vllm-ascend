@@ -73,7 +73,11 @@ if(SOC_VERSION MATCHES "ascend950")
 endif()
 
 if(SOC_VERSION MATCHES "ascend310p.*")
-    message(STATUS "310P hardware detected: skip vllm_ascend_kernels compile")
+    message(STATUS "310P hardware detected: compile the FP16 MRoPE experimental kernel only")
+    ascendc_library(vllm_ascend_kernels SHARED
+        ${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/split_qkv_rmsnorm_mrope.cpp
+    )
+    target_compile_definitions(vllm_ascend_kernels PRIVATE ASCEND_PLATFORM_310P)
 else()
     ascendc_library(vllm_ascend_kernels SHARED
         ${VLLM_ASCEND_CUSTOM_OP}
@@ -183,25 +187,13 @@ set(VLLM_ASCEND_C_COMMON_LIBS
   opapi
 )
 
-if(SOC_VERSION MATCHES "ascend310p.*")
-  target_link_libraries(
-    vllm_ascend_C
-    PUBLIC
-    ${VLLM_ASCEND_C_COMMON_LIBS}
-  )
-else()
-  target_link_libraries(
-    vllm_ascend_C
-    PUBLIC
-    vllm_ascend_kernels
-    ${VLLM_ASCEND_C_COMMON_LIBS}
-  )
-endif()
+target_link_libraries(
+  vllm_ascend_C
+  PUBLIC
+  vllm_ascend_kernels
+  ${VLLM_ASCEND_C_COMMON_LIBS}
+)
 
 target_link_options(vllm_ascend_C PRIVATE "-Wl,-rpath,$ORIGIN:$ORIGIN/lib:$ORIGIN/_cann_ops_custom/vendors/vllm-ascend/op_api/lib")
 
-if(SOC_VERSION MATCHES "ascend310p.*")
-  install(TARGETS vllm_ascend_C DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
-else()
-  install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})
-endif()
+install(TARGETS vllm_ascend_C vllm_ascend_kernels DESTINATION ${VLLM_ASCEND_INSTALL_PATH})

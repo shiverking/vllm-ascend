@@ -2,12 +2,13 @@ import pytest
 import torch
 
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import enable_custom_op, is_310p
 
 enable_custom_op()
 
-ATOL = 2e-2
-RTOL = 2e-2
+DTYPE = torch.float16 if is_310p() else torch.bfloat16
+ATOL = 3e-2 if DTYPE == torch.float16 else 2e-2
+RTOL = 3e-2 if DTYPE == torch.float16 else 2e-2
 
 
 @pytest.mark.parametrize("num_tokens", [1, 17, 129])
@@ -35,15 +36,15 @@ def test_ascendc_split_qkv_rmsnorm_mrope_matches_triton(
     qkv = torch.randn(
         num_tokens,
         q_size + 2 * kv_size,
-        dtype=torch.bfloat16,
+        dtype=DTYPE,
         device="npu",
     )
-    q_weight = torch.randn(head_size, dtype=torch.bfloat16, device="npu")
-    k_weight = torch.randn(head_size, dtype=torch.bfloat16, device="npu")
+    q_weight = torch.randn(head_size, dtype=DTYPE, device="npu")
+    k_weight = torch.randn(head_size, dtype=DTYPE, device="npu")
     cos_sin_cache = torch.randn(
         max_positions,
         rope_dim,
-        dtype=torch.bfloat16,
+        dtype=DTYPE,
         device="npu",
     )
     positions = torch.randint(

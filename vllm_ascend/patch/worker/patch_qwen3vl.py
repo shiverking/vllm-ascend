@@ -11,7 +11,7 @@ from vllm.model_executor.models.qwen3_vl import (
 from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
-from vllm_ascend.utils import enable_custom_op, vllm_version_is
+from vllm_ascend.utils import enable_custom_op, is_310p, vllm_version_is
 
 logger = init_logger(__name__)
 
@@ -40,9 +40,12 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
     qkv, _ = self.qkv_proj(hidden_states)
     if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
         cos_sin_cache = self.rotary_emb.cos_sin_cache
+        dtype_supported = qkv.dtype == torch.float16 or (
+            qkv.dtype == torch.bfloat16 and not is_310p()
+        )
         if (
             envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
-            and qkv.dtype == torch.bfloat16
+            and dtype_supported
             and (cos_sin_cache.device != qkv.device or cos_sin_cache.dtype != qkv.dtype)
         ):
             # Materialize the full cache once so the AscendC kernel can gather
@@ -53,7 +56,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             cos_sin_cache = self.rotary_emb.cos_sin_cache
         use_ascendc = (
             envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
-            and qkv.dtype == torch.bfloat16
+            and dtype_supported
             and positions.dtype == torch.int64
             and positions.ndim == 2
             and positions.shape[0] == 3
@@ -69,7 +72,9 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
         )
         if use_ascendc:
             logger.info_once(
-                "Using experimental AscendC split QKV + Q/K RMSNorm + MRoPE kernel."
+                "Using experimental AscendC split QKV + Q/K RMSNorm + MRoPE kernel "
+                "with %s inputs.",
+                qkv.dtype,
             )
             q, k, v = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
                 qkv,

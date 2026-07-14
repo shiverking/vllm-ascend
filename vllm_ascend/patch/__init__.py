@@ -750,7 +750,7 @@
 #    How：
 #       Override forward when using MRoPE. Triton remains the default and
 #       fallback; VLLM_ASCEND_ENABLE_ASCENDC_MROPE=1 selects the AscendC path
-#       for supported BF16 inputs.
+#       for supported inputs (FP16 on 310P; FP16 or BF16 on 910B/C).
 #    Future Plan:
 #       Remove this patch when vllm-ascend pattern matching supports both the
 #       MRoPE computation and positions/cache gather fusion.
