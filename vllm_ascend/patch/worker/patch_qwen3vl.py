@@ -1,5 +1,6 @@
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
+from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeAttention
 from vllm.model_executor.models.qwen3_vl import (
@@ -8,8 +9,12 @@ from vllm.model_executor.models.qwen3_vl import (
     pos_embed_interpolate_native,
 )
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
+from vllm_ascend.utils import enable_custom_op, is_310p
+
+logger = init_logger(__name__)
 
 
 def tensor_parallel_wrap(func):
@@ -35,24 +40,47 @@ def tensor_parallel_wrap(func):
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
     if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
-        cos_sin = self.rotary_emb.cos_sin_cache[positions]
-        if cos_sin.device != qkv.device:
-            cos_sin = cos_sin.to(qkv.device)
-        if cos_sin.dtype != qkv.dtype:
-            cos_sin = cos_sin.to(qkv.dtype)
-        q, k, v, _ = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
-            qkv=qkv,
-            q_weight=self.q_norm.weight,
-            k_weight=self.k_norm.weight,
-            cos_sin=cos_sin,
-            num_q_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            head_size=self.head_dim,
-            eps=self.q_norm.variance_epsilon,
-            mrope_section=self.rotary_emb.mrope_section,
-            is_interleaved=self.rotary_emb.mrope_interleaved,
-            rope_dim=self.rotary_emb.rotary_dim,
+        cache = self.rotary_emb.cos_sin_cache
+        dtype_supported = qkv.dtype == torch.float16 or (qkv.dtype == torch.bfloat16 and not is_310p())
+        if envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE and dtype_supported and (
+            cache.device != qkv.device or cache.dtype != qkv.dtype
+        ):
+            self.rotary_emb.cos_sin_cache = cache.to(device=qkv.device, dtype=qkv.dtype)
+            cache = self.rotary_emb.cos_sin_cache
+        use_ascendc = (
+            envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
+            and dtype_supported
+            and positions.dtype == torch.int64
+            and positions.ndim == 2
+            and positions.shape[0] == 3
+            and all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache, positions))
+            and cache.device == qkv.device
+            and cache.dtype == qkv.dtype
+            and enable_custom_op()
+            and hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope")
         )
+        if use_ascendc:
+            logger.info_once("Using experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
+            q, k, v = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
+                qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
+                self.num_heads, self.num_kv_heads, self.head_dim,
+                self.q_norm.variance_epsilon, self.rotary_emb.mrope_section,
+                self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
+            )
+        elif is_310p():
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q = self.q_norm(q.view(*q.shape[:-1], self.num_heads, self.head_dim)).view(q.shape)
+            k = self.k_norm(k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)).view(k.shape)
+            q, k = self.rotary_emb(positions, q, k)
+        else:
+            cos_sin = cache[positions].to(device=qkv.device, dtype=qkv.dtype)
+            q, k, v, _ = torch.ops.vllm.triton_split_qkv_rmsnorm_mrope(
+                qkv=qkv, q_weight=self.q_norm.weight, k_weight=self.k_norm.weight,
+                cos_sin=cos_sin, num_q_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads, head_size=self.head_dim,
+                eps=self.q_norm.variance_epsilon, mrope_section=self.rotary_emb.mrope_section,
+                is_interleaved=self.rotary_emb.mrope_interleaved, rope_dim=self.rotary_emb.rotary_dim,
+            )
     else:
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)

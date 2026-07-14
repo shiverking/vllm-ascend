@@ -145,6 +145,8 @@ if not envs.SOC_VERSION:
             "You can also refer to the SOC_VERSION defaults in Dockerfile*."
         )
     envs.SOC_VERSION = soc_version
+else:
+    envs.SOC_VERSION = envs.SOC_VERSION.lower()
 
 
 def gen_build_info():
@@ -495,6 +497,8 @@ def get_requirements() -> list[str]:
         requirements = _read_requirements("requirements.txt")
     except ValueError:
         print("Failed to read requirements.txt in vllm_ascend.")
+    if envs.SOC_VERSION and envs.SOC_VERSION.lower().startswith("ascend310p"):
+        requirements = [requirement for requirement in requirements if not requirement.startswith("triton-ascend")]
     return requirements
 
 

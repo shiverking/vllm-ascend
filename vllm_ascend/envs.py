@@ -110,6 +110,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Experimental, non-sensitive MRoPE preprocessing kernel. 0: disabled;
+    # 1: enabled. Ascend 310P supports FP16 inputs only.
+    "VLLM_ASCEND_ENABLE_ASCENDC_MROPE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_ASCENDC_MROPE", "0"))
+    ),
 }
 
 # end-env-vars-definition

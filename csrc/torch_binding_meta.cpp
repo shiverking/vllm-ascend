@@ -37,6 +37,19 @@ namespace vllm_ascend {
 namespace meta {
 const int64_t INT4_NUMS_IN_INT32 = 8;
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> split_qkv_rmsnorm_mrope_meta(
+    const at::Tensor& qkv, const at::Tensor&, const at::Tensor&,
+    const at::Tensor&, const at::Tensor&, int64_t num_q_heads,
+    int64_t num_kv_heads, int64_t head_size, double, at::IntArrayRef,
+    bool, int64_t)
+{
+    auto num_tokens = qkv.sym_size(0);
+    return {
+        at::empty_symint({num_tokens, num_q_heads * head_size}, qkv.options()),
+        at::empty_symint({num_tokens, num_kv_heads * head_size}, qkv.options()),
+        at::empty_symint({num_tokens, num_kv_heads * head_size}, qkv.options())};
+}
+
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
     at::Tensor &input,
@@ -1638,6 +1651,7 @@ void store_kv_block(
 // Pybind on Ascend 310P
 namespace {
 TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
+    ops.impl("npu_split_qkv_rmsnorm_mrope", &vllm_ascend::meta::split_qkv_rmsnorm_mrope_meta);
     // causal_conv1d_310
     ops.impl("npu_causal_conv1d_310", &vllm_ascend::meta::npu_causal_conv1d_310_meta);
     // npu_recurrent_gated_delta_rule_310
@@ -1658,6 +1672,7 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("device_print_tensor", &vllm_ascend::meta::device_print_tensor_meta);
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel meta implementations
+    ops.impl("npu_split_qkv_rmsnorm_mrope", &vllm_ascend::meta::split_qkv_rmsnorm_mrope_meta);
     ops.impl("get_masked_input_and_mask", &vllm_ascend::meta::get_masked_input_and_mask_meta);
     // Bgmv expand
     ops.impl("bgmv_expand", &vllm_ascend::meta::bgmv_expand_meta);

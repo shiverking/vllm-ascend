@@ -417,6 +417,87 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
     return {masked_input, mask};
 }
 
+#if defined(ASCEND_PLATFORM_310P) || defined(VLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
+    const at::Tensor& qkv, const at::Tensor& q_weight,
+    const at::Tensor& k_weight, const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions, int64_t num_q_heads, int64_t num_kv_heads,
+    int64_t head_size, double epsilon, at::IntArrayRef mrope_section,
+    bool is_interleaved, int64_t rope_dim)
+{
+    TORCH_CHECK(qkv.dim() == 2, "qkv must be 2D");
+    TORCH_CHECK(qkv.scalar_type() == at::kHalf || qkv.scalar_type() == at::kBFloat16,
+                "qkv must be float16 or bfloat16");
+#ifdef ASCEND_PLATFORM_310P
+    TORCH_CHECK(qkv.scalar_type() == at::kHalf, "Ascend 310P supports float16 only");
+#endif
+    TORCH_CHECK(q_weight.scalar_type() == qkv.scalar_type() &&
+                k_weight.scalar_type() == qkv.scalar_type() &&
+                cos_sin_cache.scalar_type() == qkv.scalar_type(),
+                "qkv, weights, and cache must have the same dtype");
+    TORCH_CHECK(qkv.device() == q_weight.device() && qkv.device() == k_weight.device() &&
+                qkv.device() == cos_sin_cache.device() && qkv.device() == positions.device(),
+                "all inputs must be on the same device");
+    TORCH_CHECK(qkv.is_contiguous() && q_weight.is_contiguous() &&
+                k_weight.is_contiguous() && cos_sin_cache.is_contiguous() &&
+                positions.is_contiguous(), "all inputs must be contiguous");
+    TORCH_CHECK(positions.scalar_type() == at::kLong && positions.dim() == 2 && positions.size(0) == 3,
+                "positions must be contiguous int64 with shape [3, num_tokens]");
+    TORCH_CHECK(cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0,
+                "cos_sin_cache must be 2D and non-empty");
+    TORCH_CHECK(num_q_heads > 0 && num_kv_heads > 0, "head counts must be positive");
+    TORCH_CHECK(head_size > 0 && head_size <= 256 && head_size % 16 == 0,
+                "head_size must be a multiple of 16 in [16, 256]");
+    TORCH_CHECK(rope_dim > 0 && rope_dim <= head_size && rope_dim % 16 == 0,
+                "rope_dim must be a multiple of 16 and no larger than head_size");
+    TORCH_CHECK(mrope_section.size() == 3 && mrope_section[0] >= 0 &&
+                mrope_section[1] >= 0 && mrope_section[2] >= 0 &&
+                mrope_section[0] + mrope_section[1] + mrope_section[2] == rope_dim / 2,
+                "mrope_section must contain three values summing to rope_dim / 2");
+
+    int64_t num_tokens = qkv.size(0);
+    int64_t q_size = num_q_heads * head_size;
+    int64_t kv_size = num_kv_heads * head_size;
+    TORCH_CHECK(num_tokens > 0 && qkv.size(1) == q_size + 2 * kv_size,
+                "invalid qkv shape");
+    TORCH_CHECK(q_weight.numel() == head_size && k_weight.numel() == head_size,
+                "RMSNorm weights must contain head_size elements");
+    TORCH_CHECK(positions.size(1) == num_tokens && cos_sin_cache.size(1) == rope_dim,
+                "positions or cache shape does not match qkv");
+
+    at::Tensor q_out = at::empty({num_tokens, q_size}, qkv.options());
+    at::Tensor k_out = at::empty({num_tokens, kv_size}, qkv.options());
+    at::Tensor v_out = at::empty({num_tokens, kv_size}, qkv.options());
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    AscendType type = get_dtype_from_torch(qkv.scalar_type());
+    uint32_t total_work = static_cast<uint32_t>(num_tokens * (num_q_heads + 2 * num_kv_heads));
+
+    at_npu::native::OpCommand cmd;
+    cmd.Name("npu_split_qkv_rmsnorm_mrope");
+    cmd.SetCustomHandler([=]() -> int {
+        int32_t device_id = 0;
+        int64_t core_num = 0;
+        TORCH_CHECK(aclrtGetDevice(&device_id) == ACL_SUCCESS, "failed to get NPU device");
+        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &core_num) == ACL_SUCCESS,
+                    "failed to get vector core count");
+        TORCH_CHECK(core_num > 0, "NPU vector core count must be positive");
+        uint32_t block_dim = std::min(total_work, static_cast<uint32_t>(core_num));
+        split_qkv_rmsnorm_mrope_impl(
+            type, stream, qkv.data_ptr(), q_weight.data_ptr(), k_weight.data_ptr(),
+            cos_sin_cache.data_ptr(), positions.data_ptr(), q_out.data_ptr(),
+            k_out.data_ptr(), v_out.data_ptr(), static_cast<uint32_t>(num_tokens),
+            static_cast<uint32_t>(cos_sin_cache.size(0)), static_cast<uint32_t>(num_q_heads),
+            static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size),
+            static_cast<uint32_t>(rope_dim), static_cast<float>(epsilon),
+            static_cast<uint32_t>(mrope_section[0]), static_cast<uint32_t>(mrope_section[1]),
+            static_cast<uint32_t>(mrope_section[2]), is_interleaved, block_dim);
+        return 0;
+    });
+    cmd.Run();
+    return {q_out, k_out, v_out};
+}
+#endif
+
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
 {
     at::ScalarType scalar_type = x.scalar_type();
@@ -2126,6 +2207,14 @@ std::vector<int64_t> get_npu_storage_shape(const at::Tensor& tensor)
 TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 {
     ops.def(
+        "npu_split_qkv_rmsnorm_mrope(Tensor qkv, Tensor q_weight, Tensor k_weight, "
+        "Tensor cos_sin_cache, Tensor positions, int num_q_heads, int num_kv_heads, "
+        "int head_size, float epsilon, int[] mrope_section, bool is_interleaved, int rope_dim) "
+        "-> (Tensor q, Tensor k, Tensor v)");
+    ops.impl("npu_split_qkv_rmsnorm_mrope", torch::kPrivateUse1,
+             &vllm_ascend::npu_split_qkv_rmsnorm_mrope);
+
+    ops.def(
         "npu_causal_conv1d_310(Tensor x, "
         "                         Tensor weight, "
         "                         Tensor? bias, "
@@ -2185,6 +2274,14 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
 #ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
     // Direct kernel custom ops
+    ops.def(
+        "npu_split_qkv_rmsnorm_mrope(Tensor qkv, Tensor q_weight, Tensor k_weight, "
+        "Tensor cos_sin_cache, Tensor positions, int num_q_heads, int num_kv_heads, "
+        "int head_size, float epsilon, int[] mrope_section, bool is_interleaved, int rope_dim) "
+        "-> (Tensor q, Tensor k, Tensor v)");
+    ops.impl("npu_split_qkv_rmsnorm_mrope", torch::kPrivateUse1,
+             &vllm_ascend::npu_split_qkv_rmsnorm_mrope);
+
     ops.def(
         "get_masked_input_and_mask(Tensor input, "
         "                         int org_vocab_start_index, "
