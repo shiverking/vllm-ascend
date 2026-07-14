@@ -743,12 +743,17 @@
 #   1. `vllm.model_executor.models.qwen3.Qwen3Attention.forward` and
 #      `vllm.model_executor.models.qwen3_moe.Qwen3MoeAttention.forward`
 #    Why:
-#       support triton_split_qkv_rmsnorm_mrope fused kernel for Qwen3Attention and Qwen3MoeAttention.
+#       Support fused QKV split, Q/K RMSNorm, and MRoPE kernels for
+#       Qwen3Attention and Qwen3MoeAttention. An opt-in experimental AscendC
+#       path also fuses the positions/cos_sin_cache gather for Qwen3-ASR
+#       operator development and benchmarking.
 #    How：
-#       override forward method with the triton_split_qkv_rmsnorm_mrope fused kernel,
-#       when using mrope.
+#       Override forward when using MRoPE. Triton remains the default and
+#       fallback; VLLM_ASCEND_ENABLE_ASCENDC_MROPE=1 selects the AscendC path
+#       for supported BF16 inputs.
 #    Future Plan:
-#       Remove this patch when vllm-ascend supports pattern matching for this fused kernel.
+#       Remove this patch when vllm-ascend pattern matching supports both the
+#       MRoPE computation and positions/cache gather fusion.
 # ** 29. File: worker/patch_qwen3_dflash.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 #   1. `vllm.model_executor.models.qwen3_dflash.DFlashQwen3Model.precompute_and_store_context_kv`

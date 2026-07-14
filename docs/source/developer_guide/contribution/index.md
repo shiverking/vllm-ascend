@@ -108,6 +108,7 @@ If you encounter any problems while contributing, feel free to submit a PR to im
 :caption: Index
 :maxdepth: 1
 testing
+ascendc_mrope_experiment
 multi_node_test
 nightly_ci_test
 e2e_ci_test

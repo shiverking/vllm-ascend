@@ -112,6 +112,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Experimental, non-sensitive switch for the AscendC QKV split + Q/K RMSNorm
+    # + MRoPE kernel. 0 (default): use the existing Triton kernel. 1: use the
+    # AscendC kernel for supported BF16 MRoPE inputs and fall back to Triton for
+    # unsupported inputs. This is intended for operator development and
+    # performance comparison on Ascend 910B/C hardware.
+    "VLLM_ASCEND_ENABLE_ASCENDC_MROPE": lambda: bool(
+        int(os.getenv("VLLM_ASCEND_ENABLE_ASCENDC_MROPE", "0"))
+    ),
 }
 
 # end-env-vars-definition

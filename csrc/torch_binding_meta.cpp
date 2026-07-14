@@ -51,6 +51,39 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask_meta(
     return {masked_input, mask};
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope_meta(
+    const at::Tensor& qkv,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    const at::Tensor& cos_sin_cache,
+    const at::Tensor& positions,
+    int64_t num_q_heads,
+    int64_t num_kv_heads,
+    int64_t head_size,
+    double epsilon,
+    at::IntArrayRef mrope_section,
+    bool is_interleaved,
+    int64_t rope_dim)
+{
+    (void)q_weight;
+    (void)k_weight;
+    (void)cos_sin_cache;
+    (void)positions;
+    (void)epsilon;
+    (void)mrope_section;
+    (void)is_interleaved;
+    (void)rope_dim;
+
+    auto q_shape = qkv.sym_sizes().vec();
+    auto kv_shape = q_shape;
+    q_shape[1] = num_q_heads * head_size;
+    kv_shape[1] = num_kv_heads * head_size;
+    at::Tensor q = at::empty_symint(q_shape, qkv.options());
+    at::Tensor k = at::empty_symint(kv_shape, qkv.options());
+    at::Tensor v = at::empty_symint(kv_shape, qkv.options());
+    return {q, k, v};
+}
+
 void device_print_meta(c10::string_view msg)
 {
     (void)msg;
@@ -688,6 +721,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_gemma_rms_norm", &vllm_ascend::meta::npu_gemma_rms_norm_meta);
     // Masked input and mask meta implementation
     ops.impl("get_masked_input_and_mask", &vllm_ascend::meta::get_masked_input_and_mask_meta);
+    // Experimental fused AscendC QKV split + RMSNorm + MRoPE
+    ops.impl("npu_split_qkv_rmsnorm_mrope", &vllm_ascend::meta::npu_split_qkv_rmsnorm_mrope_meta);
     // Launch host print from device
     ops.impl("device_print", &vllm_ascend::meta::device_print_meta);
     // launch host print from device for tensors
