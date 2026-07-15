@@ -1,12 +1,12 @@
 import torch
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 from vllm.logger import init_logger
+from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeAttention
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
 from vllm_ascend.utils import enable_custom_op, is_310p
 
 if not is_310p():
@@ -42,11 +42,11 @@ def tensor_parallel_wrap(func):
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
     ascendc_requested = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
-    logger.info_once(
+    logger.warning_once(
         "Patched Qwen3 attention forward reached; AscendC MRoPE requested=%s.",
         ascendc_requested,
     )
-    if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
+    if isinstance(self.rotary_emb, MRotaryEmbedding):
         cache = self.rotary_emb.cos_sin_cache
         dtype_supported = qkv.dtype == torch.float16
         if ascendc_requested and dtype_supported and (
@@ -74,7 +74,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 self.q_norm.variance_epsilon, self.rotary_emb.mrope_section,
                 self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
             )
-            logger.info_once("Executed experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
+            logger.warning_once("Executed experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
         elif is_310p():
             if ascendc_requested:
                 reasons = []
@@ -111,7 +111,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
     else:
         if ascendc_requested:
             logger.warning_once(
-                "AscendC MRoPE fallback reason: rotary embedding type is %s, expected AscendMRotaryEmbedding",
+                "AscendC MRoPE fallback reason: rotary embedding type is %s, expected MRotaryEmbedding",
                 type(self.rotary_emb).__name__,
             )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
@@ -129,9 +129,10 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
 
 Qwen3Attention.forward = forward_with_split_qkv_rmsnorm_mrope
 Qwen3MoeAttention.forward = forward_with_split_qkv_rmsnorm_mrope
-if is_310p():
-    logger.info_once(
-        "Installed 310P Qwen3 attention patch; AscendC MRoPE requested=%s.",
+if is_310p() or envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE:
+    logger.warning_once(
+        "Installed Qwen3 attention patch; is_310p=%s, AscendC MRoPE requested=%s.",
+        is_310p(),
         envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE,
     )
 if not is_310p():
