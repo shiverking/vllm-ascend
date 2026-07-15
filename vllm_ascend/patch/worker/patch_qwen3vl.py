@@ -42,8 +42,10 @@ def tensor_parallel_wrap(func):
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
     ascendc_requested = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
-    if ascendc_requested:
-        logger.info_once("AscendC MRoPE dispatch reached the patched Qwen3 attention forward.")
+    logger.info_once(
+        "Patched Qwen3 attention forward reached; AscendC MRoPE requested=%s.",
+        ascendc_requested,
+    )
     if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
         cache = self.rotary_emb.cos_sin_cache
         dtype_supported = qkv.dtype == torch.float16
@@ -127,6 +129,11 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
 
 Qwen3Attention.forward = forward_with_split_qkv_rmsnorm_mrope
 Qwen3MoeAttention.forward = forward_with_split_qkv_rmsnorm_mrope
+if is_310p():
+    logger.info_once(
+        "Installed 310P Qwen3 attention patch; AscendC MRoPE requested=%s.",
+        envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE,
+    )
 if not is_310p():
     Qwen3VLForConditionalGeneration._get_deepstack_input_embeds = tensor_parallel_wrap(
         Qwen3VLForConditionalGeneration._get_deepstack_input_embeds
