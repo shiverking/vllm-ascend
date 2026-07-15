@@ -19,6 +19,25 @@ if not is_310p():
 logger = init_logger(__name__)
 
 
+def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
+    if not envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE:
+        return
+    for name, module in model.named_modules():
+        if "language_model.model.layers" not in name or not name.endswith("self_attn"):
+            continue
+        forward = module.forward
+        logger.warning_once(
+            "Qwen3-ASR runtime attention: name=%s, type=%s.%s, forward=%s.%s.",
+            name,
+            type(module).__module__,
+            type(module).__name__,
+            forward.__module__,
+            forward.__name__,
+        )
+        return
+    logger.warning_once("Qwen3-ASR runtime attention module was not found in the loaded model.")
+
+
 def tensor_parallel_wrap(func):
     def wrap(*args, **kwargs):
         deepstack_input_embeds = func(*args, **kwargs)
