@@ -23,8 +23,8 @@ if not is_310p():
 
 logger = init_logger(__name__)
 ASCENDC_MROPE_REQUESTED = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
-ASCENDC_MROPE_MAX_TOKENS = 32
-
+# ASCENDC_MROPE_MAX_TOKENS = 32
+ASCENDC_MROPE_MAX_TOKENS = 4096
 
 def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
     logger.warning(

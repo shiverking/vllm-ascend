@@ -14,7 +14,7 @@ def prepare_cos_sin(cache, positions, sections, interleaved):
         axes = torch.where(h_mask, 1, torch.where(w_mask, 2, 0))
     else:
         axes = torch.where(offsets < sections[0], 0, torch.where(offsets < sum(sections[:2]), 1, 2))
-    gathered = cache[positions].float().permute(1, 2, 0)
+    gathered = cache[positions].permute(1, 2, 0)
     index = axes.view(1, half, 1).expand(tokens, half, 1)
     cos = gathered[:, :half].gather(2, index).squeeze(2)
     sin = gathered[:, half:].gather(2, index).squeeze(2)
