@@ -67,6 +67,7 @@ public:
         pipe_.InitBuffer(weightBuf_, alignedHeadSize_ * sizeof(T));
         pipe_.InitBuffer(weightFloatBuf_, alignedHeadSize_ * sizeof(float));
         pipe_.InitBuffer(normalizedBuf_, alignedHeadSize_ * sizeof(float));
+        pipe_.InitBuffer(normBuf_, BYTES_PER_BLOCK);
         pipe_.InitBuffer(rotatedBuf_, alignedHeadSize_ * sizeof(float));
         pipe_.InitBuffer(outputBuf_, alignedHeadSize_ * sizeof(T));
         pipe_.InitBuffer(tCacheBuf_, alignedRopeDim_ * sizeof(T));
@@ -144,6 +145,7 @@ private:
         LocalTensor<T> weight = weightBuf_.Get<T>();
         LocalTensor<float> weightFloat = weightFloatBuf_.Get<float>();
         LocalTensor<float> normalized = normalizedBuf_.Get<float>();
+        LocalTensor<float> norm = normBuf_.Get<float>();
         LocalTensor<float> rotated = rotatedBuf_.Get<float>();
         LocalTensor<T> outputLocal = outputBuf_.Get<T>();
         DataCopy(input, qkvGm_[inputOffset], alignedHeadSize_);
@@ -162,11 +164,11 @@ private:
             float value = normalized.GetValue(dim);
             squareSum += value * value;
         }
-        normalized.SetValue(0, squareSum * invHeadSize_ + epsilon_);
+        norm.SetValue(0, squareSum * invHeadSize_ + epsilon_);
         pipe_barrier(PIPE_ALL);
-        Sqrt(normalized, normalized, 1);
+        Sqrt(norm, norm, 1);
         pipe_barrier(PIPE_ALL);
-        float reciprocalStd = 1.0F / normalized.GetValue(0);
+        float reciprocalStd = 1.0F / norm.GetValue(0);
         for (uint32_t dim = 0; dim < headSize_; ++dim) {
             normalized.SetValue(dim, normalized.GetValue(dim) * reciprocalStd * weightFloat.GetValue(dim));
         }
@@ -184,7 +186,8 @@ private:
             rotated.SetValue(dim, result);
         }
         pipe_barrier(PIPE_ALL);
-        Cast(outputLocal, rotated, RoundMode::CAST_RINT, alignedHeadSize_);
+        // Ascend 310P supports FP32 -> FP16 with CAST_NONE only.
+        Cast(outputLocal, rotated, RoundMode::CAST_NONE, alignedHeadSize_);
         pipe_barrier(PIPE_ALL);
         DataCopy(output[outputOffset], outputLocal, alignedHeadSize_);
     }
@@ -215,7 +218,7 @@ private:
 
     TPipe pipe_;
     TBuf<TPosition::VECCALC> inputBuf_, weightBuf_, weightFloatBuf_;
-    TBuf<TPosition::VECCALC> normalizedBuf_, rotatedBuf_, outputBuf_;
+    TBuf<TPosition::VECCALC> normalizedBuf_, normBuf_, rotatedBuf_, outputBuf_;
     TBuf<TPosition::VECCALC> tCacheBuf_, hCacheBuf_, wCacheBuf_;
     TBuf<TPosition::VECCALC> tCacheFloatBuf_, hCacheFloatBuf_, wCacheFloatBuf_;
     GlobalTensor<T> qkvGm_, qWeightGm_, kWeightGm_, cacheGm_;
