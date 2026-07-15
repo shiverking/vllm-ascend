@@ -416,6 +416,7 @@ std::tuple<at::Tensor, at::Tensor> get_masked_input_and_mask(
     cmd.Run();
     return {masked_input, mask};
 }
+#endif
 
 #if defined(ASCEND_PLATFORM_310P) || defined(VLLM_ENABLE_ATB_AND_DIRECT_KERNELS)
 std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
@@ -493,6 +494,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
 }
 #endif
 
+#ifdef VLLM_ENABLE_ATB_AND_DIRECT_KERNELS
 void bgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, at::Tensor &y, double scale)
 {
     at::ScalarType scalar_type = x.scalar_type();
