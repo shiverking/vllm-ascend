@@ -39,16 +39,21 @@ def tensor_parallel_wrap(func):
 
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
+    ascendc_requested = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
+    if ascendc_requested:
+        logger.info_once("AscendC MRoPE dispatch reached the patched Qwen3 attention forward.")
     if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
         cache = self.rotary_emb.cos_sin_cache
         dtype_supported = qkv.dtype == torch.float16
-        if envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE and dtype_supported and (
+        if ascendc_requested and dtype_supported and (
             cache.device != qkv.device or cache.dtype != qkv.dtype
         ):
             self.rotary_emb.cos_sin_cache = cache.to(device=qkv.device, dtype=qkv.dtype)
             cache = self.rotary_emb.cos_sin_cache
+        custom_op_enabled = enable_custom_op() if ascendc_requested else False
+        op_registered = custom_op_enabled and hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope")
         use_ascendc = (
-            envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
+            ascendc_requested
             and dtype_supported
             and positions.dtype == torch.int64
             and positions.ndim == 2
@@ -56,8 +61,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             and all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache, positions))
             and cache.device == qkv.device
             and cache.dtype == qkv.dtype
-            and enable_custom_op()
-            and hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope")
+            and op_registered
         )
         if use_ascendc:
             logger.info_once("Using experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
@@ -68,6 +72,25 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
             )
         elif is_310p():
+            if ascendc_requested:
+                reasons = []
+                if not dtype_supported:
+                    reasons.append(f"qkv dtype is {qkv.dtype}, expected torch.float16")
+                if positions.dtype != torch.int64 or positions.ndim != 2 or positions.shape[0] != 3:
+                    reasons.append(
+                        f"positions is dtype={positions.dtype}, shape={tuple(positions.shape)}, expected int64 [3, T]"
+                    )
+                if not all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache, positions)):
+                    reasons.append("one or more inputs are not contiguous")
+                if cache.device != qkv.device or cache.dtype != qkv.dtype:
+                    reasons.append(
+                        f"cache is {cache.device}/{cache.dtype}, qkv is {qkv.device}/{qkv.dtype}"
+                    )
+                if not custom_op_enabled:
+                    reasons.append("custom op extension is not enabled")
+                elif not op_registered:
+                    reasons.append("npu_split_qkv_rmsnorm_mrope is not registered")
+                logger.warning_once("AscendC MRoPE fallback reason: %s", "; ".join(reasons) or "unknown")
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             q = self.q_norm(q.view(*q.shape[:-1], self.num_heads, self.head_dim)).view(q.shape)
             k = self.k_norm(k.view(*k.shape[:-1], self.num_kv_heads, self.head_dim)).view(k.shape)
@@ -82,6 +105,11 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 is_interleaved=self.rotary_emb.mrope_interleaved, rope_dim=self.rotary_emb.rotary_dim,
             )
     else:
+        if ascendc_requested:
+            logger.warning_once(
+                "AscendC MRoPE fallback reason: rotary embedding type is %s, expected AscendMRotaryEmbedding",
+                type(self.rotary_emb).__name__,
+            )
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
         q_by_head = self.q_norm(q_by_head)
