@@ -77,8 +77,9 @@ def tensor_parallel_wrap(func):
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
     ascendc_requested = ASCENDC_MROPE_REQUESTED
+    debug_layer = getattr(self, "_ascendc_mrope_layer_index", -1) == 0
     if not torch.compiler.is_compiling():
-        if not getattr(self, "_ascendc_mrope_eager_dispatch_printed", False):
+        if debug_layer and not getattr(self, "_ascendc_mrope_eager_dispatch_printed", False):
             print(
                 "[ASCENDC_MROPE_DEBUG] eager patched attention forward reached",
                 file=sys.stderr,
@@ -108,11 +109,20 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             and cache.dtype == qkv.dtype
             and op_registered
         )
-        if not torch.compiler.is_compiling() and not getattr(
-            self, "_ascendc_mrope_eager_decision_printed", False
+        if (
+            debug_layer
+            and not torch.compiler.is_compiling()
+            and not getattr(self, "_ascendc_mrope_eager_decision_printed", False)
         ):
             print(
-                f"[ASCENDC_MROPE_DEBUG] eager use_ascendc={use_ascendc}",
+                "[ASCENDC_MROPE_DEBUG] "
+                f"use_ascendc={use_ascendc}, requested={ascendc_requested}, "
+                f"qkv={qkv.dtype}/{qkv.device}/contiguous={qkv.is_contiguous()}, "
+                f"positions={positions.dtype}/{tuple(positions.shape)}/contiguous={positions.is_contiguous()}, "
+                f"q_weight_contiguous={self.q_norm.weight.is_contiguous()}, "
+                f"k_weight_contiguous={self.k_norm.weight.is_contiguous()}, "
+                f"cache={cache.dtype}/{cache.device}/contiguous={cache.is_contiguous()}, "
+                f"custom_op_enabled={custom_op_enabled}, op_registered={op_registered}",
                 file=sys.stderr,
                 flush=True,
             )
@@ -125,7 +135,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
             )
             if not torch.compiler.is_compiling():
-                if not getattr(self, "_ascendc_mrope_eager_kernel_printed", False):
+                if debug_layer and not getattr(self, "_ascendc_mrope_eager_kernel_printed", False):
                     print(
                         "[ASCENDC_MROPE_DEBUG] eager AscendC kernel returned successfully",
                         file=sys.stderr,
@@ -203,6 +213,7 @@ def patch_runtime_qwen3_attention(model: torch.nn.Module) -> None:
         module.forward = forward_with_split_qkv_rmsnorm_mrope.__get__(
             module, type(module)
         )
+        module._ascendc_mrope_layer_index = patched
         patched += 1
     logger.warning("Bound experimental AscendC MRoPE forward to %d runtime attention instances.", patched)
 
