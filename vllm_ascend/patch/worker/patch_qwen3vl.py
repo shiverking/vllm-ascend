@@ -20,13 +20,21 @@ logger = init_logger(__name__)
 
 
 def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
-    if not envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE:
-        return
+    logger.warning(
+        "Inspecting loaded model attention: model=%s.%s, AscendC MRoPE requested=%s.",
+        type(model).__module__,
+        type(model).__name__,
+        envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE,
+    )
+    candidates = []
     for name, module in model.named_modules():
-        if "language_model.model.layers" not in name or not name.endswith("self_attn"):
+        if not name.endswith("self_attn"):
+            continue
+        candidates.append(f"{name}={type(module).__module__}.{type(module).__name__}")
+        if "language_model.model.layers" not in name:
             continue
         forward = module.forward
-        logger.warning_once(
+        logger.warning(
             "Qwen3-ASR runtime attention: name=%s, type=%s.%s, forward=%s.%s.",
             name,
             type(module).__module__,
@@ -35,7 +43,10 @@ def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
             forward.__name__,
         )
         return
-    logger.warning_once("Qwen3-ASR runtime attention module was not found in the loaded model.")
+    logger.warning(
+        "Qwen3-ASR runtime attention was not found; self_attn candidates=%s.",
+        candidates[:8],
+    )
 
 
 def tensor_parallel_wrap(func):
