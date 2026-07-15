@@ -31,7 +31,7 @@ public:
         __gm__ void* qOut, __gm__ void* kOut, __gm__ void* vOut,
         uint32_t numTokens, uint32_t maxPositions, uint32_t numQHeads,
         uint32_t numKvHeads, uint32_t headSize, uint32_t ropeDim,
-        float epsilon, uint32_t sectionT, uint32_t sectionH,
+        float epsilon, float invHeadSize, uint32_t sectionT, uint32_t sectionH,
         uint32_t sectionW, uint32_t isInterleaved, uint32_t blockDim)
     {
         numTokens_ = numTokens;
@@ -41,6 +41,7 @@ public:
         ropeDim_ = ropeDim;
         halfRopeDim_ = ropeDim / 2;
         epsilon_ = epsilon;
+        invHeadSize_ = invHeadSize;
         sectionT_ = sectionT;
         sectionH_ = sectionH;
         sectionW_ = sectionW;
@@ -162,7 +163,7 @@ private:
             float value = normalized.GetValue(dim);
             squareSum += value * value;
         }
-        normalized.SetValue(0, squareSum / static_cast<float>(headSize_) + epsilon_);
+        normalized.SetValue(0, squareSum * invHeadSize_ + epsilon_);
         pipe_barrier(PIPE_ALL);
         Sqrt(normalized, normalized, 1);
         pipe_barrier(PIPE_ALL);
@@ -224,7 +225,7 @@ private:
     uint32_t numTokens_, numQHeads_, numKvHeads_, headSize_, ropeDim_, halfRopeDim_;
     uint32_t qSize_, kvSize_, qkvStride_, workPerToken_, totalWork_, blockDim_;
     uint32_t alignedHeadSize_, alignedRopeDim_, sectionT_, sectionH_, sectionW_;
-    float epsilon_;
+    float epsilon_, invHeadSize_;
     bool isInterleaved_;
 };
 
@@ -234,14 +235,15 @@ __aicore__ inline void RunKernel(
     __gm__ void* cache, __gm__ void* positions, __gm__ void* qOut,
     __gm__ void* kOut, __gm__ void* vOut, uint32_t numTokens,
     uint32_t maxPositions, uint32_t numQHeads, uint32_t numKvHeads,
-    uint32_t headSize, uint32_t ropeDim, float epsilon,
+    uint32_t headSize, uint32_t ropeDim, float epsilon, float invHeadSize,
     uint32_t sectionT, uint32_t sectionH, uint32_t sectionW,
     uint32_t interleaved, uint32_t blockDim)
 {
     SplitQkvRmsNormMropeKernel<T> op;
     op.Init(qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
             numTokens, maxPositions, numQHeads, numKvHeads, headSize,
-            ropeDim, epsilon, sectionT, sectionH, sectionW, interleaved, blockDim);
+            ropeDim, epsilon, invHeadSize, sectionT, sectionH, sectionW,
+            interleaved, blockDim);
     op.Process();
 }
 
@@ -252,12 +254,13 @@ __aicore__ inline void RunKernel(
     __gm__ void* cache, __gm__ void* positions, __gm__ void* qOut, \
     __gm__ void* kOut, __gm__ void* vOut, uint32_t numTokens, \
     uint32_t maxPositions, uint32_t numQHeads, uint32_t numKvHeads, \
-    uint32_t headSize, uint32_t ropeDim, float epsilon, uint32_t sectionT, \
+    uint32_t headSize, uint32_t ropeDim, float epsilon, float invHeadSize, \
+    uint32_t sectionT, \
     uint32_t sectionH, uint32_t sectionW, uint32_t interleaved, uint32_t blockDim
 
 #define MROPE_KERNEL_CALL \
     qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut, numTokens, \
-    maxPositions, numQHeads, numKvHeads, headSize, ropeDim, epsilon, \
+    maxPositions, numQHeads, numKvHeads, headSize, ropeDim, epsilon, invHeadSize, \
     sectionT, sectionH, sectionW, interleaved, blockDim
 
 extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_fp16_kernel(MROPE_KERNEL_ARGS)
@@ -265,7 +268,8 @@ extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_fp16_kernel(MROPE_
     RunKernel<half>(MROPE_KERNEL_CALL);
 }
 
-#ifndef ASCEND_PLATFORM_310P
+#if !defined(ASCEND_PLATFORM_310P) && \
+    (!defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220))
 extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_bf16_kernel(MROPE_KERNEL_ARGS)
 {
     RunKernel<bfloat16_t>(MROPE_KERNEL_CALL);
@@ -283,19 +287,23 @@ void split_qkv_rmsnorm_mrope_impl(
     bool interleaved, uint32_t blockDim)
 {
     uint32_t interleavedValue = static_cast<uint32_t>(interleaved);
+    float invHeadSize = 1.0F / static_cast<float>(headSize);
     if (type == AscendType::FP16) {
         split_qkv_rmsnorm_mrope_fp16_kernel<<<blockDim, nullptr, stream>>>(
             qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
             numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
-            epsilon, sectionT, sectionH, sectionW, interleavedValue, blockDim);
+            epsilon, invHeadSize, sectionT, sectionH, sectionW,
+            interleavedValue, blockDim);
         return;
     }
-#ifndef ASCEND_PLATFORM_310P
+#if !defined(ASCEND_PLATFORM_310P) && \
+    (!defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220))
     if (type == AscendType::BF16) {
         split_qkv_rmsnorm_mrope_bf16_kernel<<<blockDim, nullptr, stream>>>(
             qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
             numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
-            epsilon, sectionT, sectionH, sectionW, interleavedValue, blockDim);
+            epsilon, invHeadSize, sectionT, sectionH, sectionW,
+            interleavedValue, blockDim);
     }
 #endif
 }
