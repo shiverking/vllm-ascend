@@ -17,6 +17,7 @@ if not is_310p():
     )
 
 logger = init_logger(__name__)
+ASCENDC_MROPE_REQUESTED = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
 
 
 def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
@@ -24,14 +25,16 @@ def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
         "Inspecting loaded model attention: model=%s.%s, AscendC MRoPE requested=%s.",
         type(model).__module__,
         type(model).__name__,
-        envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE,
+        ASCENDC_MROPE_REQUESTED,
     )
     candidates = []
     for name, module in model.named_modules():
         if not name.endswith("self_attn"):
             continue
         candidates.append(f"{name}={type(module).__module__}.{type(module).__name__}")
-        if "language_model.model.layers" not in name:
+        if "language_model.model.layers" not in name or not all(
+            hasattr(module, attr) for attr in ("qkv_proj", "q_norm", "k_norm", "rotary_emb")
+        ):
             continue
         forward = module.forward
         logger.warning(
@@ -44,7 +47,7 @@ def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
         )
         return
     logger.warning(
-        "Qwen3-ASR runtime attention was not found; self_attn candidates=%s.",
+        "Qwen3 runtime attention was not found; self_attn candidates=%s.",
         candidates[:8],
     )
 
@@ -71,12 +74,15 @@ def tensor_parallel_wrap(func):
 
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
-    ascendc_requested = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
+    ascendc_requested = ASCENDC_MROPE_REQUESTED
     logger.warning_once(
         "Patched Qwen3 attention forward reached; AscendC MRoPE requested=%s.",
         ascendc_requested,
     )
-    if isinstance(self.rotary_emb, MRotaryEmbedding):
+    is_mrope = isinstance(self.rotary_emb, MRotaryEmbedding) or all(
+        hasattr(self.rotary_emb, attr) for attr in ("mrope_section", "mrope_interleaved", "cos_sin_cache")
+    )
+    if is_mrope:
         cache = self.rotary_emb.cos_sin_cache
         dtype_supported = qkv.dtype == torch.float16
         if ascendc_requested and dtype_supported and (
@@ -157,13 +163,30 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
     return output
 
 
+def patch_runtime_qwen3_attention(model: torch.nn.Module) -> None:
+    patched = 0
+    for name, module in model.named_modules():
+        if "language_model.model.layers" not in name or not name.endswith("self_attn"):
+            continue
+        if not all(
+            hasattr(module, attr) for attr in ("qkv_proj", "q_norm", "k_norm", "rotary_emb")
+        ):
+            continue
+        module.forward = forward_with_split_qkv_rmsnorm_mrope.__get__(
+            module, type(module)
+        )
+        patched += 1
+    logger.warning("Bound experimental AscendC MRoPE forward to %d runtime attention instances.", patched)
+
+
 Qwen3Attention.forward = forward_with_split_qkv_rmsnorm_mrope
 Qwen3MoeAttention.forward = forward_with_split_qkv_rmsnorm_mrope
-if is_310p() or envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE:
+
+if is_310p() or ASCENDC_MROPE_REQUESTED:
     logger.warning_once(
         "Installed Qwen3 attention patch; is_310p=%s, AscendC MRoPE requested=%s.",
         is_310p(),
-        envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE,
+        ASCENDC_MROPE_REQUESTED,
     )
 if not is_310p():
     Qwen3VLForConditionalGeneration._get_deepstack_input_embeds = tensor_parallel_wrap(

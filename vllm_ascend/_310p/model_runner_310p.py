@@ -633,6 +633,18 @@ class NPUModelRunner310(NPUModelRunner):
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs,
     ):
+        from vllm_ascend.patch.worker.patch_qwen3vl import (
+            ASCENDC_MROPE_REQUESTED,
+            log_runtime_qwen3_attention,
+            patch_runtime_qwen3_attention,
+        )
+
+        if ASCENDC_MROPE_REQUESTED and not getattr(
+            self, "_ascendc_mrope_path_logged", False
+        ):
+            patch_runtime_qwen3_attention(self.model)
+            log_runtime_qwen3_attention(self.model)
+            self._ascendc_mrope_path_logged = True
         if self.uses_mrope:
             assert positions is not None
             prepare_mrope_cos_sin_slices_from_runner(self, positions)

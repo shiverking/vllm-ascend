@@ -3600,10 +3600,6 @@ class NPUModelRunner(GPUModelRunner):
                 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
                 DefaultModelLoader._init_ep_weight_filter = mock_pass
             self.model: nn.Module = get_model(vllm_config=self.vllm_config)
-            # Keep this lazy so importing the model runner does not apply worker patches early.
-            from vllm_ascend.patch.worker.patch_qwen3vl import log_runtime_qwen3_attention
-
-            log_runtime_qwen3_attention(self.model)
             for name, _ in self.model.named_parameters():
                 # sinks is a kind of parameter in attention
                 # only set in weight name
