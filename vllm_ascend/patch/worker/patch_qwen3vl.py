@@ -3,16 +3,18 @@ from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_pa
 from vllm.logger import init_logger
 from vllm.model_executor.models.qwen3 import Qwen3Attention
 from vllm.model_executor.models.qwen3_moe import Qwen3MoeAttention
-from vllm.model_executor.models.qwen3_vl import (
-    Qwen3_VisionTransformer,
-    Qwen3VLForConditionalGeneration,
-    pos_embed_interpolate_native,
-)
 
 from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.rotary_embedding import AscendMRotaryEmbedding
 from vllm_ascend.utils import enable_custom_op, is_310p
+
+if not is_310p():
+    from vllm.model_executor.models.qwen3_vl import (
+        Qwen3_VisionTransformer,
+        Qwen3VLForConditionalGeneration,
+        pos_embed_interpolate_native,
+    )
 
 logger = init_logger(__name__)
 
@@ -64,13 +66,13 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             and op_registered
         )
         if use_ascendc:
-            logger.info_once("Using experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
             q, k, v = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
                 qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
                 self.num_heads, self.num_kv_heads, self.head_dim,
                 self.q_norm.variance_epsilon, self.rotary_emb.mrope_section,
                 self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
             )
+            logger.info_once("Executed experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
         elif is_310p():
             if ascendc_requested:
                 reasons = []
@@ -125,9 +127,10 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
 
 Qwen3Attention.forward = forward_with_split_qkv_rmsnorm_mrope
 Qwen3MoeAttention.forward = forward_with_split_qkv_rmsnorm_mrope
-Qwen3VLForConditionalGeneration._get_deepstack_input_embeds = tensor_parallel_wrap(
-    Qwen3VLForConditionalGeneration._get_deepstack_input_embeds
-)
+if not is_310p():
+    Qwen3VLForConditionalGeneration._get_deepstack_input_embeds = tensor_parallel_wrap(
+        Qwen3VLForConditionalGeneration._get_deepstack_input_embeds
+    )
 
 
 def _fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
@@ -147,7 +150,8 @@ def _fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor
     return torch.cat(outputs, dim=0)
 
 
-Qwen3_VisionTransformer.fast_pos_embed_interpolate = _fast_pos_embed_interpolate
+if not is_310p():
+    Qwen3_VisionTransformer.fast_pos_embed_interpolate = _fast_pos_embed_interpolate
 
 
 def patch_qwen3_vl_moe_pp_layer_range():
@@ -163,4 +167,5 @@ def patch_qwen3_vl_moe_pp_layer_range():
         Qwen3MoeLLMForCausalLM.end_layer = property(lambda self: self.model.end_layer)
 
 
-patch_qwen3_vl_moe_pp_layer_range()
+if not is_310p():
+    patch_qwen3_vl_moe_pp_layer_range()

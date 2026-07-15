@@ -44,9 +44,9 @@ import vllm_ascend.patch.worker.patch_qwen3_next_mtp  # noqa
 if not is_310p():
     import vllm_ascend.patch.worker.patch_qwen3_5  # noqa
     import vllm_ascend.patch.worker.patch_qwen3_dflash  # noqa
-    import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
 else:
     import vllm_ascend.patch.worker.patch_idex_310  # noqa
+import vllm_ascend.patch.worker.patch_qwen3vl  # noqa
 import vllm_ascend.patch.worker.patch_rejection_sampler  # noqa
 
 # torchair/npugraph_ex is only available on NPU; silently skip when missing
