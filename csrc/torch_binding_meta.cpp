@@ -37,16 +37,14 @@ namespace vllm_ascend {
 namespace meta {
 const int64_t INT4_NUMS_IN_INT32 = 8;
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> split_qkv_rmsnorm_mrope_meta(
+std::tuple<at::Tensor, at::Tensor> split_qkv_rmsnorm_mrope_meta(
     const at::Tensor& qkv, const at::Tensor&, const at::Tensor&,
     const at::Tensor&, const at::Tensor&, int64_t num_q_heads,
-    int64_t num_kv_heads, int64_t head_size, double, at::IntArrayRef,
-    bool, int64_t)
+    int64_t num_kv_heads, int64_t head_size, double, int64_t)
 {
     auto num_tokens = qkv.sym_size(0);
     return {
         at::empty_symint({num_tokens, num_q_heads * head_size}, qkv.options()),
-        at::empty_symint({num_tokens, num_kv_heads * head_size}, qkv.options()),
         at::empty_symint({num_tokens, num_kv_heads * head_size}, qkv.options())};
 }
 

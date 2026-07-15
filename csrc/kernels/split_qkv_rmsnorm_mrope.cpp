@@ -26,16 +26,13 @@ class SplitQkvRmsNormMropeKernel {
 public:
     __aicore__ inline void Init(
         __gm__ void* qkv, __gm__ void* qWeight, __gm__ void* kWeight,
-        __gm__ void* cosSinCache, __gm__ void* positions,
-        __gm__ void* qOut, __gm__ void* kOut, __gm__ void* vOut,
-        uint32_t numTokens, uint32_t positionStride, uint32_t maxPositions,
+        __gm__ void* cos, __gm__ void* sin,
+        __gm__ void* qOut, __gm__ void* kOut, uint32_t numTokens,
         uint32_t numQHeads,
         uint32_t numKvHeads, uint32_t headSize, uint32_t ropeDim,
-        float epsilon, float invHeadSize, uint32_t sectionT, uint32_t sectionH,
-        uint32_t sectionW, uint32_t isInterleaved, uint32_t blockDim)
+        float epsilon, float invHeadSize, uint32_t blockDim)
     {
         numTokens_ = numTokens;
-        positionStride_ = positionStride;
         numQHeads_ = numQHeads;
         numKvHeads_ = numKvHeads;
         headSize_ = headSize;
@@ -43,26 +40,20 @@ public:
         halfRopeDim_ = ropeDim / 2;
         epsilon_ = epsilon;
         invHeadSize_ = invHeadSize;
-        sectionT_ = sectionT;
-        sectionH_ = sectionH;
-        sectionW_ = sectionW;
-        isInterleaved_ = isInterleaved != 0;
         blockDim_ = blockDim;
         qSize_ = numQHeads * headSize;
         kvSize_ = numKvHeads * headSize;
         qkvStride_ = qSize_ + 2 * kvSize_;
-        workPerToken_ = numQHeads + 2 * numKvHeads;
+        workPerToken_ = numQHeads + numKvHeads;
         totalWork_ = numTokens * workPerToken_;
 
         qkvGm_.SetGlobalBuffer(static_cast<__gm__ T*>(qkv), numTokens * qkvStride_);
         qWeightGm_.SetGlobalBuffer(static_cast<__gm__ T*>(qWeight), headSize);
         kWeightGm_.SetGlobalBuffer(static_cast<__gm__ T*>(kWeight), headSize);
-        cacheGm_.SetGlobalBuffer(static_cast<__gm__ T*>(cosSinCache), maxPositions * ropeDim);
-        positionsGm_.SetGlobalBuffer(
-            static_cast<__gm__ int64_t*>(positions), 2 * positionStride + numTokens);
+        cosGm_.SetGlobalBuffer(static_cast<__gm__ T*>(cos), numTokens * ropeDim);
+        sinGm_.SetGlobalBuffer(static_cast<__gm__ T*>(sin), numTokens * ropeDim);
         qOutGm_.SetGlobalBuffer(static_cast<__gm__ T*>(qOut), numTokens * qSize_);
         kOutGm_.SetGlobalBuffer(static_cast<__gm__ T*>(kOut), numTokens * kvSize_);
-        vOutGm_.SetGlobalBuffer(static_cast<__gm__ T*>(vOut), numTokens * kvSize_);
 
         alignedHeadSize_ = AlignElements(headSize, sizeof(T));
         alignedRopeDim_ = AlignElements(ropeDim, sizeof(T));
@@ -73,12 +64,10 @@ public:
         pipe_.InitBuffer(normBuf_, BYTES_PER_BLOCK);
         pipe_.InitBuffer(rotatedBuf_, alignedHeadSize_ * sizeof(float));
         pipe_.InitBuffer(outputBuf_, alignedHeadSize_ * sizeof(T));
-        pipe_.InitBuffer(tCacheBuf_, alignedRopeDim_ * sizeof(T));
-        pipe_.InitBuffer(hCacheBuf_, alignedRopeDim_ * sizeof(T));
-        pipe_.InitBuffer(wCacheBuf_, alignedRopeDim_ * sizeof(T));
-        pipe_.InitBuffer(tCacheFloatBuf_, alignedRopeDim_ * sizeof(float));
-        pipe_.InitBuffer(hCacheFloatBuf_, alignedRopeDim_ * sizeof(float));
-        pipe_.InitBuffer(wCacheFloatBuf_, alignedRopeDim_ * sizeof(float));
+        pipe_.InitBuffer(cosBuf_, alignedRopeDim_ * sizeof(T));
+        pipe_.InitBuffer(sinBuf_, alignedRopeDim_ * sizeof(T));
+        pipe_.InitBuffer(cosFloatBuf_, alignedRopeDim_ * sizeof(float));
+        pipe_.InitBuffer(sinFloatBuf_, alignedRopeDim_ * sizeof(float));
     }
 
     __aicore__ inline void Process()
@@ -88,10 +77,8 @@ public:
             uint32_t task = work % workPerToken_;
             if (task < numQHeads_) {
                 ProcessQ(token, task);
-            } else if (task < numQHeads_ + numKvHeads_) {
-                ProcessK(token, task - numQHeads_);
             } else {
-                CopyV(token, task - numQHeads_ - numKvHeads_);
+                ProcessK(token, task - numQHeads_);
             }
         }
     }
@@ -103,41 +90,17 @@ private:
         return (count + elementsPerBlock - 1) / elementsPerBlock * elementsPerBlock;
     }
 
-    __aicore__ inline void LoadCache(uint32_t token)
+    __aicore__ inline void LoadCosSin(uint32_t token)
     {
-        int64_t tPosition = positionsGm_.GetValue(token);
-        int64_t hPosition = positionsGm_.GetValue(positionStride_ + token);
-        int64_t wPosition = positionsGm_.GetValue(2 * positionStride_ + token);
-        LocalTensor<T> tCache = tCacheBuf_.Get<T>();
-        LocalTensor<T> hCache = hCacheBuf_.Get<T>();
-        LocalTensor<T> wCache = wCacheBuf_.Get<T>();
-        DataCopy(tCache, cacheGm_[tPosition * ropeDim_], alignedRopeDim_);
-        DataCopy(hCache, cacheGm_[hPosition * ropeDim_], alignedRopeDim_);
-        DataCopy(wCache, cacheGm_[wPosition * ropeDim_], alignedRopeDim_);
+        LocalTensor<T> cos = cosBuf_.Get<T>();
+        LocalTensor<T> sin = sinBuf_.Get<T>();
+        uint32_t offset = token * ropeDim_;
+        DataCopy(cos, cosGm_[offset], alignedRopeDim_);
+        DataCopy(sin, sinGm_[offset], alignedRopeDim_);
         pipe_barrier(PIPE_ALL);
-        Cast(tCacheFloatBuf_.Get<float>(), tCache, RoundMode::CAST_NONE, alignedRopeDim_);
-        Cast(hCacheFloatBuf_.Get<float>(), hCache, RoundMode::CAST_NONE, alignedRopeDim_);
-        Cast(wCacheFloatBuf_.Get<float>(), wCache, RoundMode::CAST_NONE, alignedRopeDim_);
+        Cast(cosFloatBuf_.Get<float>(), cos, RoundMode::CAST_NONE, alignedRopeDim_);
+        Cast(sinFloatBuf_.Get<float>(), sin, RoundMode::CAST_NONE, alignedRopeDim_);
         pipe_barrier(PIPE_ALL);
-    }
-
-    __aicore__ inline uint32_t Axis(uint32_t dim) const
-    {
-        if (isInterleaved_) {
-            if ((dim % 3 == 1) && (dim <= 3 * sectionH_)) return 1;
-            if ((dim % 3 == 2) && (dim <= 3 * sectionW_)) return 2;
-            return 0;
-        }
-        if (dim < sectionT_) return 0;
-        if (dim < sectionT_ + sectionH_) return 1;
-        return 2;
-    }
-
-    __aicore__ inline float CacheValue(uint32_t axis, uint32_t offset)
-    {
-        if (axis == 0) return tCacheFloatBuf_.Get<float>().GetValue(offset);
-        if (axis == 1) return hCacheFloatBuf_.Get<float>().GetValue(offset);
-        return wCacheFloatBuf_.Get<float>().GetValue(offset);
     }
 
     __aicore__ inline void NormalizeRotate(
@@ -178,13 +141,11 @@ private:
         for (uint32_t dim = 0; dim < headSize_; ++dim) {
             float result = normalized.GetValue(dim);
             if (dim < ropeDim_) {
-                uint32_t offset = dim % halfRopeDim_;
-                uint32_t axis = Axis(offset);
                 uint32_t pair = dim < halfRopeDim_ ? dim + halfRopeDim_ : dim - halfRopeDim_;
                 float pairValue = normalized.GetValue(pair);
                 if (dim < halfRopeDim_) pairValue = -pairValue;
-                result = result * CacheValue(axis, offset) +
-                         pairValue * CacheValue(axis, halfRopeDim_ + offset);
+                result = result * cosFloatBuf_.Get<float>().GetValue(dim) +
+                         pairValue * sinFloatBuf_.Get<float>().GetValue(dim);
             }
             rotated.SetValue(dim, result);
         }
@@ -197,59 +158,43 @@ private:
 
     __aicore__ inline void ProcessQ(uint32_t token, uint32_t head)
     {
-        LoadCache(token);
+        LoadCosSin(token);
         NormalizeRotate(qOutGm_, token * qkvStride_ + head * headSize_,
                         token * qSize_ + head * headSize_, true);
     }
 
     __aicore__ inline void ProcessK(uint32_t token, uint32_t head)
     {
-        LoadCache(token);
+        LoadCosSin(token);
         NormalizeRotate(kOutGm_, token * qkvStride_ + qSize_ + head * headSize_,
                         token * kvSize_ + head * headSize_, false);
-    }
-
-    __aicore__ inline void CopyV(uint32_t token, uint32_t head)
-    {
-        LocalTensor<T> input = inputBuf_.Get<T>();
-        uint32_t inputOffset = token * qkvStride_ + qSize_ + kvSize_ + head * headSize_;
-        uint32_t outputOffset = token * kvSize_ + head * headSize_;
-        DataCopy(input, qkvGm_[inputOffset], alignedHeadSize_);
-        pipe_barrier(PIPE_ALL);
-        DataCopy(vOutGm_[outputOffset], input, alignedHeadSize_);
     }
 
     TPipe pipe_;
     TBuf<TPosition::VECCALC> inputBuf_, weightBuf_, weightFloatBuf_;
     TBuf<TPosition::VECCALC> normalizedBuf_, normBuf_, rotatedBuf_, outputBuf_;
-    TBuf<TPosition::VECCALC> tCacheBuf_, hCacheBuf_, wCacheBuf_;
-    TBuf<TPosition::VECCALC> tCacheFloatBuf_, hCacheFloatBuf_, wCacheFloatBuf_;
-    GlobalTensor<T> qkvGm_, qWeightGm_, kWeightGm_, cacheGm_;
-    GlobalTensor<int64_t> positionsGm_;
-    GlobalTensor<T> qOutGm_, kOutGm_, vOutGm_;
-    uint32_t numTokens_, positionStride_, numQHeads_, numKvHeads_, headSize_, ropeDim_, halfRopeDim_;
+    TBuf<TPosition::VECCALC> cosBuf_, sinBuf_, cosFloatBuf_, sinFloatBuf_;
+    GlobalTensor<T> qkvGm_, qWeightGm_, kWeightGm_, cosGm_, sinGm_;
+    GlobalTensor<T> qOutGm_, kOutGm_;
+    uint32_t numTokens_, numQHeads_, numKvHeads_, headSize_, ropeDim_, halfRopeDim_;
     uint32_t qSize_, kvSize_, qkvStride_, workPerToken_, totalWork_, blockDim_;
-    uint32_t alignedHeadSize_, alignedRopeDim_, sectionT_, sectionH_, sectionW_;
+    uint32_t alignedHeadSize_, alignedRopeDim_;
     float epsilon_, invHeadSize_;
-    bool isInterleaved_;
 };
 
 template <typename T>
 __aicore__ inline void RunKernel(
     __gm__ void* qkv, __gm__ void* qWeight, __gm__ void* kWeight,
-    __gm__ void* cache, __gm__ void* positions, __gm__ void* qOut,
-    __gm__ void* kOut, __gm__ void* vOut, uint32_t numTokens,
-    uint32_t positionStride, uint32_t maxPositions, uint32_t numQHeads,
+    __gm__ void* cos, __gm__ void* sin, __gm__ void* qOut,
+    __gm__ void* kOut, uint32_t numTokens, uint32_t numQHeads,
     uint32_t numKvHeads,
     uint32_t headSize, uint32_t ropeDim, float epsilon, float invHeadSize,
-    uint32_t sectionT, uint32_t sectionH, uint32_t sectionW,
-    uint32_t interleaved, uint32_t blockDim)
+    uint32_t blockDim)
 {
     SplitQkvRmsNormMropeKernel<T> op;
-    op.Init(qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
-            numTokens, positionStride, maxPositions, numQHeads, numKvHeads, headSize,
-            ropeDim, epsilon, invHeadSize, sectionT, sectionH, sectionW,
-            interleaved, blockDim);
+    op.Init(qkv, qWeight, kWeight, cos, sin, qOut, kOut,
+            numTokens, numQHeads, numKvHeads, headSize, ropeDim,
+            epsilon, invHeadSize, blockDim);
     op.Process();
 }
 
@@ -257,19 +202,15 @@ __aicore__ inline void RunKernel(
 
 #define MROPE_KERNEL_ARGS \
     __gm__ void* qkv, __gm__ void* qWeight, __gm__ void* kWeight, \
-    __gm__ void* cache, __gm__ void* positions, __gm__ void* qOut, \
-    __gm__ void* kOut, __gm__ void* vOut, uint32_t numTokens, \
-    uint32_t positionStride, uint32_t maxPositions, uint32_t numQHeads, \
+    __gm__ void* cos, __gm__ void* sin, __gm__ void* qOut, \
+    __gm__ void* kOut, uint32_t numTokens, uint32_t numQHeads, \
     uint32_t numKvHeads, \
     uint32_t headSize, uint32_t ropeDim, float epsilon, float invHeadSize, \
-    uint32_t sectionT, \
-    uint32_t sectionH, uint32_t sectionW, uint32_t interleaved, uint32_t blockDim
+    uint32_t blockDim
 
 #define MROPE_KERNEL_CALL \
-    qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut, numTokens, \
-    positionStride, maxPositions, numQHeads, numKvHeads, headSize, ropeDim, \
-    epsilon, invHeadSize, \
-    sectionT, sectionH, sectionW, interleaved, blockDim
+    qkv, qWeight, kWeight, cos, sin, qOut, kOut, numTokens, \
+    numQHeads, numKvHeads, headSize, ropeDim, epsilon, invHeadSize, blockDim
 
 extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_fp16_kernel(MROPE_KERNEL_ARGS)
 {
@@ -280,21 +221,16 @@ namespace vllm_ascend {
 
 void split_qkv_rmsnorm_mrope_impl(
     void* stream, void* qkv, void* qWeight, void* kWeight,
-    void* cache, void* positions, void* qOut, void* kOut, void* vOut,
-    uint32_t numTokens, uint32_t positionStride, uint32_t maxPositions,
+    void* cos, void* sin, void* qOut, void* kOut, uint32_t numTokens,
     uint32_t numQHeads,
     uint32_t numKvHeads, uint32_t headSize, uint32_t ropeDim, float epsilon,
-    uint32_t sectionT, uint32_t sectionH, uint32_t sectionW,
-    bool interleaved, uint32_t blockDim)
+    uint32_t blockDim)
 {
-    uint32_t interleavedValue = static_cast<uint32_t>(interleaved);
     float invHeadSize = 1.0F / static_cast<float>(headSize);
     split_qkv_rmsnorm_mrope_fp16_kernel<<<blockDim, nullptr, stream>>>(
-        qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
-        numTokens, positionStride, maxPositions, numQHeads, numKvHeads,
-        headSize, ropeDim,
-        epsilon, invHeadSize, sectionT, sectionH, sectionW,
-        interleavedValue, blockDim);
+        qkv, qWeight, kWeight, cos, sin, qOut, kOut, numTokens,
+        numQHeads, numKvHeads, headSize, ropeDim, epsilon, invHeadSize,
+        blockDim);
 }
 
 }  // namespace vllm_ascend

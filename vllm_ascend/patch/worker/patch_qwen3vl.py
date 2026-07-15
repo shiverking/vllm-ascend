@@ -11,6 +11,9 @@ from vllm_ascend import envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.utils import enable_custom_op, is_310p
 
+if is_310p():
+    from vllm_ascend._310p.ops.rotary_embedding import get_mrope_cos_sin_slices
+
 if not is_310p():
     from vllm.model_executor.models.qwen3_vl import (
         Qwen3_VisionTransformer,
@@ -96,6 +99,15 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
     )
     if is_mrope:
         cache = self.rotary_emb.cos_sin_cache
+        cos = sin = None
+        if (
+            ascendc_requested
+            and is_310p()
+            and qkv.shape[0] <= ASCENDC_MROPE_MAX_TOKENS
+        ):
+            cos_slice, sin_slice = get_mrope_cos_sin_slices(qkv.shape[0])
+            cos = cos_slice[0, :, 0, :]
+            sin = sin_slice[0, :, 0, :]
         dtype_supported = qkv.dtype == torch.float16
         custom_op_enabled = enable_custom_op() if ascendc_requested else False
         op_registered = custom_op_enabled and hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope")
@@ -103,14 +115,13 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             ascendc_requested
             and qkv.shape[0] <= ASCENDC_MROPE_MAX_TOKENS
             and dtype_supported
-            and positions.dtype == torch.int64
-            and positions.ndim == 2
-            and positions.shape[0] == 3
-            and all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache))
-            and positions.stride(1) == 1
-            and positions.stride(0) >= positions.shape[1]
-            and cache.device == qkv.device
-            and cache.dtype == qkv.dtype
+            and cos is not None
+            and sin is not None
+            and all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cos, sin))
+            and cos.device == qkv.device
+            and sin.device == qkv.device
+            and cos.dtype == qkv.dtype
+            and sin.dtype == qkv.dtype
             and op_registered
         )
         decision_marker = (
@@ -128,21 +139,20 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 f"use_ascendc={use_ascendc}, requested={ascendc_requested}, "
                 f"tokens={qkv.shape[0]}, max_tokens={ASCENDC_MROPE_MAX_TOKENS}, "
                 f"qkv={qkv.dtype}/{qkv.device}/contiguous={qkv.is_contiguous()}, "
-                f"positions={positions.dtype}/{tuple(positions.shape)}/contiguous={positions.is_contiguous()}, "
                 f"q_weight_contiguous={self.q_norm.weight.is_contiguous()}, "
                 f"k_weight_contiguous={self.k_norm.weight.is_contiguous()}, "
-                f"cache={cache.dtype}/{cache.device}/contiguous={cache.is_contiguous()}, "
+                f"prepared_cos_sin={None if cos is None else (cos.dtype, cos.device, cos.is_contiguous())}, "
                 f"custom_op_enabled={custom_op_enabled}, op_registered={op_registered}",
                 file=sys.stderr,
                 flush=True,
             )
             setattr(self, decision_marker, True)
         if use_ascendc:
-            q, k, v = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
-                qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
+            v = qkv.narrow(-1, self.q_size + self.kv_size, self.kv_size)
+            q, k = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
+                qkv, self.q_norm.weight, self.k_norm.weight, cos, sin,
                 self.num_heads, self.num_kv_heads, self.head_dim,
-                self.q_norm.variance_epsilon, self.rotary_emb.mrope_section,
-                self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon, self.rotary_emb.rotary_dim,
             )
             if not torch.compiler.is_compiling():
                 if debug_layer and not getattr(self, "_ascendc_mrope_eager_kernel_printed", False):
@@ -163,18 +173,17 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                     )
                 if not dtype_supported:
                     reasons.append(f"qkv dtype is {qkv.dtype}, expected torch.float16")
-                if positions.dtype != torch.int64 or positions.ndim != 2 or positions.shape[0] != 3:
-                    reasons.append(
-                        f"positions is dtype={positions.dtype}, shape={tuple(positions.shape)}, expected int64 [3, T]"
-                    )
-                if not all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache)):
-                    reasons.append("qkv, weights, or cache is not contiguous")
-                if positions.stride(1) != 1 or positions.stride(0) < positions.shape[1]:
-                    reasons.append("positions token dimension is not contiguous or rows overlap")
-                if cache.device != qkv.device or cache.dtype != qkv.dtype:
-                    reasons.append(
-                        f"cache is {cache.device}/{cache.dtype}, qkv is {qkv.device}/{qkv.dtype}"
-                    )
+                if cos is None or sin is None:
+                    reasons.append("prepared MRoPE cos/sin is unavailable")
+                elif not all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cos, sin)):
+                    reasons.append("qkv, weights, cos, or sin is not contiguous")
+                elif (
+                    cos.device != qkv.device
+                    or sin.device != qkv.device
+                    or cos.dtype != qkv.dtype
+                    or sin.dtype != qkv.dtype
+                ):
+                    reasons.append("prepared cos/sin does not match qkv dtype or device")
                 if not custom_op_enabled:
                     reasons.append("custom op extension is not enabled")
                 elif not op_registered:

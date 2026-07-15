@@ -32,6 +32,18 @@ _mrope_cos_slice: torch.Tensor | None = None
 _mrope_sin_slice: torch.Tensor | None = None
 
 
+def get_mrope_cos_sin_slices(num_tokens: int) -> tuple[torch.Tensor, torch.Tensor]:
+    if _mrope_cos_slice is None or _mrope_sin_slice is None:
+        raise RuntimeError(
+            "MRoPE cos/sin slices are not initialized. "
+            "Call set_mrope_apply_rotary_slices before forward."
+        )
+    return (
+        _mrope_cos_slice[:, :num_tokens],
+        _mrope_sin_slice[:, :num_tokens],
+    )
+
+
 def _apply_rotary_mrope_torch(
     q_rot: torch.Tensor,
     k_rot: torch.Tensor,
@@ -193,11 +205,7 @@ class AscendMRotaryEmbedding310(MRotaryEmbedding):
         # Here `rotary_mode` matches vLLM ApplyRotaryEmb: half = neox chunk, interleave = GPT-J pairs.
         rotary_mode = "half" if self.is_neox_style else "interleave"
         num_tokens = query.shape[0]
-        if _mrope_cos_slice is None or _mrope_sin_slice is None:
-            raise RuntimeError(
-                "MRoPE cos/sin slices are not initialized. Call set_mrope_apply_rotary_slices before forward."
-            )
-        cos, sin = _mrope_cos_slice[:, :num_tokens], _mrope_sin_slice[:, :num_tokens]
+        cos, sin = get_mrope_cos_sin_slices(num_tokens)
 
         is_partial_rope = self.rotary_dim < self.head_size
         if is_partial_rope:

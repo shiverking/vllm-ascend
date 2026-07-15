@@ -148,11 +148,9 @@ namespace vllm_ascend {
 
     extern void split_qkv_rmsnorm_mrope_impl(
         void* stream, void* qkv, void* q_weight,
-        void* k_weight, void* cos_sin_cache, void* positions,
-        void* q_out, void* k_out, void* v_out, uint32_t num_tokens,
-        uint32_t position_stride, uint32_t max_positions,
+        void* k_weight, void* cos, void* sin,
+        void* q_out, void* k_out, uint32_t num_tokens,
         uint32_t num_q_heads, uint32_t num_kv_heads,
         uint32_t head_size, uint32_t rope_dim, float epsilon,
-        uint32_t section_t, uint32_t section_h, uint32_t section_w,
-        bool is_interleaved, uint32_t block_dim);
+        uint32_t block_dim);
 }
