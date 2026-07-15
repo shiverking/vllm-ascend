@@ -76,6 +76,13 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
     qkv, _ = self.qkv_proj(hidden_states)
     ascendc_requested = ASCENDC_MROPE_REQUESTED
     if not torch.compiler.is_compiling():
+        if not getattr(self, "_ascendc_mrope_eager_dispatch_printed", False):
+            print(
+                "[ASCENDC_MROPE_DEBUG] eager patched attention forward reached",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._ascendc_mrope_eager_dispatch_printed = True
         logger.warning_once(
             "Patched Qwen3 attention forward reached; AscendC MRoPE requested=%s.",
             ascendc_requested,
@@ -99,6 +106,15 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             and cache.dtype == qkv.dtype
             and op_registered
         )
+        if not torch.compiler.is_compiling() and not getattr(
+            self, "_ascendc_mrope_eager_decision_printed", False
+        ):
+            print(
+                f"[ASCENDC_MROPE_DEBUG] eager use_ascendc={use_ascendc}",
+                file=sys.stderr,
+                flush=True,
+            )
+            self._ascendc_mrope_eager_decision_printed = True
         if use_ascendc:
             q, k, v = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
                 qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
@@ -107,6 +123,13 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
             )
             if not torch.compiler.is_compiling():
+                if not getattr(self, "_ascendc_mrope_eager_kernel_printed", False):
+                    print(
+                        "[ASCENDC_MROPE_DEBUG] eager AscendC kernel returned successfully",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    self._ascendc_mrope_eager_kernel_printed = True
                 logger.warning_once("Executed experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
         elif is_310p():
             if ascendc_requested and not torch.compiler.is_compiling():
