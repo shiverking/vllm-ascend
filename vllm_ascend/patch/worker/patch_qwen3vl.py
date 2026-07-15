@@ -104,7 +104,9 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             and positions.dtype == torch.int64
             and positions.ndim == 2
             and positions.shape[0] == 3
-            and all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache, positions))
+            and all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache))
+            and positions.stride(1) == 1
+            and positions.stride(0) >= positions.shape[1]
             and cache.device == qkv.device
             and cache.dtype == qkv.dtype
             and op_registered
@@ -152,8 +154,10 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                     reasons.append(
                         f"positions is dtype={positions.dtype}, shape={tuple(positions.shape)}, expected int64 [3, T]"
                     )
-                if not all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache, positions)):
-                    reasons.append("one or more inputs are not contiguous")
+                if not all(t.is_contiguous() for t in (qkv, self.q_norm.weight, self.k_norm.weight, cache)):
+                    reasons.append("qkv, weights, or cache is not contiguous")
+                if positions.stride(1) != 1 or positions.stride(0) < positions.shape[1]:
+                    reasons.append("positions token dimension is not contiguous or rows overlap")
                 if cache.device != qkv.device or cache.dtype != qkv.dtype:
                     reasons.append(
                         f"cache is {cache.device}/{cache.dtype}, qkv is {qkv.device}/{qkv.dtype}"

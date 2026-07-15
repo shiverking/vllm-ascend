@@ -436,10 +436,12 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
                 qkv.device() == cos_sin_cache.device() && qkv.device() == positions.device(),
                 "all inputs must be on the same device");
     TORCH_CHECK(qkv.is_contiguous() && q_weight.is_contiguous() &&
-                k_weight.is_contiguous() && cos_sin_cache.is_contiguous() &&
-                positions.is_contiguous(), "all inputs must be contiguous");
+                k_weight.is_contiguous() && cos_sin_cache.is_contiguous(),
+                "qkv, weights, and cache must be contiguous");
     TORCH_CHECK(positions.scalar_type() == at::kLong && positions.dim() == 2 && positions.size(0) == 3,
-                "positions must be contiguous int64 with shape [3, num_tokens]");
+                "positions must be int64 with shape [3, num_tokens]");
+    TORCH_CHECK(positions.stride(1) == 1 && positions.stride(0) >= positions.size(1),
+                "positions must have a contiguous token dimension and non-overlapping rows");
     TORCH_CHECK(cos_sin_cache.dim() == 2 && cos_sin_cache.size(0) > 0,
                 "cos_sin_cache must be 2D and non-empty");
     TORCH_CHECK(num_q_heads > 0 && num_kv_heads > 0, "head counts must be positive");
@@ -482,6 +484,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
             stream, qkv.data_ptr(), q_weight.data_ptr(), k_weight.data_ptr(),
             cos_sin_cache.data_ptr(), positions.data_ptr(), q_out.data_ptr(),
             k_out.data_ptr(), v_out.data_ptr(), static_cast<uint32_t>(num_tokens),
+            static_cast<uint32_t>(positions.stride(0)),
             static_cast<uint32_t>(cos_sin_cache.size(0)), static_cast<uint32_t>(num_q_heads),
             static_cast<uint32_t>(num_kv_heads), static_cast<uint32_t>(head_size),
             static_cast<uint32_t>(rope_dim), static_cast<float>(epsilon),

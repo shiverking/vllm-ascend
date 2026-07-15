@@ -28,12 +28,14 @@ public:
         __gm__ void* qkv, __gm__ void* qWeight, __gm__ void* kWeight,
         __gm__ void* cosSinCache, __gm__ void* positions,
         __gm__ void* qOut, __gm__ void* kOut, __gm__ void* vOut,
-        uint32_t numTokens, uint32_t maxPositions, uint32_t numQHeads,
+        uint32_t numTokens, uint32_t positionStride, uint32_t maxPositions,
+        uint32_t numQHeads,
         uint32_t numKvHeads, uint32_t headSize, uint32_t ropeDim,
         float epsilon, float invHeadSize, uint32_t sectionT, uint32_t sectionH,
         uint32_t sectionW, uint32_t isInterleaved, uint32_t blockDim)
     {
         numTokens_ = numTokens;
+        positionStride_ = positionStride;
         numQHeads_ = numQHeads;
         numKvHeads_ = numKvHeads;
         headSize_ = headSize;
@@ -56,7 +58,8 @@ public:
         qWeightGm_.SetGlobalBuffer(static_cast<__gm__ T*>(qWeight), headSize);
         kWeightGm_.SetGlobalBuffer(static_cast<__gm__ T*>(kWeight), headSize);
         cacheGm_.SetGlobalBuffer(static_cast<__gm__ T*>(cosSinCache), maxPositions * ropeDim);
-        positionsGm_.SetGlobalBuffer(static_cast<__gm__ int64_t*>(positions), 3 * numTokens);
+        positionsGm_.SetGlobalBuffer(
+            static_cast<__gm__ int64_t*>(positions), 2 * positionStride + numTokens);
         qOutGm_.SetGlobalBuffer(static_cast<__gm__ T*>(qOut), numTokens * qSize_);
         kOutGm_.SetGlobalBuffer(static_cast<__gm__ T*>(kOut), numTokens * kvSize_);
         vOutGm_.SetGlobalBuffer(static_cast<__gm__ T*>(vOut), numTokens * kvSize_);
@@ -103,8 +106,8 @@ private:
     __aicore__ inline void LoadCache(uint32_t token)
     {
         int64_t tPosition = positionsGm_.GetValue(token);
-        int64_t hPosition = positionsGm_.GetValue(numTokens_ + token);
-        int64_t wPosition = positionsGm_.GetValue(2 * numTokens_ + token);
+        int64_t hPosition = positionsGm_.GetValue(positionStride_ + token);
+        int64_t wPosition = positionsGm_.GetValue(2 * positionStride_ + token);
         LocalTensor<T> tCache = tCacheBuf_.Get<T>();
         LocalTensor<T> hCache = hCacheBuf_.Get<T>();
         LocalTensor<T> wCache = wCacheBuf_.Get<T>();
@@ -224,7 +227,7 @@ private:
     GlobalTensor<T> qkvGm_, qWeightGm_, kWeightGm_, cacheGm_;
     GlobalTensor<int64_t> positionsGm_;
     GlobalTensor<T> qOutGm_, kOutGm_, vOutGm_;
-    uint32_t numTokens_, numQHeads_, numKvHeads_, headSize_, ropeDim_, halfRopeDim_;
+    uint32_t numTokens_, positionStride_, numQHeads_, numKvHeads_, headSize_, ropeDim_, halfRopeDim_;
     uint32_t qSize_, kvSize_, qkvStride_, workPerToken_, totalWork_, blockDim_;
     uint32_t alignedHeadSize_, alignedRopeDim_, sectionT_, sectionH_, sectionW_;
     float epsilon_, invHeadSize_;
@@ -236,14 +239,15 @@ __aicore__ inline void RunKernel(
     __gm__ void* qkv, __gm__ void* qWeight, __gm__ void* kWeight,
     __gm__ void* cache, __gm__ void* positions, __gm__ void* qOut,
     __gm__ void* kOut, __gm__ void* vOut, uint32_t numTokens,
-    uint32_t maxPositions, uint32_t numQHeads, uint32_t numKvHeads,
+    uint32_t positionStride, uint32_t maxPositions, uint32_t numQHeads,
+    uint32_t numKvHeads,
     uint32_t headSize, uint32_t ropeDim, float epsilon, float invHeadSize,
     uint32_t sectionT, uint32_t sectionH, uint32_t sectionW,
     uint32_t interleaved, uint32_t blockDim)
 {
     SplitQkvRmsNormMropeKernel<T> op;
     op.Init(qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
-            numTokens, maxPositions, numQHeads, numKvHeads, headSize,
+            numTokens, positionStride, maxPositions, numQHeads, numKvHeads, headSize,
             ropeDim, epsilon, invHeadSize, sectionT, sectionH, sectionW,
             interleaved, blockDim);
     op.Process();
@@ -255,14 +259,16 @@ __aicore__ inline void RunKernel(
     __gm__ void* qkv, __gm__ void* qWeight, __gm__ void* kWeight, \
     __gm__ void* cache, __gm__ void* positions, __gm__ void* qOut, \
     __gm__ void* kOut, __gm__ void* vOut, uint32_t numTokens, \
-    uint32_t maxPositions, uint32_t numQHeads, uint32_t numKvHeads, \
+    uint32_t positionStride, uint32_t maxPositions, uint32_t numQHeads, \
+    uint32_t numKvHeads, \
     uint32_t headSize, uint32_t ropeDim, float epsilon, float invHeadSize, \
     uint32_t sectionT, \
     uint32_t sectionH, uint32_t sectionW, uint32_t interleaved, uint32_t blockDim
 
 #define MROPE_KERNEL_CALL \
     qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut, numTokens, \
-    maxPositions, numQHeads, numKvHeads, headSize, ropeDim, epsilon, invHeadSize, \
+    positionStride, maxPositions, numQHeads, numKvHeads, headSize, ropeDim, \
+    epsilon, invHeadSize, \
     sectionT, sectionH, sectionW, interleaved, blockDim
 
 extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_fp16_kernel(MROPE_KERNEL_ARGS)
@@ -275,7 +281,8 @@ namespace vllm_ascend {
 void split_qkv_rmsnorm_mrope_impl(
     void* stream, void* qkv, void* qWeight, void* kWeight,
     void* cache, void* positions, void* qOut, void* kOut, void* vOut,
-    uint32_t numTokens, uint32_t maxPositions, uint32_t numQHeads,
+    uint32_t numTokens, uint32_t positionStride, uint32_t maxPositions,
+    uint32_t numQHeads,
     uint32_t numKvHeads, uint32_t headSize, uint32_t ropeDim, float epsilon,
     uint32_t sectionT, uint32_t sectionH, uint32_t sectionW,
     bool interleaved, uint32_t blockDim)
@@ -284,7 +291,8 @@ void split_qkv_rmsnorm_mrope_impl(
     float invHeadSize = 1.0F / static_cast<float>(headSize);
     split_qkv_rmsnorm_mrope_fp16_kernel<<<blockDim, nullptr, stream>>>(
         qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
-        numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
+        numTokens, positionStride, maxPositions, numQHeads, numKvHeads,
+        headSize, ropeDim,
         epsilon, invHeadSize, sectionT, sectionH, sectionW,
         interleavedValue, blockDim);
 }

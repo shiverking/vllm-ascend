@@ -54,7 +54,11 @@ def test_split_qkv_rmsnorm_mrope_ascendc(tokens, interleaved):
     q_weight = torch.randn(head_size, device="npu", dtype=dtype)
     k_weight = torch.randn(head_size, device="npu", dtype=dtype)
     cache = torch.randn(4096, head_size, device="npu", dtype=dtype)
-    positions = torch.randint(0, 4096, (3, tokens), device="npu", dtype=torch.int64)
+    positions_storage = torch.randint(
+        0, 4096, (3, tokens + 7), device="npu", dtype=torch.int64
+    )
+    positions = positions_storage[:, :tokens]
+    assert positions.stride(1) == 1 and not positions.is_contiguous()
 
     expected = reference(
         qkv, q_weight, k_weight, cache, positions,
