@@ -20,6 +20,7 @@ if not is_310p():
 
 logger = init_logger(__name__)
 ASCENDC_MROPE_REQUESTED = envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE
+ASCENDC_MROPE_MAX_TOKENS = 32
 
 
 def log_runtime_qwen3_attention(model: torch.nn.Module) -> None:
@@ -100,6 +101,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
         op_registered = custom_op_enabled and hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope")
         use_ascendc = (
             ascendc_requested
+            and qkv.shape[0] <= ASCENDC_MROPE_MAX_TOKENS
             and dtype_supported
             and positions.dtype == torch.int64
             and positions.ndim == 2
@@ -111,14 +113,20 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
             and cache.dtype == qkv.dtype
             and op_registered
         )
+        decision_marker = (
+            "_ascendc_mrope_eager_enabled_printed"
+            if use_ascendc
+            else "_ascendc_mrope_eager_fallback_printed"
+        )
         if (
             debug_layer
             and not torch.compiler.is_compiling()
-            and not getattr(self, "_ascendc_mrope_eager_decision_printed", False)
+            and not getattr(self, decision_marker, False)
         ):
             print(
                 "[ASCENDC_MROPE_DEBUG] "
                 f"use_ascendc={use_ascendc}, requested={ascendc_requested}, "
+                f"tokens={qkv.shape[0]}, max_tokens={ASCENDC_MROPE_MAX_TOKENS}, "
                 f"qkv={qkv.dtype}/{qkv.device}/contiguous={qkv.is_contiguous()}, "
                 f"positions={positions.dtype}/{tuple(positions.shape)}/contiguous={positions.is_contiguous()}, "
                 f"q_weight_contiguous={self.q_norm.weight.is_contiguous()}, "
@@ -128,7 +136,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 file=sys.stderr,
                 flush=True,
             )
-            self._ascendc_mrope_eager_decision_printed = True
+            setattr(self, decision_marker, True)
         if use_ascendc:
             q, k, v = torch.ops._C_ascend.npu_split_qkv_rmsnorm_mrope(
                 qkv, self.q_norm.weight, self.k_norm.weight, cache, positions,
@@ -148,6 +156,11 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
         elif is_310p():
             if ascendc_requested and not torch.compiler.is_compiling():
                 reasons = []
+                if qkv.shape[0] > ASCENDC_MROPE_MAX_TOKENS:
+                    reasons.append(
+                        f"num_tokens={qkv.shape[0]} exceeds decode threshold "
+                        f"{ASCENDC_MROPE_MAX_TOKENS}"
+                    )
                 if not dtype_supported:
                     reasons.append(f"qkv dtype is {qkv.dtype}, expected torch.float16")
                 if positions.dtype != torch.int64 or positions.ndim != 2 or positions.shape[0] != 3:
