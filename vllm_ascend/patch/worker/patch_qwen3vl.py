@@ -75,21 +75,17 @@ def tensor_parallel_wrap(func):
 def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_states: torch.Tensor):
     qkv, _ = self.qkv_proj(hidden_states)
     ascendc_requested = ASCENDC_MROPE_REQUESTED
-    logger.warning_once(
-        "Patched Qwen3 attention forward reached; AscendC MRoPE requested=%s.",
-        ascendc_requested,
-    )
+    if not torch.compiler.is_compiling():
+        logger.warning_once(
+            "Patched Qwen3 attention forward reached; AscendC MRoPE requested=%s.",
+            ascendc_requested,
+        )
     is_mrope = isinstance(self.rotary_emb, MRotaryEmbedding) or all(
         hasattr(self.rotary_emb, attr) for attr in ("mrope_section", "mrope_interleaved", "cos_sin_cache")
     )
     if is_mrope:
         cache = self.rotary_emb.cos_sin_cache
         dtype_supported = qkv.dtype == torch.float16
-        if ascendc_requested and dtype_supported and (
-            cache.device != qkv.device or cache.dtype != qkv.dtype
-        ):
-            self.rotary_emb.cos_sin_cache = cache.to(device=qkv.device, dtype=qkv.dtype)
-            cache = self.rotary_emb.cos_sin_cache
         custom_op_enabled = enable_custom_op() if ascendc_requested else False
         op_registered = custom_op_enabled and hasattr(torch.ops._C_ascend, "npu_split_qkv_rmsnorm_mrope")
         use_ascendc = (
@@ -110,9 +106,10 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 self.q_norm.variance_epsilon, self.rotary_emb.mrope_section,
                 self.rotary_emb.mrope_interleaved, self.rotary_emb.rotary_dim,
             )
-            logger.warning_once("Executed experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
+            if not torch.compiler.is_compiling():
+                logger.warning_once("Executed experimental AscendC split QKV + RMSNorm + MRoPE kernel.")
         elif is_310p():
-            if ascendc_requested:
+            if ascendc_requested and not torch.compiler.is_compiling():
                 reasons = []
                 if not dtype_supported:
                     reasons.append(f"qkv dtype is {qkv.dtype}, expected torch.float16")
@@ -145,7 +142,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
                 is_interleaved=self.rotary_emb.mrope_interleaved, rope_dim=self.rotary_emb.rotary_dim,
             )
     else:
-        if ascendc_requested:
+        if ascendc_requested and not torch.compiler.is_compiling():
             logger.warning_once(
                 "AscendC MRoPE fallback reason: rotary embedding type is %s, expected MRotaryEmbedding",
                 type(self.rotary_emb).__name__,
@@ -172,6 +169,12 @@ def patch_runtime_qwen3_attention(model: torch.nn.Module) -> None:
             hasattr(module, attr) for attr in ("qkv_proj", "q_norm", "k_norm", "rotary_emb")
         ):
             continue
+        cache = module.rotary_emb.cos_sin_cache
+        weight = module.q_norm.weight
+        if cache.device != weight.device or cache.dtype != weight.dtype:
+            module.rotary_emb.cos_sin_cache = cache.to(
+                device=weight.device, dtype=weight.dtype
+            )
         module.forward = forward_with_split_qkv_rmsnorm_mrope.__get__(
             module, type(module)
         )
