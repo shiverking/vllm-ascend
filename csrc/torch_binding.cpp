@@ -426,11 +426,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
     bool is_interleaved, int64_t rope_dim)
 {
     TORCH_CHECK(qkv.dim() == 2, "qkv must be 2D");
-    TORCH_CHECK(qkv.scalar_type() == at::kHalf || qkv.scalar_type() == at::kBFloat16,
-                "qkv must be float16 or bfloat16");
-#ifdef ASCEND_PLATFORM_310P
-    TORCH_CHECK(qkv.scalar_type() == at::kHalf, "Ascend 310P supports float16 only");
-#endif
+    TORCH_CHECK(qkv.scalar_type() == at::kHalf, "this experimental kernel supports float16 only");
     TORCH_CHECK(q_weight.scalar_type() == qkv.scalar_type() &&
                 k_weight.scalar_type() == qkv.scalar_type() &&
                 cos_sin_cache.scalar_type() == qkv.scalar_type(),
@@ -469,7 +465,6 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
     at::Tensor k_out = at::empty({num_tokens, kv_size}, qkv.options());
     at::Tensor v_out = at::empty({num_tokens, kv_size}, qkv.options());
     aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
-    AscendType type = get_dtype_from_torch(qkv.scalar_type());
     uint32_t total_work = static_cast<uint32_t>(num_tokens * (num_q_heads + 2 * num_kv_heads));
 
     at_npu::native::OpCommand cmd;
@@ -483,7 +478,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_split_qkv_rmsnorm_mrope(
         TORCH_CHECK(core_num > 0, "NPU vector core count must be positive");
         uint32_t block_dim = std::min(total_work, static_cast<uint32_t>(core_num));
         split_qkv_rmsnorm_mrope_impl(
-            type, stream, qkv.data_ptr(), q_weight.data_ptr(), k_weight.data_ptr(),
+            stream, qkv.data_ptr(), q_weight.data_ptr(), k_weight.data_ptr(),
             cos_sin_cache.data_ptr(), positions.data_ptr(), q_out.data_ptr(),
             k_out.data_ptr(), v_out.data_ptr(), static_cast<uint32_t>(num_tokens),
             static_cast<uint32_t>(cos_sin_cache.size(0)), static_cast<uint32_t>(num_q_heads),

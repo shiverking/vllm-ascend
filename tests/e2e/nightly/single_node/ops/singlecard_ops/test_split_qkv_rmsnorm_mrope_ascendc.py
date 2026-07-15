@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from vllm_ascend.utils import enable_custom_op, is_310p
+from vllm_ascend.utils import enable_custom_op
 
 
 def reference(
@@ -44,7 +44,7 @@ def reference(
 @torch.inference_mode()
 def test_split_qkv_rmsnorm_mrope_ascendc(tokens, interleaved):
     assert enable_custom_op()
-    dtype = torch.float16 if is_310p() else torch.bfloat16
+    dtype = torch.float16
     num_q_heads, num_kv_heads, head_size = 8, 2, 128
     sections = [16, 24, 24]
     q_size = num_q_heads * head_size
@@ -64,7 +64,7 @@ def test_split_qkv_rmsnorm_mrope_ascendc(tokens, interleaved):
         qkv, q_weight, k_weight, cache, positions, num_q_heads,
         num_kv_heads, head_size, 1e-6, sections, interleaved, head_size,
     )
-    tolerance = 3e-2 if dtype == torch.float16 else 2e-2
+    tolerance = 3e-2
     torch.testing.assert_close(actual[0], expected[0], atol=tolerance, rtol=tolerance)
     torch.testing.assert_close(actual[1], expected[1], atol=tolerance, rtol=tolerance)
     torch.testing.assert_close(actual[2], expected[2], atol=0, rtol=0)

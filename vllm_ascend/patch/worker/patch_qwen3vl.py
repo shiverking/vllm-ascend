@@ -41,7 +41,7 @@ def forward_with_split_qkv_rmsnorm_mrope(self, positions: torch.Tensor, hidden_s
     qkv, _ = self.qkv_proj(hidden_states)
     if isinstance(self.rotary_emb, AscendMRotaryEmbedding):
         cache = self.rotary_emb.cos_sin_cache
-        dtype_supported = qkv.dtype == torch.float16 or (qkv.dtype == torch.bfloat16 and not is_310p())
+        dtype_supported = qkv.dtype == torch.float16
         if envs.VLLM_ASCEND_ENABLE_ASCENDC_MROPE and dtype_supported and (
             cache.device != qkv.device or cache.dtype != qkv.dtype
         ):

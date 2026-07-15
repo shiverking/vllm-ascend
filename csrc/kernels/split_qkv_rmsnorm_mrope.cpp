@@ -14,7 +14,6 @@
  */
 
 #include "kernel_operator.h"
-#include "types.h"
 
 using namespace AscendC;
 
@@ -268,18 +267,10 @@ extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_fp16_kernel(MROPE_
     RunKernel<half>(MROPE_KERNEL_CALL);
 }
 
-#if !defined(ASCEND_PLATFORM_310P) && \
-    (!defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220))
-extern "C" __global__ __aicore__ void split_qkv_rmsnorm_mrope_bf16_kernel(MROPE_KERNEL_ARGS)
-{
-    RunKernel<bfloat16_t>(MROPE_KERNEL_CALL);
-}
-#endif
-
 namespace vllm_ascend {
 
 void split_qkv_rmsnorm_mrope_impl(
-    AscendType type, void* stream, void* qkv, void* qWeight, void* kWeight,
+    void* stream, void* qkv, void* qWeight, void* kWeight,
     void* cache, void* positions, void* qOut, void* kOut, void* vOut,
     uint32_t numTokens, uint32_t maxPositions, uint32_t numQHeads,
     uint32_t numKvHeads, uint32_t headSize, uint32_t ropeDim, float epsilon,
@@ -288,24 +279,11 @@ void split_qkv_rmsnorm_mrope_impl(
 {
     uint32_t interleavedValue = static_cast<uint32_t>(interleaved);
     float invHeadSize = 1.0F / static_cast<float>(headSize);
-    if (type == AscendType::FP16) {
-        split_qkv_rmsnorm_mrope_fp16_kernel<<<blockDim, nullptr, stream>>>(
-            qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
-            numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
-            epsilon, invHeadSize, sectionT, sectionH, sectionW,
-            interleavedValue, blockDim);
-        return;
-    }
-#if !defined(ASCEND_PLATFORM_310P) && \
-    (!defined(__CCE_AICORE__) || (__CCE_AICORE__ >= 220))
-    if (type == AscendType::BF16) {
-        split_qkv_rmsnorm_mrope_bf16_kernel<<<blockDim, nullptr, stream>>>(
-            qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
-            numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
-            epsilon, invHeadSize, sectionT, sectionH, sectionW,
-            interleavedValue, blockDim);
-    }
-#endif
+    split_qkv_rmsnorm_mrope_fp16_kernel<<<blockDim, nullptr, stream>>>(
+        qkv, qWeight, kWeight, cache, positions, qOut, kOut, vOut,
+        numTokens, maxPositions, numQHeads, numKvHeads, headSize, ropeDim,
+        epsilon, invHeadSize, sectionT, sectionH, sectionW,
+        interleavedValue, blockDim);
 }
 
 }  // namespace vllm_ascend

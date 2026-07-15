@@ -147,7 +147,7 @@ namespace vllm_ascend {
     );
 
     extern void split_qkv_rmsnorm_mrope_impl(
-        AscendType type, void* stream, void* qkv, void* q_weight,
+        void* stream, void* qkv, void* q_weight,
         void* k_weight, void* cos_sin_cache, void* positions,
         void* q_out, void* k_out, void* v_out, uint32_t num_tokens,
         uint32_t max_positions, uint32_t num_q_heads, uint32_t num_kv_heads,
