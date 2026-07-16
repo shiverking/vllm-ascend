@@ -89,6 +89,7 @@ def test_mm_encoder_attention_310_reuses_cpu_sequence_lengths():
     layer.enable_pad = False
     layer.scale_value = layer.head_size**-0.5
     layer.support_approximate_calculation = False
+    layer.layer_name = "audio_tower.layers.0.self_attn.attn"
 
     query = torch.randn(1, 5, layer.num_heads, layer.head_size)
     sequence_lengths = torch.tensor([2, 3], dtype=torch.int32, device="cpu")
@@ -100,9 +101,7 @@ def test_mm_encoder_attention_310_reuses_cpu_sequence_lengths():
         out.copy_(query)
 
     with (
-        mock.patch(
-            "vllm_ascend._310p.ops.mm_encoder_attention.logger.info_once"
-        ) as mock_info_once,
+        mock.patch("builtins.print") as mock_print,
         mock.patch(
             "vllm_ascend._310p.ops.mm_encoder_attention.torch.diff",
             side_effect=AssertionError("cu_seqlens must not be read"),
@@ -122,5 +121,9 @@ def test_mm_encoder_attention_310_reuses_cpu_sequence_lengths():
         )
 
     assert captured_seq_lens is sequence_lengths
-    mock_info_once.assert_called_once()
+    mock_print.assert_called_once_with(
+        "[AUDIO_ENCODER_D2H] 310P attention is reusing precomputed CPU "
+        "sequence lengths; per-layer D2H skipped.",
+        flush=True,
+    )
     torch.testing.assert_close(out, query)

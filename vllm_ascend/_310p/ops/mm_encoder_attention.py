@@ -19,13 +19,10 @@ import einops
 import torch
 import torch.nn.functional as F
 import torch_npu
-from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
 MIN_PAD_SIZE: int = 64  # min_size to pad weight
 MAX_PAD_SIZE: int = 128  # max_size to pad weight
-
-logger = init_logger(__name__)
 
 
 class AscendMMEncoderAttention310(MMEncoderAttention):
@@ -95,21 +92,14 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
         kv_len = key.size(1)
         is_reshaped = query.dim() == 4
 
-        print(
-            "[AUDIO_ENCODER_D2H_DEBUG] Entered "
-            "AscendMMEncoderAttention310.forward_oot; "
-            f"layer={getattr(self, 'layer_name', '<unknown>')}; "
-            f"sequence_lengths_is_none={sequence_lengths is None}; "
-            f"cu_seqlens_device={getattr(cu_seqlens, 'device', None)}",
-            flush=True,
-        )
-
         if sequence_lengths is not None:
             seq_lens_cpu = sequence_lengths.to(device="cpu", dtype=torch.int32)
-            print(
-                "[AUDIO_ENCODER_D2H] 310P attention reused precomputed CPU "
-                "sequence lengths; per-layer D2H skipped."
-            )
+            if ".layers.0." in getattr(self, "layer_name", ""):
+                print(
+                    "[AUDIO_ENCODER_D2H] 310P attention is reusing "
+                    "precomputed CPU sequence lengths; per-layer D2H skipped.",
+                    flush=True,
+                )
         else:
             if cu_seqlens is None:
                 cu_seqlens = torch.arange(
