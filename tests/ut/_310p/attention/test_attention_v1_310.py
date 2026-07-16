@@ -112,6 +112,25 @@ class TestAscendAttentionBackendImpl310(TestBase):
         self.assertIs(kwargs["out"], output)
         self.assertIs(result, output)
 
+    def test_forward_prefill_310_uses_host_actual_token_count(self):
+        query = torch.randn(16, 8, 64)
+        key = torch.randn_like(query)
+        value = torch.randn_like(query)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.attn_mask = torch.randn(1, 1, 16, 16)
+        # Deliberately differ from sum(seq_lens) to verify that the host-side
+        # token count, rather than a device reduction, drives padding.
+        metadata.seq_lens = torch.tensor([4, 5])
+        metadata.num_actual_tokens = 10
+
+        self.impl._flash_attention = MagicMock(return_value=output)
+        result = self.impl.forward_prefill_310(query, key, value, metadata, output)
+
+        args, _ = self.impl._flash_attention.call_args
+        torch.testing.assert_close(args[4], torch.tensor([4, 11]))
+        self.assertIs(result, output)
+
     @patch("torch_npu.npu_format_cast", return_value=torch.randn((1, 128, 16, 16), dtype=torch.float16))
     @patch("torch_npu._npu_reshape_and_cache")
     @patch("torch_npu._npu_paged_attention_splitfuse")

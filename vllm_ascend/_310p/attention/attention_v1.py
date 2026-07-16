@@ -219,7 +219,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         Returns:
             The output tensor after flash attention.
         """
-        real_tokens = int(attn_metadata.seq_lens.sum().item())
+        real_tokens = int(attn_metadata.num_actual_tokens)
         seq_len = attn_metadata.seq_lens
         aligned_tokens = int(query.shape[0])
         delta = aligned_tokens - real_tokens
