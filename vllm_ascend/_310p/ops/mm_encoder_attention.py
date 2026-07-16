@@ -19,20 +19,13 @@ import einops
 import torch
 import torch.nn.functional as F
 import torch_npu
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
 MIN_PAD_SIZE: int = 64  # min_size to pad weight
 MAX_PAD_SIZE: int = 128  # max_size to pad weight
 
-# Use seq_lens CPU cache to avoid frequent d2h copy.
-# AscendMMEncoderAttention310 will copy the cu_seqlens from NPU to CPU in every
-# forward, since the op _npu_flash_attention_unpad() requires CPU cu_seqlens
-# (otherwise it will break down).
-# Thus, we use seq_lens_cpu_cache to cache this tensor, since it's shared
-# between all layers, but may change in different forward step. When the
-# current layer_index is 0, we update the cache, otherwise we directly use the
-# cache to avoid frequent diff and copy operations, which are costful.
-seq_lens_cpu_cache: torch.Tensor = None
+logger = init_logger(__name__)
 
 
 class AscendMMEncoderAttention310(MMEncoderAttention):
@@ -102,10 +95,22 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
         kv_len = key.size(1)
         is_reshaped = query.dim() == 4
 
-        # Directly use seq_lens cpu cache to avoid d2h copy.
-        if cu_seqlens is None:
-            cu_seqlens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device="cpu")
-        seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
+        if sequence_lengths is not None:
+            seq_lens_cpu = sequence_lengths.to(device="cpu", dtype=torch.int32)
+            logger.info_once(
+                "[AUDIO_ENCODER_D2H] 310P attention reused precomputed CPU "
+                "sequence lengths; per-layer D2H skipped."
+            )
+        else:
+            if cu_seqlens is None:
+                cu_seqlens = torch.arange(
+                    0,
+                    (bsz + 1) * q_len,
+                    step=q_len,
+                    dtype=torch.int32,
+                    device="cpu",
+                )
+            seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
 
         # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
         q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)

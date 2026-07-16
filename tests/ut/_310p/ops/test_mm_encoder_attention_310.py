@@ -43,6 +43,7 @@ def test_mm_encoder_attention_310_forward_oot_with_padding():
     layer.head_size = 80
     layer.enable_pad = True
     layer.scale_value = layer.head_size**-0.5
+    layer.support_approximate_calculation = False
 
     bsz, q_len, kv_len = 2, 3, 3
     query = torch.randn(bsz, q_len, layer.num_heads, layer.head_size)
@@ -78,3 +79,48 @@ def test_mm_encoder_attention_310_forward_oot_with_padding():
 
     assert out.shape == query.shape
     torch.testing.assert_close(out, query + 1.0)
+
+
+def test_mm_encoder_attention_310_reuses_cpu_sequence_lengths():
+    layer = AscendMMEncoderAttention310.__new__(AscendMMEncoderAttention310)
+    layer.num_heads = 2
+    layer.num_kv_heads = 2
+    layer.head_size = 64
+    layer.enable_pad = False
+    layer.scale_value = layer.head_size**-0.5
+    layer.support_approximate_calculation = False
+
+    query = torch.randn(1, 5, layer.num_heads, layer.head_size)
+    sequence_lengths = torch.tensor([2, 3], dtype=torch.int32, device="cpu")
+    captured_seq_lens = None
+
+    def fake_flash_attention_unpad(*, query, seq_len, out, **kwargs):
+        nonlocal captured_seq_lens
+        captured_seq_lens = seq_len
+        out.copy_(query)
+
+    with (
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.logger.info_once"
+        ) as mock_info_once,
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.torch.diff",
+            side_effect=AssertionError("cu_seqlens must not be read"),
+        ),
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.torch_npu._npu_flash_attention_unpad",
+            side_effect=fake_flash_attention_unpad,
+            create=True,
+        ),
+    ):
+        out = layer.forward_oot(
+            query,
+            query,
+            query,
+            cu_seqlens=torch.tensor([0, 2, 5], dtype=torch.int32),
+            sequence_lengths=sequence_lengths,
+        )
+
+    assert captured_seq_lens is sequence_lengths
+    mock_info_once.assert_called_once()
+    torch.testing.assert_close(out, query)
