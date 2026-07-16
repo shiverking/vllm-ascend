@@ -106,7 +106,7 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
 
         if sequence_lengths is not None:
             seq_lens_cpu = sequence_lengths.to(device="cpu", dtype=torch.int32)
-            logger.info_once(
+            print(
                 "[AUDIO_ENCODER_D2H] 310P attention reused precomputed CPU "
                 "sequence lengths; per-layer D2H skipped."
             )
