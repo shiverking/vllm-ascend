@@ -95,6 +95,15 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
         kv_len = key.size(1)
         is_reshaped = query.dim() == 4
 
+        print(
+            "[AUDIO_ENCODER_D2H_DEBUG] Entered "
+            "AscendMMEncoderAttention310.forward_oot; "
+            f"layer={getattr(self, 'layer_name', '<unknown>')}; "
+            f"sequence_lengths_is_none={sequence_lengths is None}; "
+            f"cu_seqlens_device={getattr(cu_seqlens, 'device', None)}",
+            flush=True,
+        )
+
         if sequence_lengths is not None:
             seq_lens_cpu = sequence_lengths.to(device="cpu", dtype=torch.int32)
             logger.info_once(

@@ -758,6 +758,15 @@ def register_ascend_customop(vllm_config: VllmConfig | None = None):
             }
         )
 
+    mm_encoder_attention_cls = REGISTERED_ASCEND_OPS["MMEncoderAttention"]
+    print(
+        "[AUDIO_ENCODER_D2H_DEBUG] Registering MMEncoderAttention as "
+        f"{mm_encoder_attention_cls.__module__}."
+        f"{mm_encoder_attention_cls.__name__}; is_310p={is_310p()}; "
+        f"source={mm_encoder_attention_cls.forward_oot.__code__.co_filename}",
+        flush=True,
+    )
+
     for name, op_cls in REGISTERED_ASCEND_OPS.items():
         CustomOp.register_oot(_decorated_op_cls=op_cls, name=name)
 
