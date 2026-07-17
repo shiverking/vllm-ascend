@@ -110,9 +110,10 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Experimental fixed-shape Qwen3-ASR audio encoder ACLGraph size for
-    # Ascend 310P. 0 disables the feature; a positive value specifies the
-    # exact number of post-CNN tokens captured by the graph. Not sensitive.
+    # Experimental padded Qwen3-ASR audio encoder ACLGraph size for Ascend
+    # 310P. 0 disables the feature; a positive value specifies the fixed
+    # number of post-CNN tokens captured by the graph. Requests may pad up to
+    # four tokens to this size using isolated attention sequences. Not sensitive.
     "VLLM_ASCEND_310P_AUDIO_ACLGRAPH_TOKENS": lambda: int(
         os.getenv("VLLM_ASCEND_310P_AUDIO_ACLGRAPH_TOKENS", "0")
     ),

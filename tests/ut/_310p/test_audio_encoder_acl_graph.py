@@ -24,71 +24,115 @@ from vllm_ascend._310p.audio_encoder_acl_graph import (
 
 
 def _make_encoder(enforce_eager: bool = False):
-    return SimpleNamespace(
-        n_window=100,
-        n_window_infer=400,
-        enforce_eager=enforce_eager,
-    )
+    return SimpleNamespace(enforce_eager=enforce_eager)
 
 
-def test_audio_encoder_aclgraph_builds_fixed_topology():
-    runner = FixedAudioEncoderAclGraphRunner(
-        _make_encoder(),
-        lambda *args: args[1],
-        125,
-    )
-
-    assert runner.expected_sequence_lengths == (50, 50, 25)
-
-
-def test_audio_encoder_aclgraph_rejects_topology_mismatch():
-    runner = FixedAudioEncoderAclGraphRunner(
-        _make_encoder(),
-        lambda *args: args[1],
-        125,
-    )
+def _make_hidden_states(tokens: int):
     hidden_states = mock.Mock()
     hidden_states.dtype = torch.float16
     hidden_states.device = torch.device("npu")
-    hidden_states.shape = (125, 8)
+    hidden_states.shape = (tokens, 8)
     hidden_states.is_contiguous.return_value = True
-
-    with mock.patch(
-        "vllm_ascend._310p.audio_encoder_acl_graph.get_tensor_model_parallel_world_size",
-        return_value=1,
-    ):
-        eligible = runner._check_eligibility(
-            hidden_states,
-            torch.tensor([50, 50, 24, 1], dtype=torch.int32),
-            1,
-        )
-
-    assert not eligible
+    return hidden_states
 
 
-def test_audio_encoder_aclgraph_rejects_token_mismatch():
+def test_audio_encoder_aclgraph_builds_padding_topology():
     runner = FixedAudioEncoderAclGraphRunner(
         _make_encoder(),
         lambda *args: args[1],
-        125,
+        64,
     )
-    hidden_states = mock.Mock()
-    hidden_states.dtype = torch.float16
-    hidden_states.device = torch.device("npu")
-    hidden_states.shape = (124, 8)
-    hidden_states.is_contiguous.return_value = True
+
+    assert runner._build_graph_topology((50, 12), 62) == (50, 12, 2)
+    assert runner._build_graph_topology((60,), 60) == (60, 2, 2)
+    assert runner._build_graph_topology((63,), 63) is None
+
+
+def test_audio_encoder_aclgraph_accepts_padding_and_ignores_num_audios():
+    runner = FixedAudioEncoderAclGraphRunner(
+        _make_encoder(),
+        lambda *args: args[1],
+        64,
+    )
 
     with mock.patch(
-        "vllm_ascend._310p.audio_encoder_acl_graph.get_tensor_model_parallel_world_size",
+        "vllm_ascend._310p.audio_encoder_acl_graph."
+        "get_tensor_model_parallel_world_size",
         return_value=1,
     ):
-        eligible = runner._check_eligibility(
-            hidden_states,
-            torch.tensor([50, 50, 24], dtype=torch.int32),
+        topology = runner._check_eligibility(
+            _make_hidden_states(62),
+            torch.tensor([50, 12], dtype=torch.int32),
+            5,
+        )
+
+    assert topology == (50, 12, 2)
+
+
+def test_audio_encoder_aclgraph_rejects_excessive_padding():
+    runner = FixedAudioEncoderAclGraphRunner(
+        _make_encoder(),
+        lambda *args: args[1],
+        64,
+    )
+
+    with mock.patch(
+        "vllm_ascend._310p.audio_encoder_acl_graph."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        topology = runner._check_eligibility(
+            _make_hidden_states(55),
+            torch.tensor([50, 5], dtype=torch.int32),
             1,
         )
 
-    assert not eligible
+    assert topology is None
+    assert "fallback:padding_ratio" in runner._log_keys
+
+
+def test_audio_encoder_aclgraph_rejects_exact_size():
+    runner = FixedAudioEncoderAclGraphRunner(
+        _make_encoder(),
+        lambda *args: args[1],
+        64,
+    )
+
+    with mock.patch(
+        "vllm_ascend._310p.audio_encoder_acl_graph."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        topology = runner._check_eligibility(
+            _make_hidden_states(64),
+            torch.tensor([50, 14], dtype=torch.int32),
+            1,
+        )
+
+    assert topology is None
+    assert "fallback:exact_graph_size" in runner._log_keys
+
+
+def test_audio_encoder_aclgraph_rejects_too_many_sequences():
+    runner = FixedAudioEncoderAclGraphRunner(
+        _make_encoder(),
+        lambda *args: args[1],
+        64,
+    )
+
+    with mock.patch(
+        "vllm_ascend._310p.audio_encoder_acl_graph."
+        "get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        topology = runner._check_eligibility(
+            _make_hidden_states(62),
+            torch.tensor([30, 20, 12], dtype=torch.int32),
+            1,
+        )
+
+    assert topology is None
+    assert "fallback:too_many_sequences" in runner._log_keys
 
 
 def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones():
@@ -101,20 +145,25 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones():
     runner = FixedAudioEncoderAclGraphRunner(
         _make_encoder(),
         eager_forward,
-        125,
+        64,
     )
     graph = mock.Mock()
-    hidden_states = torch.randn(125, 8, dtype=torch.float16)
-    cu_seqlens = torch.tensor([0, 50, 100, 125], dtype=torch.int32)
-    sequence_lengths = torch.tensor([50, 50, 25], dtype=torch.int32)
+    hidden_states = torch.randn(62, 8, dtype=torch.float16)
+    cu_seqlens = torch.tensor([0, 50, 62], dtype=torch.int32)
+    sequence_lengths = torch.tensor([50, 12], dtype=torch.int32)
 
     with (
-        mock.patch.object(runner, "_check_eligibility", return_value=True),
+        mock.patch.object(
+            runner,
+            "_check_eligibility",
+            return_value=(50, 12, 2),
+        ),
         mock.patch.object(torch.npu, "synchronize"),
         mock.patch.object(torch.npu, "NPUGraph", return_value=graph),
         mock.patch.object(torch.npu, "graph", return_value=nullcontext()),
         mock.patch(
-            "vllm_ascend._310p.audio_encoder_acl_graph.current_platform.get_global_graph_pool",
+            "vllm_ascend._310p.audio_encoder_acl_graph."
+            "current_platform.get_global_graph_pool",
             return_value=None,
         ),
     ):
@@ -123,17 +172,25 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones():
             cu_seqlens,
             None,
             sequence_lengths,
-            1,
+            5,
         )
+        assert runner.static_input is not None
+        runner.static_input[62:].fill_(7)
+        host_address = runner.static_sequence_lengths.data_ptr()
         second = runner.run(
             hidden_states,
             cu_seqlens,
             None,
             sequence_lengths,
-            1,
+            5,
         )
 
     assert len(calls) == 3
     graph.replay.assert_called_once_with()
+    assert first.shape[0] == 62
+    assert second.shape[0] == 62
     assert first.data_ptr() != runner.static_output.data_ptr()
     assert second.data_ptr() != runner.static_output.data_ptr()
+    assert torch.count_nonzero(runner.static_input[62:]) == 0
+    assert runner.static_sequence_lengths.tolist() == [50, 12, 2]
+    assert runner.static_sequence_lengths.data_ptr() == host_address
