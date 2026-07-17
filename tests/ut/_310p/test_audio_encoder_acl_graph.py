@@ -91,7 +91,7 @@ def test_audio_encoder_aclgraph_rejects_token_mismatch():
     assert not eligible
 
 
-def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones():
+def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones(capsys):
     calls = []
 
     def eager_forward(encoder, hidden_states, *args):
@@ -137,3 +137,46 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones():
     graph.replay.assert_called_once_with()
     assert first.data_ptr() != runner.static_output.data_ptr()
     assert second.data_ptr() != runner.static_output.data_ptr()
+    output = capsys.readouterr().out
+    assert (
+        "[310P_AUDIO_GRAPH] request=1, graph_hit=False, action=capture"
+        in output
+    )
+    assert (
+        "[310P_AUDIO_GRAPH] request=2, graph_hit=True, action=replay"
+        in output
+    )
+
+
+def test_audio_encoder_aclgraph_logs_every_fallback(capsys):
+    runner = FixedAudioEncoderAclGraphRunner(
+        _make_encoder(),
+        lambda *args: args[1],
+        125,
+    )
+    hidden_states = mock.Mock()
+    hidden_states.dtype = torch.float16
+    hidden_states.device = torch.device("npu")
+    hidden_states.shape = (124, 8)
+    hidden_states.is_contiguous.return_value = True
+    cu_seqlens = torch.tensor([0, 50, 100, 124], dtype=torch.int32)
+    sequence_lengths = torch.tensor([50, 50, 24], dtype=torch.int32)
+
+    with mock.patch(
+        "vllm_ascend._310p.audio_encoder_acl_graph.get_tensor_model_parallel_world_size",
+        return_value=1,
+    ):
+        for _ in range(2):
+            runner.run(
+                hidden_states,
+                cu_seqlens,
+                None,
+                sequence_lengths,
+                1,
+            )
+
+    output = capsys.readouterr().out
+    assert output.count("graph_hit=False, action=fallback") == 2
+    assert "request=1, graph_hit=False, action=fallback" in output
+    assert "request=2, graph_hit=False, action=fallback" in output
+    assert output.count("reason=token_mismatch") == 2

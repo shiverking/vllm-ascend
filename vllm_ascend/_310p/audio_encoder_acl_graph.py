@@ -45,6 +45,7 @@ class FixedAudioEncoderAclGraphRunner:
         self.static_output: torch.Tensor | None = None
         self.capture_failed = False
         self._log_keys: set[str] = set()
+        self._request_count = 0
         self._print_once("enabled", f"enabled: tokens={num_tokens}")
 
     def _build_expected_sequence_lengths(self) -> tuple[int, ...]:
@@ -69,7 +70,24 @@ class FixedAudioEncoderAclGraphRunner:
 
     def _fallback(self, reason: str, detail: str = "") -> None:
         suffix = f", {detail}" if detail else ""
-        self._print_once(f"fallback:{reason}", f"fallback: reason={reason}{suffix}")
+        self._print_request_status(
+            graph_hit=False,
+            action="fallback",
+            detail=f"reason={reason}{suffix}",
+        )
+
+    def _print_request_status(
+        self,
+        graph_hit: bool,
+        action: str,
+        detail: str = "",
+    ) -> None:
+        suffix = f", {detail}" if detail else ""
+        print(
+            f"[310P_AUDIO_GRAPH] request={self._request_count}, "
+            f"graph_hit={graph_hit}, action={action}{suffix}",
+            flush=True,
+        )
 
     def _check_eligibility(
         self,
@@ -119,10 +137,6 @@ class FixedAudioEncoderAclGraphRunner:
                 f"actual={list(actual_topology)}, expected={list(self.expected_sequence_lengths)}",
             )
             return False
-        self._print_once(
-            "eligible",
-            f"runtime eligible: tokens={actual_tokens}, seq_lens={list(actual_topology)}",
-        )
         return True
 
     def _run_eager(
@@ -188,6 +202,7 @@ class FixedAudioEncoderAclGraphRunner:
         sequence_lengths: torch.Tensor,
         num_audios: int,
     ) -> torch.Tensor:
+        self._request_count += 1
         if not self._check_eligibility(hidden_states, sequence_lengths, num_audios):
             return self._run_eager(
                 hidden_states,
@@ -198,6 +213,14 @@ class FixedAudioEncoderAclGraphRunner:
             )
 
         if self.graph is None:
+            self._print_request_status(
+                graph_hit=False,
+                action="capture",
+                detail=(
+                    f"tokens={hidden_states.shape[0]}, "
+                    f"seq_lens={sequence_lengths.tolist()}"
+                ),
+            )
             try:
                 return self._capture(
                     hidden_states,
@@ -209,7 +232,10 @@ class FixedAudioEncoderAclGraphRunner:
                 self.capture_failed = True
                 self.graph = None
                 self.static_output = None
-                self._fallback("capture_error", f"error={type(exc).__name__}: {exc}")
+                self._print_once(
+                    "capture_error",
+                    f"capture error: {type(exc).__name__}: {exc}",
+                )
                 return self._run_eager(
                     hidden_states,
                     cu_seqlens,
@@ -221,7 +247,13 @@ class FixedAudioEncoderAclGraphRunner:
         assert self.static_input is not None
         assert self.static_output is not None
         self.static_input.copy_(hidden_states)
-        self._print_once("replay_begin", "replay begin")
+        self._print_request_status(
+            graph_hit=True,
+            action="replay",
+            detail=(
+                f"tokens={hidden_states.shape[0]}, "
+                f"seq_lens={sequence_lengths.tolist()}"
+            ),
+        )
         self.graph.replay()
-        self._print_once("replay_complete", "replay complete")
         return self.static_output.clone()
