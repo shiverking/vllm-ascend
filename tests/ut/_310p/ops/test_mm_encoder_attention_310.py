@@ -78,3 +78,40 @@ def test_mm_encoder_attention_310_forward_oot_with_padding():
 
     assert out.shape == query.shape
     torch.testing.assert_close(out, query + 1.0)
+
+
+def test_mm_encoder_attention_reuses_precomputed_cpu_sequence_lengths():
+    layer = AscendMMEncoderAttention310.__new__(AscendMMEncoderAttention310)
+    layer.num_heads = 2
+    layer.num_kv_heads = 2
+    layer.head_size = 64
+    layer.enable_pad = False
+    layer.scale_value = layer.head_size**-0.5
+
+    query = torch.randn(1, 3, 2, 64)
+    sequence_lengths = torch.tensor([3], dtype=torch.int32)
+    captured = {}
+
+    def fake_flash_attention_unpad(**kwargs):
+        captured["seq_len"] = kwargs["seq_len"]
+        kwargs["out"].copy_(kwargs["query"])
+
+    with (
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.torch.diff",
+            side_effect=AssertionError("unexpected D2H fallback"),
+        ),
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.torch_npu._npu_flash_attention_unpad",
+            side_effect=fake_flash_attention_unpad,
+            create=True,
+        ),
+    ):
+        layer.forward_oot(
+            query,
+            query,
+            query,
+            sequence_lengths=sequence_lengths,
+        )
+
+    assert captured["seq_len"] is sequence_lengths
