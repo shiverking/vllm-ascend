@@ -16,6 +16,7 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
 import torch
 
 from vllm_ascend._310p.audio_encoder_acl_graph import (
@@ -178,12 +179,97 @@ def test_audio_encoder_aclgraph_pool_captures_all_configured_sizes():
     ):
         captured = pool.capture_all(show_progress=False)
 
-    assert captured == (520, 312, 104)
+    assert captured == (104, 312, 520)
     assert [call.args[0].num_tokens for call in capture.call_args_list] == [
-        520,
-        312,
         104,
+        312,
+        520,
     ]
+
+
+def test_audio_encoder_aclgraph_pool_rejects_unaligned_sizes():
+    with pytest.raises(ValueError, match="multiples of 104"):
+        AudioEncoderAclGraphPool(
+            _make_encoder_with_104_token_window(),
+            lambda *args: args[1],
+            (140,),
+        )
+
+
+def test_audio_encoder_aclgraph_pool_stops_on_first_capture_failure():
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder_with_104_token_window(),
+        lambda *args: args[1],
+        (104, 208, 520),
+    )
+
+    with (
+        mock.patch(
+            "vllm_ascend._310p.audio_encoder_acl_graph.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+        mock.patch.object(pool.encoder, "dtype", torch.float16, create=True),
+        mock.patch.object(
+            pool.encoder,
+            "device",
+            torch.device("npu"),
+            create=True,
+        ),
+        mock.patch.object(
+            pool,
+            "_capture_runner",
+            side_effect=(True, False, True),
+        ) as capture,
+    ):
+        with pytest.raises(RuntimeError, match="size 208"):
+            pool.capture_all(show_progress=False)
+
+    assert capture.call_count == 2
+
+
+def test_audio_encoder_aclgraph_basis_covers_one_to_fifteen_windows():
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder_with_104_token_window(),
+        lambda *args: args[1],
+        (1040, 520, 208, 104),
+    )
+
+    for num_windows in range(1, 16):
+        chunks, tail_sequence_start, tail_token_start = pool._build_plan(
+            (104,) * num_windows
+        )
+        assert len(chunks) <= 3
+        assert tail_sequence_start == num_windows
+        assert tail_token_start == num_windows * 104
+
+    expected_plans = {
+        9: [520, 208, 208],
+        14: [1040, 208, 208],
+        15: [1040, 520],
+    }
+    for num_windows, expected_sizes in expected_plans.items():
+        chunks, _, _ = pool._build_plan((104,) * num_windows)
+        assert [chunk.runner.num_tokens for chunk in chunks] == expected_sizes
+
+
+def test_audio_encoder_aclgraph_basis_leaves_partial_window_eager():
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder_with_104_token_window(),
+        lambda *args: args[1],
+        (1040, 520, 208, 104),
+    )
+
+    chunks, tail_sequence_start, tail_token_start = pool._build_plan(
+        (104,) * 14 + (44,)
+    )
+
+    assert [chunk.runner.num_tokens for chunk in chunks] == [
+        1040,
+        208,
+        208,
+    ]
+    assert tail_sequence_start == 14
+    assert tail_token_start == 1456
 
 
 def test_audio_encoder_aclgraph_does_not_capture_lazily(capsys):

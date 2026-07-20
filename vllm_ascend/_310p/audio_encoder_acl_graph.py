@@ -25,6 +25,17 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.platforms import current_platform
 
 
+def _get_attention_window_tokens(encoder: Any) -> int:
+    chunk_size = encoder.n_window * 2
+    chunk_tokens = chunk_size
+    for _ in range(3):
+        chunk_tokens = (chunk_tokens - 1) // 2 + 1
+    window_tokens = chunk_tokens * (encoder.n_window_infer // chunk_size)
+    if window_tokens <= 0:
+        raise ValueError("audio encoder attention window must be positive")
+    return window_tokens
+
+
 @dataclass(frozen=True)
 class AudioGraphChunk:
     runner: "FixedAudioEncoderAclGraphRunner"
@@ -69,13 +80,7 @@ class FixedAudioEncoderAclGraphRunner:
             self._print_once("enabled", f"enabled: tokens={num_tokens}")
 
     def _build_expected_sequence_lengths(self) -> tuple[int, ...]:
-        chunk_size = self.encoder.n_window * 2
-        chunk_tokens = chunk_size
-        for _ in range(3):
-            chunk_tokens = (chunk_tokens - 1) // 2 + 1
-        window_tokens = chunk_tokens * (self.encoder.n_window_infer // chunk_size)
-        if window_tokens <= 0:
-            raise ValueError("audio encoder attention window must be positive")
+        window_tokens = _get_attention_window_tokens(self.encoder)
         full_windows, remainder = divmod(self.num_tokens, window_tokens)
         result = [window_tokens] * full_windows
         if remainder:
@@ -319,6 +324,16 @@ class AudioEncoderAclGraphPool:
         sizes = tuple(sorted(set(graph_sizes), reverse=True))
         if not sizes or any(size <= 0 for size in sizes):
             raise ValueError("audio encoder ACLGraph sizes must be positive")
+        self.window_tokens = _get_attention_window_tokens(encoder)
+        unaligned_sizes = [
+            size for size in sizes if size % self.window_tokens != 0
+        ]
+        if unaligned_sizes:
+            raise ValueError(
+                "audio_encoder_aclgraph_sizes must contain complete attention "
+                f"windows and be multiples of {self.window_tokens}; "
+                f"unaligned sizes: {unaligned_sizes}"
+            )
         self.encoder = encoder
         self.eager_forward = eager_forward
         self.graph_sizes = sizes
@@ -376,23 +391,28 @@ class AudioEncoderAclGraphPool:
         ):
             return ()
         captured = []
-        graph_sizes = tqdm(
-            self.graph_sizes,
+        capture_sizes = tuple(reversed(self.graph_sizes))
+        with tqdm(
+            capture_sizes,
             desc="Capturing audio encoder graphs",
             unit="graph",
             disable=not show_progress,
-        )
-        for size in graph_sizes:
-            if show_progress:
-                graph_sizes.set_postfix(tokens=size)
-            runner = self.runners[size]
-            try:
-                success = self._capture_runner(runner)
-            except Exception as exc:
-                runner.capture_failed = True
-                runner.capture_error = f"{type(exc).__name__}: {exc}"
-                success = False
-            if success:
+        ) as progress:
+            for size in progress:
+                if show_progress:
+                    progress.set_postfix(tokens=size)
+                runner = self.runners[size]
+                try:
+                    success = self._capture_runner(runner)
+                except Exception as exc:
+                    runner.capture_failed = True
+                    runner.capture_error = f"{type(exc).__name__}: {exc}"
+                    success = False
+                if not success:
+                    raise RuntimeError(
+                        "Audio encoder ACLGraph capture failed for "
+                        f"size {size}: {runner.capture_error}"
+                    )
                 captured.append(size)
         return tuple(captured)
 
