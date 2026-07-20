@@ -59,6 +59,10 @@ class TestNPUModelRunner310(TestBase):
         runner.load_config = SimpleNamespace(use_tqdm_on_load=True)
         runner.model = MagicMock()
 
+        def capture_audio_graphs(*args, **kwargs):
+            self.assertTrue(torch.is_inference_mode_enabled())
+            return (520, 312, 104)
+
         with (
             patch(
                 "vllm_ascend.worker.model_runner_v1.NPUModelRunner.capture_model",
@@ -71,8 +75,8 @@ class TestNPUModelRunner310(TestBase):
             patch(
                 "vllm_ascend.patch.worker.patch_qwen3_audio_aclgraph_310p."
                 "capture_audio_encoder_aclgraphs",
-                return_value=(520, 312, 104),
-            ) as capture_audio_graphs,
+                side_effect=capture_audio_graphs,
+            ) as mock_capture_audio_graphs,
             patch.object(
                 torch.npu,
                 "memory_reserved",
@@ -82,7 +86,7 @@ class TestNPUModelRunner310(TestBase):
             graph_memory_bytes = runner.capture_model()
 
         self.assertEqual(graph_memory_bytes, 400)
-        capture_audio_graphs.assert_called_once_with(
+        mock_capture_audio_graphs.assert_called_once_with(
             runner.model,
             show_progress=True,
         )

@@ -103,6 +103,7 @@ class NPUModelRunner310(NPUModelRunner):
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
 
+    @torch.inference_mode()
     def capture_model(self) -> int:
         graph_memory_bytes = super().capture_model()
         audio_graph_sizes = self.ascend_config.audio_encoder_aclgraph_sizes
