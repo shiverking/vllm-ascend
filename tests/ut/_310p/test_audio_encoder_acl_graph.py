@@ -92,7 +92,7 @@ def test_audio_encoder_aclgraph_rejects_token_mismatch():
     assert not eligible
 
 
-def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones(capsys):
+def test_audio_encoder_aclgraph_startup_capture_then_replays_and_clones(capsys):
     calls = []
 
     def eager_forward(encoder, hidden_states, *args):
@@ -119,6 +119,12 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones(capsys):
             return_value=None,
         ),
     ):
+        assert runner.capture(
+            hidden_states,
+            cu_seqlens,
+            None,
+            sequence_lengths,
+        )
         first = runner.run(
             hidden_states,
             cu_seqlens,
@@ -135,18 +141,73 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones(capsys):
         )
 
     assert len(calls) == 3
-    graph.replay.assert_called_once_with()
+    assert graph.replay.call_count == 2
     assert first.data_ptr() != runner.static_output.data_ptr()
     assert second.data_ptr() != runner.static_output.data_ptr()
     output = capsys.readouterr().out
     assert (
-        "[310P_AUDIO_GRAPH] request=1, graph_hit=False, action=capture"
+        "[310P_AUDIO_GRAPH] request=1, graph_hit=True, action=replay"
         in output
     )
     assert (
         "[310P_AUDIO_GRAPH] request=2, graph_hit=True, action=replay"
         in output
     )
+
+
+def test_audio_encoder_aclgraph_pool_captures_all_configured_sizes():
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder_with_104_token_window(),
+        lambda *args: args[1],
+        (104, 312, 520),
+    )
+
+    with (
+        mock.patch(
+            "vllm_ascend._310p.audio_encoder_acl_graph.get_tensor_model_parallel_world_size",
+            return_value=1,
+        ),
+        mock.patch.object(pool.encoder, "dtype", torch.float16, create=True),
+        mock.patch.object(
+            pool.encoder,
+            "device",
+            torch.device("npu"),
+            create=True,
+        ),
+        mock.patch.object(pool, "_capture_runner", return_value=True) as capture,
+    ):
+        captured = pool.capture_all(show_progress=False)
+
+    assert captured == (520, 312, 104)
+    assert [call.args[0].num_tokens for call in capture.call_args_list] == [
+        520,
+        312,
+        104,
+    ]
+
+
+def test_audio_encoder_aclgraph_does_not_capture_lazily(capsys):
+    runner = FixedAudioEncoderAclGraphRunner(
+        _make_encoder(),
+        lambda encoder, hidden_states, *args: hidden_states,
+        125,
+    )
+    hidden_states = torch.randn(125, 8, dtype=torch.float16)
+    cu_seqlens = torch.tensor([0, 50, 100, 125], dtype=torch.int32)
+    sequence_lengths = torch.tensor([50, 50, 25], dtype=torch.int32)
+
+    with mock.patch.object(runner, "_check_eligibility", return_value=True):
+        output = runner.run(
+            hidden_states,
+            cu_seqlens,
+            None,
+            sequence_lengths,
+            1,
+        )
+
+    assert output is hidden_states
+    assert runner.graph is None
+    assert "reason=graph_not_captured" in capsys.readouterr().out
 
 
 def _make_encoder_with_104_token_window():

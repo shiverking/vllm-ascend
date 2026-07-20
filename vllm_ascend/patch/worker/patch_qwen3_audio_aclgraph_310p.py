@@ -28,6 +28,37 @@ from vllm_ascend.ascend_config import get_ascend_config
 _original_forward_encoder_body = Qwen3OmniMoeAudioEncoder._forward_encoder_body
 
 
+def _get_or_create_audio_aclgraph_pool(
+    encoder: Qwen3OmniMoeAudioEncoder,
+) -> AudioEncoderAclGraphPool | None:
+    graph_sizes = get_ascend_config().audio_encoder_aclgraph_sizes
+    if not graph_sizes:
+        return None
+    pool = getattr(encoder, "_ascend_audio_aclgraph_pool", None)
+    if pool is None or pool.graph_sizes != graph_sizes:
+        pool = AudioEncoderAclGraphPool(
+            encoder,
+            _original_forward_encoder_body,
+            graph_sizes,
+        )
+        encoder._ascend_audio_aclgraph_pool = pool
+    return pool
+
+
+def capture_audio_encoder_aclgraphs(
+    model: torch.nn.Module,
+    *,
+    show_progress: bool,
+) -> tuple[int, ...]:
+    encoder = getattr(model, "audio_tower", None)
+    if not isinstance(encoder, Qwen3OmniMoeAudioEncoder):
+        return ()
+    pool = _get_or_create_audio_aclgraph_pool(encoder)
+    if pool is None:
+        return ()
+    return pool.capture_all(show_progress=show_progress)
+
+
 def _forward_encoder_body_with_aclgraph(
     self: Qwen3OmniMoeAudioEncoder,
     hidden_states: torch.Tensor,
@@ -47,8 +78,7 @@ def _forward_encoder_body_with_aclgraph(
         )
         self._ascend_sequence_lengths_reuse_logged = True
 
-    graph_sizes = get_ascend_config().audio_encoder_aclgraph_sizes
-    if not graph_sizes:
+    if not get_ascend_config().audio_encoder_aclgraph_sizes:
         return _original_forward_encoder_body(
             self,
             hidden_states,
@@ -59,13 +89,15 @@ def _forward_encoder_body_with_aclgraph(
         )
 
     pool = getattr(self, "_ascend_audio_aclgraph_pool", None)
-    if pool is None or pool.graph_sizes != graph_sizes:
-        pool = AudioEncoderAclGraphPool(
+    if pool is None:
+        return _original_forward_encoder_body(
             self,
-            _original_forward_encoder_body,
-            graph_sizes,
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            sequence_lengths,
+            num_audios,
         )
-        self._ascend_audio_aclgraph_pool = pool
     return pool.run(
         hidden_states,
         cu_seqlens,

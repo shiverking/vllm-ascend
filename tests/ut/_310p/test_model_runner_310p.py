@@ -51,6 +51,42 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    def test_capture_model_captures_configured_audio_graphs_at_startup(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.ascend_config = SimpleNamespace(
+            audio_encoder_aclgraph_sizes=(520, 312, 104)
+        )
+        runner.load_config = SimpleNamespace(use_tqdm_on_load=True)
+        runner.model = MagicMock()
+
+        with (
+            patch(
+                "vllm_ascend.worker.model_runner_v1.NPUModelRunner.capture_model",
+                return_value=100,
+            ),
+            patch(
+                "vllm_ascend._310p.model_runner_310p.is_global_first_rank",
+                return_value=True,
+            ),
+            patch(
+                "vllm_ascend.patch.worker.patch_qwen3_audio_aclgraph_310p."
+                "capture_audio_encoder_aclgraphs",
+                return_value=(520, 312, 104),
+            ) as capture_audio_graphs,
+            patch.object(
+                torch.npu,
+                "memory_reserved",
+                side_effect=(1000, 1300),
+            ),
+        ):
+            graph_memory_bytes = runner.capture_model()
+
+        self.assertEqual(graph_memory_bytes, 400)
+        capture_audio_graphs.assert_called_once_with(
+            runner.model,
+            show_progress=True,
+        )
+
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8

@@ -20,6 +20,7 @@ from itertools import accumulate
 from typing import Any
 
 import torch
+from tqdm import tqdm
 from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.platforms import current_platform
 
@@ -57,6 +58,7 @@ class FixedAudioEncoderAclGraphRunner:
         self.static_sequence_lengths: torch.Tensor | None = None
         self.static_output: torch.Tensor | None = None
         self.capture_failed = False
+        self.capture_error: str | None = None
         self.last_action = "uninitialized"
         self._log_keys: set[str] = set()
         self._request_count = 0
@@ -190,17 +192,13 @@ class FixedAudioEncoderAclGraphRunner:
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
         sequence_lengths: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> None:
         self.static_input = torch.empty_like(hidden_states)
         self.static_input.copy_(hidden_states)
         self.static_cu_seqlens = cu_seqlens.clone()
         self.static_max_seqlen = None if max_seqlen is None else max_seqlen.clone()
         self.static_sequence_lengths = sequence_lengths.clone()
 
-        self._print_once(
-            "warmup",
-            f"graph_size={self.num_tokens}, warmup begin",
-        )
         for _ in range(2):
             self._run_eager(
                 self.static_input,
@@ -213,10 +211,6 @@ class FixedAudioEncoderAclGraphRunner:
 
         self.graph = torch.npu.NPUGraph()
         graph_pool = current_platform.get_global_graph_pool()
-        self._print_once(
-            "capture_begin",
-            f"graph_size={self.num_tokens}, capture begin",
-        )
         with torch.npu.graph(self.graph, pool=graph_pool):
             self.static_output = self._run_eager(
                 self.static_input,
@@ -225,11 +219,37 @@ class FixedAudioEncoderAclGraphRunner:
                 self.static_sequence_lengths,
                 1,
             )
-        self._print_once(
-            "capture_complete",
-            f"graph_size={self.num_tokens}, capture complete",
-        )
-        return self.static_output.clone()
+
+    def capture(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        max_seqlen: torch.Tensor | None,
+        sequence_lengths: torch.Tensor,
+    ) -> bool:
+        if self.graph is not None:
+            return True
+        try:
+            self._capture(
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+            )
+            torch.npu.synchronize()
+            self.last_action = "startup_capture"
+            return True
+        except Exception as exc:
+            self.capture_failed = True
+            self.capture_error = f"{type(exc).__name__}: {exc}"
+            self.graph = None
+            self.static_input = None
+            self.static_cu_seqlens = None
+            self.static_max_seqlen = None
+            self.static_sequence_lengths = None
+            self.static_output = None
+            self.last_action = "capture_failed"
+            return False
 
     def run(
         self,
@@ -262,39 +282,14 @@ class FixedAudioEncoderAclGraphRunner:
             )
 
         if self.graph is None:
-            self.last_action = "capture"
-            self._print_request_status(
-                graph_hit=False,
-                action="capture",
-                detail=(
-                    f"tokens={hidden_states.shape[0]}, "
-                    f"seq_lens={sequence_lengths.tolist()}"
-                ),
+            self._fallback("graph_not_captured")
+            return self._run_eager(
+                hidden_states,
+                cu_seqlens,
+                max_seqlen,
+                sequence_lengths,
+                num_audios,
             )
-            try:
-                return self._capture(
-                    hidden_states,
-                    cu_seqlens,
-                    max_seqlen,
-                    sequence_lengths,
-                )
-            except Exception as exc:
-                self.last_action = "fallback"
-                self.capture_failed = True
-                self.graph = None
-                self.static_output = None
-                self._print_once(
-                    "capture_error",
-                    f"graph_size={self.num_tokens}, capture error: "
-                    f"{type(exc).__name__}: {exc}",
-                )
-                return self._run_eager(
-                    hidden_states,
-                    cu_seqlens,
-                    max_seqlen,
-                    sequence_lengths,
-                    num_audios,
-                )
 
         assert self.static_input is not None
         assert self.static_output is not None
@@ -349,6 +344,57 @@ class AudioEncoderAclGraphPool:
             f"topologies={topologies}",
             flush=True,
         )
+
+    def _capture_runner(self, runner: FixedAudioEncoderAclGraphRunner) -> bool:
+        topology = runner.expected_sequence_lengths
+        hidden_size = int(self.encoder.ln_post.normalized_shape[0])
+        hidden_states = torch.zeros(
+            (runner.num_tokens, hidden_size),
+            dtype=self.encoder.dtype,
+            device=self.encoder.device,
+        )
+        sequence_lengths = torch.tensor(
+            topology,
+            dtype=torch.int32,
+            device="cpu",
+        ).contiguous()
+        cu_seqlens = self._make_cu_seqlens(topology).to(self.encoder.device)
+        max_seqlen = self.encoder.compute_attn_mask_seqlen(cu_seqlens)
+        return runner.capture(
+            hidden_states,
+            cu_seqlens,
+            max_seqlen,
+            sequence_lengths,
+        )
+
+    def capture_all(self, *, show_progress: bool) -> tuple[int, ...]:
+        if (
+            self.encoder.enforce_eager
+            or get_tensor_model_parallel_world_size() != 1
+            or self.encoder.dtype != torch.float16
+            or self.encoder.device.type != "npu"
+        ):
+            return ()
+        captured = []
+        graph_sizes = tqdm(
+            self.graph_sizes,
+            desc="Capturing audio encoder graphs",
+            unit="graph",
+            disable=not show_progress,
+        )
+        for size in graph_sizes:
+            if show_progress:
+                graph_sizes.set_postfix(tokens=size)
+            runner = self.runners[size]
+            try:
+                success = self._capture_runner(runner)
+            except Exception as exc:
+                runner.capture_failed = True
+                runner.capture_error = f"{type(exc).__name__}: {exc}"
+                success = False
+            if success:
+                captured.append(size)
+        return tuple(captured)
 
     @staticmethod
     def _make_cu_seqlens(topology: Sequence[int]) -> torch.Tensor:
