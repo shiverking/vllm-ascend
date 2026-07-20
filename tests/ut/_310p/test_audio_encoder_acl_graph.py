@@ -19,6 +19,7 @@ from unittest import mock
 import torch
 
 from vllm_ascend._310p.audio_encoder_acl_graph import (
+    AudioEncoderAclGraphPool,
     FixedAudioEncoderAclGraphRunner,
 )
 
@@ -142,6 +143,14 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones(capsys):
         "[310P_AUDIO_GRAPH] request=1, graph_hit=False, action=capture"
         in output
     )
+
+
+def _make_encoder_with_104_token_window():
+    return SimpleNamespace(
+        n_window=50,
+        n_window_infer=800,
+        enforce_eager=False,
+    )
     assert (
         "[310P_AUDIO_GRAPH] request=2, graph_hit=True, action=replay"
         in output
@@ -180,3 +189,76 @@ def test_audio_encoder_aclgraph_logs_every_fallback(capsys):
     assert "request=1, graph_hit=False, action=fallback" in output
     assert "request=2, graph_hit=False, action=fallback" in output
     assert output.count("reason=token_mismatch") == 2
+
+
+def test_audio_encoder_aclgraph_pool_uses_largest_sequence_aligned_graph():
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder_with_104_token_window(),
+        lambda *args: args[1],
+        (104, 312, 520),
+    )
+
+    chunks, tail_sequence_start, tail_token_start = pool._build_plan((104,) * 15)
+
+    assert [chunk.runner.num_tokens for chunk in chunks] == [520, 520, 520]
+    assert tail_sequence_start == 15
+    assert tail_token_start == 1560
+
+
+def test_audio_encoder_aclgraph_pool_leaves_unmatched_tail_for_eager():
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder_with_104_token_window(),
+        lambda *args: args[1],
+        (104, 312, 520),
+    )
+    topology = (104,) * 14 + (44,)
+
+    chunks, tail_sequence_start, tail_token_start = pool._build_plan(topology)
+
+    assert [chunk.runner.num_tokens for chunk in chunks] == [
+        520,
+        520,
+        312,
+        104,
+    ]
+    assert tail_sequence_start == 14
+    assert tail_token_start == 1456
+
+
+def test_audio_encoder_aclgraph_pool_runs_graph_chunks_and_tail_once(capsys):
+    def eager_forward(encoder, hidden_states, *args):
+        return hidden_states + 10
+
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder(),
+        eager_forward,
+        (100,),
+    )
+    runner = pool.runners[100]
+    hidden_states = torch.arange(124 * 2, dtype=torch.float16).view(124, 2)
+    cu_seqlens = torch.tensor([0, 50, 100, 124], dtype=torch.int32)
+    sequence_lengths = torch.tensor([50, 50, 24], dtype=torch.int32)
+
+    def run_graph_chunk(chunk_hidden_states, *args, **kwargs):
+        runner.last_action = "replay"
+        return chunk_hidden_states + 1
+
+    with (
+        mock.patch.object(pool, "_check_common_eligibility", return_value=None),
+        mock.patch.object(runner, "run", side_effect=run_graph_chunk),
+    ):
+        output = pool.run(
+            hidden_states,
+            cu_seqlens,
+            None,
+            sequence_lengths,
+            1,
+        )
+
+    torch.testing.assert_close(output[:100], hidden_states[:100] + 1)
+    torch.testing.assert_close(output[100:], hidden_states[100:] + 10)
+    logs = capsys.readouterr().out
+    assert "graph_chunks=[100], eager_tail_tokens=24" in logs
+    assert "action=eager_tail, tokens=24, seq_lens=[24]" in logs
+    assert "replay_hits=1" in logs
+    assert "eager_tail_tokens=24" in logs

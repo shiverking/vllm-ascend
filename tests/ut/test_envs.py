@@ -57,3 +57,18 @@ class TestEnvVariables(TestBase):
         for var_name in self.env_vars:
             with self.subTest(var=var_name):
                 getattr(envs_ascend, var_name)
+
+    def test_audio_aclgraph_sizes(self):
+        name = "VLLM_ASCEND_310P_AUDIO_ACLGRAPH_SIZES"
+        original_val = os.environ.get(name)
+        try:
+            os.environ[name] = "104, 520,312,104"
+            self.assertEqual(getattr(envs_ascend, name), (520, 312, 104))
+            os.environ[name] = "104,0"
+            with self.assertRaises(ValueError):
+                getattr(envs_ascend, name)
+        finally:
+            if original_val is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = original_val
