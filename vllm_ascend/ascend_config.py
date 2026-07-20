@@ -23,7 +23,7 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-MAX_AUDIO_ENCODER_ACLGRAPH_SIZES = 4
+MAX_AUDIO_ENCODER_ACLGRAPH_SIZES = 5
 
 
 def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
