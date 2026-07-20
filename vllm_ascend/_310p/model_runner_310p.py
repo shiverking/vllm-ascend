@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch_npu
 from vllm.config import CUDAGraphMode
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, is_global_first_rank
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import get_dtype_size
@@ -102,6 +102,40 @@ class NPUModelRunner310(NPUModelRunner):
             # Keep dispatcher's internal query_len in sync to avoid key-init assert.
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
+
+    @torch.inference_mode()
+    def capture_model(self) -> int:
+        graph_memory_bytes = super().capture_model()
+        audio_graph_sizes = self.ascend_config.audio_encoder_aclgraph_sizes
+        if not audio_graph_sizes:
+            return graph_memory_bytes
+
+        from vllm_ascend.patch.worker.patch_qwen3_audio_aclgraph_310p import (
+            capture_audio_encoder_aclgraphs,
+        )
+
+        memory_before = torch.npu.memory_reserved()
+        captured = capture_audio_encoder_aclgraphs(
+            self.get_model(),
+            show_progress=(
+                is_global_first_rank()
+                and self.load_config.use_tqdm_on_load
+            ),
+        )
+        missing = tuple(
+            size for size in audio_graph_sizes if size not in captured
+        )
+        if missing:
+            logger.warning(
+                "Audio encoder ACLGraph capture skipped for sizes %s; "
+                "these chunks will run eagerly.",
+                list(missing),
+            )
+        audio_graph_memory = max(
+            torch.npu.memory_reserved() - memory_before,
+            0,
+        )
+        return graph_memory_bytes + audio_graph_memory
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)

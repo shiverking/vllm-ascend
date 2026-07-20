@@ -23,6 +23,36 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+MAX_AUDIO_ENCODER_ACLGRAPH_SIZES = 5
+
+
+def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            "additional_config.audio_encoder_aclgraph_sizes must be "
+            "an array of positive integers"
+        )
+    if any(isinstance(size, bool) or not isinstance(size, int) for size in value):
+        raise TypeError(
+            "additional_config.audio_encoder_aclgraph_sizes must contain "
+            "only positive integers"
+        )
+    if any(size <= 0 for size in value):
+        raise ValueError(
+            "additional_config.audio_encoder_aclgraph_sizes must contain "
+            "only positive integers"
+        )
+    sizes = tuple(sorted(set(value), reverse=True))
+    if len(sizes) > MAX_AUDIO_ENCODER_ACLGRAPH_SIZES:
+        raise ValueError(
+            "additional_config.audio_encoder_aclgraph_sizes supports at most "
+            f"{MAX_AUDIO_ENCODER_ACLGRAPH_SIZES} sizes on Ascend 310P because "
+            "each captured graph retains hardware event resources"
+        )
+    return sizes
+
 
 class AscendConfig:
     """
@@ -32,6 +62,10 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+
+        self.audio_encoder_aclgraph_sizes = _parse_audio_encoder_aclgraph_sizes(
+            additional_config.get("audio_encoder_aclgraph_sizes")
+        )
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
         self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)
