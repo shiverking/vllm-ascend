@@ -143,6 +143,10 @@ def test_audio_encoder_aclgraph_captures_once_then_replays_and_clones(capsys):
         "[310P_AUDIO_GRAPH] request=1, graph_hit=False, action=capture"
         in output
     )
+    assert (
+        "[310P_AUDIO_GRAPH] request=2, graph_hit=True, action=replay"
+        in output
+    )
 
 
 def _make_encoder_with_104_token_window():
@@ -150,10 +154,6 @@ def _make_encoder_with_104_token_window():
         n_window=50,
         n_window_infer=800,
         enforce_eager=False,
-    )
-    assert (
-        "[310P_AUDIO_GRAPH] request=2, graph_hit=True, action=replay"
-        in output
     )
 
 

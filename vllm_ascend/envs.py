@@ -22,21 +22,6 @@ import os
 from collections.abc import Callable
 from typing import Any
 
-
-def _parse_audio_aclgraph_sizes() -> tuple[int, ...]:
-    value = os.getenv("VLLM_ASCEND_310P_AUDIO_ACLGRAPH_SIZES", "")
-    if not value.strip():
-        return ()
-    sizes = tuple(
-        sorted({int(item.strip()) for item in value.split(",")}, reverse=True)
-    )
-    if any(size <= 0 for size in sizes):
-        raise ValueError(
-            "VLLM_ASCEND_310P_AUDIO_ACLGRAPH_SIZES must contain "
-            "comma-separated positive integers"
-        )
-    return sizes
-
 # The begin-* and end* here are used by the documentation generator
 # to extract the used env vars.
 
@@ -125,18 +110,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
-    # Legacy single-size Qwen3-ASR audio encoder ACLGraph configuration for
-    # Ascend 310P. 0 disables the feature; a positive value specifies one
-    # sequence-aligned graph chunk size. Not sensitive.
-    "VLLM_ASCEND_310P_AUDIO_ACLGRAPH_TOKENS": lambda: int(
-        os.getenv("VLLM_ASCEND_310P_AUDIO_ACLGRAPH_TOKENS", "0")
-    ),
-    # Experimental Qwen3-ASR audio encoder ACLGraph pool sizes for Ascend
-    # 310P. The value is a comma-separated list of positive post-CNN token
-    # counts, for example "104,312,520". Graph chunks are matched only at
-    # attention sequence boundaries. Empty disables the pool and falls back
-    # to VLLM_ASCEND_310P_AUDIO_ACLGRAPH_TOKENS. Not sensitive.
-    "VLLM_ASCEND_310P_AUDIO_ACLGRAPH_SIZES": _parse_audio_aclgraph_sizes,
 }
 
 # end-env-vars-definition

@@ -46,6 +46,7 @@ class TestAscendConfig(TestBase):
         ascend_config = init_ascend_config(test_vllm_config)
         self.assertFalse(ascend_config.multistream_overlap_shared_expert)
         self.assertFalse(ascend_config.enable_kv_nz)
+        self.assertEqual(ascend_config.audio_encoder_aclgraph_sizes, ())
 
         ascend_compilation_config = ascend_config.ascend_compilation_config
         self.assertTrue(ascend_compilation_config.fuse_norm_quant)
@@ -81,6 +82,32 @@ class TestAscendConfig(TestBase):
 
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertFalse(ascend_fusion_config.fusion_ops_gmmswigluquant)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_audio_encoder_aclgraph_sizes(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "audio_encoder_aclgraph_sizes": [104, 520, 312, 104],
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertEqual(
+            ascend_config.audio_encoder_aclgraph_sizes,
+            (520, 312, 104),
+        )
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_audio_encoder_aclgraph_sizes_reject_invalid_value(self, mock_fix_incompatible_config):
+        test_vllm_config = VllmConfig()
+        test_vllm_config.additional_config = {
+            "audio_encoder_aclgraph_sizes": [104, 0],
+        }
+
+        with self.assertRaisesRegex(ValueError, "positive integers"):
+            init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")

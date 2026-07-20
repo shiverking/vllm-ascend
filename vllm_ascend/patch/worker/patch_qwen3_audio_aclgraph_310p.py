@@ -19,10 +19,10 @@ from vllm.model_executor.models.qwen3_omni_moe_thinker import (
     Qwen3OmniMoeAudioEncoder,
 )
 
-from vllm_ascend import envs
 from vllm_ascend._310p.audio_encoder_acl_graph import (
     AudioEncoderAclGraphPool,
 )
+from vllm_ascend.ascend_config import get_ascend_config
 
 
 _original_forward_encoder_body = Qwen3OmniMoeAudioEncoder._forward_encoder_body
@@ -47,10 +47,7 @@ def _forward_encoder_body_with_aclgraph(
         )
         self._ascend_sequence_lengths_reuse_logged = True
 
-    graph_sizes = envs.VLLM_ASCEND_310P_AUDIO_ACLGRAPH_SIZES
-    if not graph_sizes:
-        num_tokens = envs.VLLM_ASCEND_310P_AUDIO_ACLGRAPH_TOKENS
-        graph_sizes = (num_tokens,) if num_tokens > 0 else ()
+    graph_sizes = get_ascend_config().audio_encoder_aclgraph_sizes
     if not graph_sizes:
         return _original_forward_encoder_body(
             self,
