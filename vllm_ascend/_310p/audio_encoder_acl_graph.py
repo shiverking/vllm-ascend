@@ -326,12 +326,16 @@ class AudioEncoderAclGraphPool:
             raise ValueError("audio encoder ACLGraph sizes must be positive")
         self.window_tokens = _get_attention_window_tokens(encoder)
         unaligned_sizes = [
-            size for size in sizes if size % self.window_tokens != 0
+            size
+            for size in sizes
+            if size >= self.window_tokens and size % self.window_tokens != 0
         ]
         if unaligned_sizes:
             raise ValueError(
-                "audio_encoder_aclgraph_sizes must contain complete attention "
-                f"windows and be multiples of {self.window_tokens}; "
+                "audio_encoder_aclgraph_sizes may contain a partial attention "
+                f"window smaller than {self.window_tokens}, but sizes spanning "
+                "complete attention windows must be multiples of "
+                f"{self.window_tokens}; "
                 f"unaligned sizes: {unaligned_sizes}"
             )
         self.encoder = encoder
