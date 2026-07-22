@@ -184,30 +184,8 @@ def test_audio_encoder_attention_operator_performance_310p():
         tokens: build_padded_attention_mask((tokens,))[0].npu()
         for tokens in TOKEN_SIZES
     }
-    static_query = query_bnsd.clone()
-    static_key = key_bnsd.clone()
-    static_value = value_bnsd.clone()
-    static_mask = build_padded_attention_mask((GRAPH_SIZE,))[0].npu()
-
-    for _ in range(2):
-        _prompt_attention(
-            static_query,
-            static_key,
-            static_value,
-            static_mask,
-        )
-    torch.npu.synchronize()
-    graph = torch.npu.NPUGraph()
-    with torch.npu.graph(graph):
-        graph_output = _prompt_attention(
-            static_query,
-            static_key,
-            static_value,
-            static_mask,
-        )
-    torch.npu.synchronize()
-
     rows = []
+    eager_references = {}
     unpad_format = ACL_FORMAT_FRACTAL_NZ
     for tokens in TOKEN_SIZES:
         sequence_lengths = torch.tensor([tokens], dtype=torch.int32)
@@ -244,25 +222,18 @@ def test_audio_encoder_attention_operator_performance_310p():
             value_bnsd,
             mask,
         )
-        static_mask.copy_(mask)
-        graph.replay()
         torch.npu.synchronize()
-        replay_pfa = graph_output.clone()
 
-        eager_pfa_prefix = eager_pfa[0, :, :tokens].transpose(0, 1)
-        replay_pfa_prefix = replay_pfa[0, :, :tokens].transpose(0, 1)
+        eager_pfa_prefix = (
+            eager_pfa[0, :, :tokens].transpose(0, 1).clone()
+        )
         torch.testing.assert_close(
             eager_pfa_prefix,
             eager_unpad,
             atol=3e-2,
             rtol=3e-2,
         )
-        torch.testing.assert_close(
-            replay_pfa_prefix,
-            eager_unpad,
-            atol=3e-2,
-            rtol=3e-2,
-        )
+        eager_references[tokens] = eager_pfa_prefix
 
         unpad_p50, unpad_min, unpad_p90 = _benchmark_npu(
             lambda: _unpad_attention(
@@ -281,9 +252,6 @@ def test_audio_encoder_attention_operator_performance_310p():
                 mask,
             )
         )
-        static_mask.copy_(mask)
-        torch.npu.synchronize()
-        graph_p50, graph_min, graph_p90 = _benchmark_npu(graph.replay)
         rows.append(
             {
                 "tokens": float(tokens),
@@ -293,6 +261,53 @@ def test_audio_encoder_attention_operator_performance_310p():
                 "pfa_p50": pfa_p50,
                 "pfa_min": pfa_min,
                 "pfa_p90": pfa_p90,
+            }
+        )
+
+    # Capture last and do not execute another eager Attention afterwards.
+    # On 310P, interleaving ATB SelfAttentionOperation calls after capture can
+    # overwrite state required by a captured PromptFlashAttention replay.
+    static_query = query_bnsd.clone()
+    static_key = key_bnsd.clone()
+    static_value = value_bnsd.clone()
+    static_mask = build_padded_attention_mask((GRAPH_SIZE,))[0].npu()
+    for _ in range(2):
+        _prompt_attention(
+            static_query,
+            static_key,
+            static_value,
+            static_mask,
+        )
+    torch.npu.synchronize()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        graph_output = _prompt_attention(
+            static_query,
+            static_key,
+            static_value,
+            static_mask,
+        )
+    torch.npu.synchronize()
+
+    for row, tokens in zip(rows, TOKEN_SIZES, strict=True):
+        static_mask.copy_(masks[tokens])
+        graph.replay()
+        torch.npu.synchronize()
+        replay_pfa_prefix = (
+            graph_output[0, :, :tokens].transpose(0, 1).clone()
+        )
+        torch.testing.assert_close(
+            replay_pfa_prefix,
+            eager_references[tokens],
+            atol=3e-2,
+            rtol=3e-2,
+        )
+
+        static_mask.copy_(masks[tokens])
+        torch.npu.synchronize()
+        graph_p50, graph_min, graph_p90 = _benchmark_npu(graph.replay)
+        row.update(
+            {
                 "graph_p50": graph_p50,
                 "graph_min": graph_min,
                 "graph_p90": graph_p90,
