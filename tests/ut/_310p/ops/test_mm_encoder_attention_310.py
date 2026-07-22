@@ -128,11 +128,12 @@ def test_mm_encoder_attention_uses_prompt_attention_only_in_graph_context():
     layer.enable_pad = False
     layer.scale_value = layer.head_size**-0.5
 
-    query = torch.randn(1, 128, 2, 64)
+    query = torch.randn(1, 26, 2, 64)
     attention_mask = torch.zeros((128, 128), dtype=torch.bool)
     captured = {}
 
     def fake_prompt_attention(q, k, v, **kwargs):
+        captured["query"] = q
         captured["query_shape"] = q.shape
         captured.update(kwargs)
         return q
@@ -151,6 +152,7 @@ def test_mm_encoder_attention_uses_prompt_attention_only_in_graph_context():
         output = layer.forward_oot(query, query, query)
 
     assert captured["query_shape"] == (1, 2, 128, 64)
+    assert torch.count_nonzero(captured["query"][:, :, 26:]) == 0
     assert captured["atten_mask"] is attention_mask
     assert captured["input_layout"] == "BNSD"
     assert captured["pre_tokens"] == 2147483647

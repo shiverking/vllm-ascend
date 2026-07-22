@@ -53,7 +53,7 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 class TestNPUModelRunner310(TestBase):
     def test_capture_model_captures_configured_audio_graphs_at_startup(self):
         runner = object.__new__(NPUModelRunner310)
-        graph_sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
+        graph_sizes = (26, 52, 78, 128, 256, 384, 512)
         runner.ascend_config = SimpleNamespace(
             audio_encoder_aclgraph_sizes=graph_sizes
         )

@@ -20,9 +20,9 @@ import pytest
 import torch
 
 from vllm_ascend._310p.audio_encoder_acl_graph import (
-    AUDIO_ENCODER_PROMPT_GRAPH_SIZE,
     AudioEncoderAclGraphPool,
     FixedAudioEncoderAclGraphRunner,
+    align_audio_encoder_prompt_attention_tokens,
     build_padded_attention_mask,
 )
 
@@ -36,6 +36,7 @@ def _make_encoder(enforce_eager: bool = False):
     [
         ((100,), 28),
         ((26, 44), 58),
+        ((8, 12), 108),
         ((104,), 24),
         ((26, 26, 26, 26), 24),
         ((128,), 0),
@@ -78,9 +79,36 @@ def test_build_padded_attention_mask_rejects_invalid_topology(topology):
         build_padded_attention_mask(topology)
 
 
-def test_audio_encoder_aclgraph_accepts_aligned_graph_pool():
+@pytest.mark.parametrize(
+    ("graph_tokens", "attention_tokens"),
+    [
+        (26, 128),
+        (52, 128),
+        (78, 128),
+        (128, 128),
+        (256, 256),
+        (384, 384),
+        (512, 512),
+    ],
+)
+def test_align_audio_encoder_prompt_attention_tokens(
+    graph_tokens,
+    attention_tokens,
+):
+    assert (
+        align_audio_encoder_prompt_attention_tokens(graph_tokens)
+        == attention_tokens
+    )
+
+
+def test_align_audio_encoder_prompt_attention_tokens_rejects_zero():
+    with pytest.raises(ValueError, match="positive"):
+        align_audio_encoder_prompt_attention_tokens(0)
+
+
+def test_audio_encoder_aclgraph_accepts_small_graph_pool():
     eager_forward = lambda *args: args[1]
-    sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
+    sizes = (26, 52, 78, 128, 256, 384, 512)
     pool = AudioEncoderAclGraphPool(
         _make_encoder(),
         eager_forward,
@@ -88,20 +116,23 @@ def test_audio_encoder_aclgraph_accepts_aligned_graph_pool():
     )
 
     assert pool.graph_sizes == sizes
-    with pytest.raises(ValueError, match=r"multiples of 128"):
-        AudioEncoderAclGraphPool(_make_encoder(), eager_forward, (104,))
+    assert pool.runners[26].attention_tokens == 128
 
 
 @pytest.mark.parametrize(
     ("topology", "expected_graphs", "expected_eager"),
     [
-        ((13,), [128], 0),
-        ((26,), [128], 0),
-        ((52,), [128], 0),
+        ((13,), [26], 0),
+        ((26,), [26], 0),
+        ((27,), [52], 0),
+        ((52,), [52], 0),
+        ((53,), [78], 0),
+        ((78,), [78], 0),
+        ((79,), [128], 0),
         ((104,), [128], 0),
         ((130,), [256], 0),
-        ((104, 104, 104, 104, 104), [640], 0),
-        ((104,) * 10, [1024, 128], 0),
+        ((104, 104, 104, 104, 104), [512, 128], 0),
+        ((104,) * 10, [512, 512, 256], 0),
         ((1200, 104), [128], 1200),
     ],
 )
@@ -110,7 +141,7 @@ def test_audio_encoder_aclgraph_builds_nearest_sequence_plan(
     expected_graphs,
     expected_eager,
 ):
-    sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
+    sizes = (26, 52, 78, 128, 256, 384, 512)
     pool = AudioEncoderAclGraphPool(
         _make_encoder(),
         lambda *args: args[1],
@@ -136,7 +167,7 @@ def test_audio_encoder_aclgraph_builds_nearest_sequence_plan(
 
 
 def test_audio_encoder_aclgraph_long_standard_topology_has_no_eager_tail():
-    sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
+    sizes = (26, 52, 78, 128, 256, 384, 512)
     pool = AudioEncoderAclGraphPool(
         _make_encoder(),
         lambda *args: args[1],
@@ -158,12 +189,12 @@ def test_audio_encoder_aclgraph_replays_a_b_a_with_stable_mask_address(
     runner = FixedAudioEncoderAclGraphRunner(
         _make_encoder(),
         eager_forward,
-        128,
+        26,
     )
     graph = mock.Mock()
-    capture_input = torch.zeros(128, 4, dtype=torch.float16)
-    capture_cu_seqlens = torch.tensor([0, 128], dtype=torch.int32)
-    capture_sequence_lengths = torch.tensor([128], dtype=torch.int32)
+    capture_input = torch.zeros(26, 4, dtype=torch.float16)
+    capture_cu_seqlens = torch.tensor([0, 26], dtype=torch.int32)
+    capture_sequence_lengths = torch.tensor([26], dtype=torch.int32)
 
     with (
         mock.patch.object(torch.npu, "synchronize"),
@@ -181,7 +212,7 @@ def test_audio_encoder_aclgraph_replays_a_b_a_with_stable_mask_address(
             capture_sequence_lengths,
         )
 
-    topologies = ((100,), (26, 44), (100,))
+    topologies = ((20,), (8, 12), (20,))
     masks = []
     mask_addresses = []
     outputs = []
@@ -209,12 +240,15 @@ def test_audio_encoder_aclgraph_replays_a_b_a_with_stable_mask_address(
     assert len(set(mask_addresses)) == 1
     torch.testing.assert_close(masks[0], masks[2])
     assert not torch.equal(masks[0], masks[1])
-    assert [output.shape[0] for output in outputs] == [100, 70, 100]
+    assert [output.shape[0] for output in outputs] == [20, 20, 20]
     assert all(output.data_ptr() != runner.static_output.data_ptr() for output in outputs)
-    assert torch.count_nonzero(runner.static_input[100:]) == 0
+    assert torch.count_nonzero(runner.static_input[20:]) == 0
     logs = capsys.readouterr().out
     assert logs.count("graph_hit=True") == 3
-    assert "actual=70, padded=128, seq_lens=[26, 44], dummy=58" in logs
+    assert (
+        "actual=20, graph=26, seq_lens=[8, 12], "
+        "body_padding=6, attention_padding=108"
+    ) in logs
 
 
 def test_audio_encoder_aclgraph_falls_back_for_token_overflow(capsys):
@@ -257,13 +291,13 @@ def test_audio_encoder_aclgraph_accepts_multiple_audio_sequences():
     runner = FixedAudioEncoderAclGraphRunner(
         _make_encoder(),
         lambda *args: args[1],
-        128,
+        26,
     )
     runner.graph = mock.Mock()
     hidden_states = mock.Mock()
     hidden_states.dtype = torch.float16
     hidden_states.device = torch.device("npu")
-    hidden_states.shape = (70, 4)
+    hidden_states.shape = (20, 4)
     hidden_states.is_contiguous.return_value = True
 
     with mock.patch(
@@ -272,7 +306,7 @@ def test_audio_encoder_aclgraph_accepts_multiple_audio_sequences():
     ):
         error = runner._eligibility_error(
             hidden_states,
-            torch.tensor([26, 44], dtype=torch.int32),
+            torch.tensor([8, 12], dtype=torch.int32),
         )
 
     assert error is None

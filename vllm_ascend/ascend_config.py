@@ -23,7 +23,7 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-AUDIO_ENCODER_PROMPT_ACLGRAPH_ALIGNMENT = 128
+MAX_AUDIO_ENCODER_ACLGRAPHS_310P = 7
 
 
 def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
@@ -45,16 +45,12 @@ def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
             "only positive integers"
         )
     sizes = tuple(sorted(set(value)))
-    unaligned_sizes = [
-        size
-        for size in sizes
-        if size % AUDIO_ENCODER_PROMPT_ACLGRAPH_ALIGNMENT != 0
-    ]
-    if unaligned_sizes:
+    if len(sizes) > MAX_AUDIO_ENCODER_ACLGRAPHS_310P:
         raise ValueError(
-            "additional_config.audio_encoder_aclgraph_sizes must contain "
-            f"multiples of {AUDIO_ENCODER_PROMPT_ACLGRAPH_ALIGNMENT}; "
-            f"unaligned sizes: {unaligned_sizes}"
+            "additional_config.audio_encoder_aclgraph_sizes supports at most "
+            f"{MAX_AUDIO_ENCODER_ACLGRAPHS_310P} graph sizes on Ascend 310P; "
+            "capturing more full audio encoder graphs can exhaust CANN event "
+            f"resources. Got {len(sizes)} unique sizes: {list(sizes)}"
         )
     return sizes
 

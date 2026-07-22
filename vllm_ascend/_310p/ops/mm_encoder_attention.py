@@ -22,6 +22,7 @@ import torch_npu
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
 from vllm_ascend._310p.audio_encoder_acl_graph import (
+    AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT,
     get_audio_encoder_prompt_attention_mask,
 )
 
@@ -115,19 +116,61 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
                     "310P padded audio encoder graph requires self-attention "
                     "with batch size 1"
                 )
+            if (
+                prompt_attention_mask.dim() != 2
+                or prompt_attention_mask.shape[0]
+                != prompt_attention_mask.shape[1]
+            ):
+                raise ValueError(
+                    "310P padded audio encoder graph requires a square "
+                    "attention mask"
+                )
+            attention_tokens = int(prompt_attention_mask.shape[0])
+            if attention_tokens % AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT != 0:
+                raise ValueError(
+                    "310P padded audio encoder attention mask size must be "
+                    "a multiple of "
+                    f"{AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT}: "
+                    f"actual={attention_tokens}"
+                )
+            if attention_tokens < q_len:
+                raise ValueError(
+                    "310P padded audio encoder attention mask is smaller "
+                    f"than Q/K: mask={attention_tokens}, q_len={q_len}"
+                )
+            sequence_padding = attention_tokens - q_len
+            if sequence_padding:
+                q = F.pad(q, (0, 0, 0, 0, 0, sequence_padding))
+                k = F.pad(k, (0, 0, 0, 0, 0, sequence_padding))
+                v = F.pad(v, (0, 0, 0, 0, 0, sequence_padding))
             padded_head_size = q.shape[-1]
             q_bnsd = (
-                q.view(bsz, q_len, self.num_heads, padded_head_size)
+                q.view(
+                    bsz,
+                    attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )
                 .transpose(1, 2)
                 .contiguous()
             )
             k_bnsd = (
-                k.view(bsz, kv_len, self.num_heads, padded_head_size)
+                k.view(
+                    bsz,
+                    attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )
                 .transpose(1, 2)
                 .contiguous()
             )
             v_bnsd = (
-                v.view(bsz, kv_len, self.num_heads, padded_head_size)
+                v.view(
+                    bsz,
+                    attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )
                 .transpose(1, 2)
                 .contiguous()
             )
@@ -147,7 +190,11 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
             context_layer = (
                 context_layer.transpose(1, 2)
                 .contiguous()
-                .view(bsz * q_len, self.num_heads, padded_head_size)
+                .view(
+                    bsz * attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )[: bsz * q_len]
             )
         else:
             if sequence_lengths is not None:

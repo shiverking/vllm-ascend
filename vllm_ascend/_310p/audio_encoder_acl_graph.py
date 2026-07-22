@@ -28,7 +28,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.platforms import current_platform
 
 
-AUDIO_ENCODER_PROMPT_GRAPH_SIZE = 128
+AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT = 128
 _PROMPT_ATTENTION_MASK: ContextVar[torch.Tensor | None] = ContextVar(
     "audio_encoder_prompt_attention_mask",
     default=None,
@@ -54,9 +54,18 @@ def use_audio_encoder_prompt_attention(
         _PROMPT_ATTENTION_MASK.reset(token)
 
 
+def align_audio_encoder_prompt_attention_tokens(num_tokens: int) -> int:
+    """Align the PromptFlashAttention sequence while keeping its body small."""
+
+    if num_tokens <= 0:
+        raise ValueError("audio encoder graph size must be positive")
+    alignment = AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT
+    return ((num_tokens + alignment - 1) // alignment) * alignment
+
+
 def build_padded_attention_mask(
     sequence_lengths: Sequence[int],
-    graph_size: int = AUDIO_ENCODER_PROMPT_GRAPH_SIZE,
+    graph_size: int = AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT,
 ) -> tuple[torch.Tensor, int]:
     """Build a block mask and isolate padding as an independent sequence."""
 
@@ -109,17 +118,14 @@ class FixedAudioEncoderAclGraphRunner:
         *,
         announce_enabled: bool = True,
     ) -> None:
-        if (
-            num_tokens <= 0
-            or num_tokens % AUDIO_ENCODER_PROMPT_GRAPH_SIZE != 0
-        ):
-            raise ValueError(
-                "audio encoder ACLGraph sizes must be positive multiples of "
-                f"{AUDIO_ENCODER_PROMPT_GRAPH_SIZE}"
-            )
+        if num_tokens <= 0:
+            raise ValueError("audio encoder ACLGraph sizes must be positive")
         self.encoder = encoder
         self.eager_forward = eager_forward
         self.num_tokens = num_tokens
+        self.attention_tokens = align_audio_encoder_prompt_attention_tokens(
+            num_tokens
+        )
         self.graph: Any | None = None
         self.static_input: torch.Tensor | None = None
         self.static_cu_seqlens: torch.Tensor | None = None
@@ -134,7 +140,8 @@ class FixedAudioEncoderAclGraphRunner:
         if announce_enabled:
             print(
                 "[310P_AUDIO_GRAPH] PromptFlashAttention padding enabled: "
-                f"size={num_tokens}",
+                f"graph_tokens={num_tokens}, "
+                f"attention_tokens={self.attention_tokens}",
                 flush=True,
             )
 
@@ -185,7 +192,7 @@ class FixedAudioEncoderAclGraphRunner:
         self.static_sequence_lengths = sequence_lengths.clone()
         capture_mask, _ = build_padded_attention_mask(
             (self.num_tokens,),
-            self.num_tokens,
+            self.attention_tokens,
         )
         self.host_attention_mask = torch.empty_like(capture_mask)
         self.host_attention_mask.copy_(capture_mask)
@@ -279,7 +286,7 @@ class FixedAudioEncoderAclGraphRunner:
         self,
         hidden_states: torch.Tensor,
         sequence_lengths: torch.Tensor,
-    ) -> tuple[torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, int, int]:
         error = self._eligibility_error(hidden_states, sequence_lengths)
         if error is not None:
             reason, detail = error
@@ -292,12 +299,13 @@ class FixedAudioEncoderAclGraphRunner:
         assert self.static_output is not None
         topology = tuple(sequence_lengths.tolist())
         actual_tokens = hidden_states.shape[0]
-        mask, dummy_tokens = build_padded_attention_mask(
+        body_padding = self.num_tokens - actual_tokens
+        mask, attention_padding = build_padded_attention_mask(
             topology,
-            self.num_tokens,
+            self.attention_tokens,
         )
         self.static_input[:actual_tokens].copy_(hidden_states)
-        if dummy_tokens:
+        if body_padding:
             self.static_input[actual_tokens:].zero_()
         self.host_attention_mask.copy_(mask)
         self.static_attention_mask.copy_(
@@ -306,7 +314,11 @@ class FixedAudioEncoderAclGraphRunner:
         )
         self.graph.replay()
         self.last_action = "replay"
-        return self.static_output[:actual_tokens].clone(), dummy_tokens
+        return (
+            self.static_output[:actual_tokens].clone(),
+            body_padding,
+            attention_padding,
+        )
 
     def run(
         self,
@@ -336,11 +348,15 @@ class FixedAudioEncoderAclGraphRunner:
                 num_audios,
             )
 
-        output, dummy_tokens = self.replay(hidden_states, sequence_lengths)
+        output, body_padding, attention_padding = self.replay(
+            hidden_states, sequence_lengths
+        )
         print(
             f"[310P_AUDIO_GRAPH] request={request_id}, graph_hit=True, "
-            f"actual={hidden_states.shape[0]}, padded={self.num_tokens}, "
-            f"seq_lens={sequence_lengths.tolist()}, dummy={dummy_tokens}",
+            f"actual={hidden_states.shape[0]}, graph={self.num_tokens}, "
+            f"seq_lens={sequence_lengths.tolist()}, "
+            f"body_padding={body_padding}, "
+            f"attention_padding={attention_padding}",
             flush=True,
         )
         return output
@@ -358,17 +374,6 @@ class AudioEncoderAclGraphPool:
         sizes = tuple(sorted(set(graph_sizes)))
         if not sizes or any(size <= 0 for size in sizes):
             raise ValueError("audio encoder ACLGraph sizes must be positive")
-        unaligned_sizes = [
-            size
-            for size in sizes
-            if size % AUDIO_ENCODER_PROMPT_GRAPH_SIZE != 0
-        ]
-        if unaligned_sizes:
-            raise ValueError(
-                "audio encoder ACLGraph sizes must be multiples of "
-                f"{AUDIO_ENCODER_PROMPT_GRAPH_SIZE}; "
-                f"unaligned sizes: {unaligned_sizes}"
-            )
         self.encoder = encoder
         self.eager_forward = eager_forward
         self.graph_sizes = sizes
@@ -631,10 +636,11 @@ class AudioEncoderAclGraphPool:
         hidden_states: torch.Tensor,
         topology: tuple[int, ...],
         max_seqlen: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, list[int], int, int]:
+    ) -> tuple[torch.Tensor, list[int], int, int, int]:
         outputs: list[torch.Tensor] = []
         graph_sizes: list[int] = []
-        padding_tokens = 0
+        body_padding_tokens = 0
+        attention_padding_tokens = 0
         eager_tokens = 0
         for chunk in plan:
             if chunk.runner is None:
@@ -657,16 +663,23 @@ class AudioEncoderAclGraphPool:
                 dtype=torch.int32,
                 device="cpu",
             ).contiguous()
-            output, dummy_tokens = chunk.runner.replay(
+            output, body_padding, attention_padding = chunk.runner.replay(
                 hidden_states[chunk.token_start : chunk.token_end],
                 chunk_sequence_lengths,
             )
             outputs.append(output)
             graph_sizes.append(chunk.runner.num_tokens)
-            padding_tokens += dummy_tokens
+            body_padding_tokens += body_padding
+            attention_padding_tokens += attention_padding
 
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
-        return output, graph_sizes, padding_tokens, eager_tokens
+        return (
+            output,
+            graph_sizes,
+            body_padding_tokens,
+            attention_padding_tokens,
+            eager_tokens,
+        )
 
     def _execute_plan_stream_safe(
         self,
@@ -674,7 +687,7 @@ class AudioEncoderAclGraphPool:
         hidden_states: torch.Tensor,
         topology: tuple[int, ...],
         max_seqlen: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, list[int], int, int]:
+    ) -> tuple[torch.Tensor, list[int], int, int, int]:
         if self._execution_stream is None:
             return self._execute_plan(
                 plan,
@@ -717,7 +730,8 @@ class AudioEncoderAclGraphPool:
         if reason is not None:
             print(
                 f"[310P_AUDIO_GRAPH] batch={batch_id}, hit=False, "
-                f"actual={hidden_states.shape[0]}, graphs=[], padding=0, "
+                f"actual={hidden_states.shape[0]}, graphs=[], "
+                "body_padding=0, attention_padding=0, "
                 f"eager={hidden_states.shape[0]}, reason={reason}",
                 flush=True,
             )
@@ -732,7 +746,13 @@ class AudioEncoderAclGraphPool:
 
         topology = tuple(sequence_lengths.tolist())
         plan = self._build_plan(topology)
-        output, graph_sizes, padding_tokens, eager_tokens = (
+        (
+            output,
+            graph_sizes,
+            body_padding_tokens,
+            attention_padding_tokens,
+            eager_tokens,
+        ) = (
             self._execute_plan_stream_safe(
                 plan,
                 hidden_states,
@@ -748,7 +768,9 @@ class AudioEncoderAclGraphPool:
         print(
             f"[310P_AUDIO_GRAPH] batch={batch_id}, hit={hit}, "
             f"actual={hidden_states.shape[0]}, graphs={graph_sizes}, "
-            f"padding={padding_tokens}, eager={eager_tokens}",
+            f"body_padding={body_padding_tokens}, "
+            f"attention_padding={attention_padding_tokens}, "
+            f"eager={eager_tokens}",
             flush=True,
         )
         return output
