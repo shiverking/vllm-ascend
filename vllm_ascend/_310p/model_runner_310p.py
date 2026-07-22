@@ -138,11 +138,9 @@ class NPUModelRunner310(NPUModelRunner):
                 if pool is not None
                 else {}
             )
-            logger.warning(
-                "Audio encoder graph capture failed for sizes %s; "
-                "these chunks will run eagerly. errors=%s",
-                list(missing),
-                errors,
+            raise RuntimeError(
+                "Audio encoder ACLGraph startup capture did not complete: "
+                f"missing={list(missing)}, errors={errors}"
             )
         audio_graph_memory = max(
             torch.npu.memory_reserved() - memory_before,

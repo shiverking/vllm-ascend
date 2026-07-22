@@ -53,15 +53,16 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 class TestNPUModelRunner310(TestBase):
     def test_capture_model_captures_configured_audio_graphs_at_startup(self):
         runner = object.__new__(NPUModelRunner310)
+        graph_sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
         runner.ascend_config = SimpleNamespace(
-            audio_encoder_aclgraph_sizes=(128,)
+            audio_encoder_aclgraph_sizes=graph_sizes
         )
         runner.load_config = SimpleNamespace(use_tqdm_on_load=True)
         runner.model = MagicMock()
 
         def capture_audio_graphs(*args, **kwargs):
             self.assertTrue(torch.is_inference_mode_enabled())
-            return (128,)
+            return graph_sizes
 
         with (
             patch(
@@ -90,6 +91,33 @@ class TestNPUModelRunner310(TestBase):
             runner.model,
             show_progress=True,
         )
+
+    def test_capture_model_fails_when_audio_graph_pool_is_incomplete(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.ascend_config = SimpleNamespace(
+            audio_encoder_aclgraph_sizes=(128, 256)
+        )
+        runner.load_config = SimpleNamespace(use_tqdm_on_load=False)
+        runner.model = MagicMock()
+        runner.model.audio_tower._ascend_audio_aclgraph_pool = None
+
+        with (
+            patch(
+                "vllm_ascend.worker.model_runner_v1.NPUModelRunner.capture_model",
+                return_value=100,
+            ),
+            patch(
+                "vllm_ascend.patch.worker.patch_qwen3_audio_aclgraph_310p."
+                "capture_audio_encoder_aclgraphs",
+                return_value=(128,),
+            ),
+            patch.object(torch.npu, "memory_reserved", return_value=1000),
+            self.assertRaisesRegex(
+                RuntimeError,
+                r"startup capture did not complete.*256",
+            ),
+        ):
+            runner.capture_model()
 
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)

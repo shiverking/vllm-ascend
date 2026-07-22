@@ -23,7 +23,7 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-AUDIO_ENCODER_PROMPT_ACLGRAPH_SIZE = 128
+AUDIO_ENCODER_PROMPT_ACLGRAPH_ALIGNMENT = 128
 
 
 def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
@@ -44,11 +44,17 @@ def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
             "additional_config.audio_encoder_aclgraph_sizes must contain "
             "only positive integers"
         )
-    sizes = tuple(sorted(set(value), reverse=True))
-    if sizes and sizes != (AUDIO_ENCODER_PROMPT_ACLGRAPH_SIZE,):
+    sizes = tuple(sorted(set(value)))
+    unaligned_sizes = [
+        size
+        for size in sizes
+        if size % AUDIO_ENCODER_PROMPT_ACLGRAPH_ALIGNMENT != 0
+    ]
+    if unaligned_sizes:
         raise ValueError(
-            "the 310P padded audio encoder prototype requires "
-            "additional_config.audio_encoder_aclgraph_sizes=[128]"
+            "additional_config.audio_encoder_aclgraph_sizes must contain "
+            f"multiples of {AUDIO_ENCODER_PROMPT_ACLGRAPH_ALIGNMENT}; "
+            f"unaligned sizes: {unaligned_sizes}"
         )
     return sizes
 

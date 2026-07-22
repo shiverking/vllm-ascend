@@ -61,23 +61,92 @@ def test_build_padded_attention_mask(topology, dummy_tokens):
         offset = end
 
 
+def test_build_padded_attention_mask_supports_larger_graph():
+    mask, dummy_tokens = build_padded_attention_mask((104, 52), 256)
+
+    assert mask.shape == (256, 256)
+    assert dummy_tokens == 100
+    assert not mask[:104, :104].any()
+    assert not mask[104:156, 104:156].any()
+    assert not mask[156:, 156:].any()
+    assert mask[:104, 104:].all()
+
+
 @pytest.mark.parametrize("topology", [(), (0,), (-1,), (129,)])
 def test_build_padded_attention_mask_rejects_invalid_topology(topology):
     with pytest.raises(ValueError):
         build_padded_attention_mask(topology)
 
 
-def test_audio_encoder_aclgraph_requires_single_128_graph():
+def test_audio_encoder_aclgraph_accepts_aligned_graph_pool():
     eager_forward = lambda *args: args[1]
+    sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
     pool = AudioEncoderAclGraphPool(
         _make_encoder(),
         eager_forward,
-        (AUDIO_ENCODER_PROMPT_GRAPH_SIZE,),
+        sizes,
     )
 
-    assert pool.graph_sizes == (128,)
-    with pytest.raises(ValueError, match=r"sizes=\[128\]"):
+    assert pool.graph_sizes == sizes
+    with pytest.raises(ValueError, match=r"multiples of 128"):
         AudioEncoderAclGraphPool(_make_encoder(), eager_forward, (104,))
+
+
+@pytest.mark.parametrize(
+    ("topology", "expected_graphs", "expected_eager"),
+    [
+        ((13,), [128], 0),
+        ((26,), [128], 0),
+        ((52,), [128], 0),
+        ((104,), [128], 0),
+        ((130,), [256], 0),
+        ((104, 104, 104, 104, 104), [640], 0),
+        ((104,) * 10, [1024, 128], 0),
+        ((1200, 104), [128], 1200),
+    ],
+)
+def test_audio_encoder_aclgraph_builds_nearest_sequence_plan(
+    topology,
+    expected_graphs,
+    expected_eager,
+):
+    sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder(),
+        lambda *args: args[1],
+        sizes,
+    )
+
+    plan = pool._build_plan(topology)
+    graph_sizes = [
+        chunk.runner.num_tokens
+        for chunk in plan
+        if chunk.runner is not None
+    ]
+    eager_tokens = sum(
+        chunk.actual_tokens for chunk in plan if chunk.runner is None
+    )
+
+    assert graph_sizes == expected_graphs
+    assert eager_tokens == expected_eager
+    assert [chunk.sequence_start for chunk in plan] == [
+        0,
+        *[chunk.sequence_end for chunk in plan[:-1]],
+    ]
+
+
+def test_audio_encoder_aclgraph_long_standard_topology_has_no_eager_tail():
+    sizes = (128, 256, 384, 512, 640, 768, 896, 1024)
+    pool = AudioEncoderAclGraphPool(
+        _make_encoder(),
+        lambda *args: args[1],
+        sizes,
+    )
+
+    plan = pool._build_plan((104,) * 23)
+
+    assert all(chunk.runner is not None for chunk in plan)
+    assert sum(chunk.actual_tokens for chunk in plan) == 104 * 23
 
 
 def test_audio_encoder_aclgraph_replays_a_b_a_with_stable_mask_address(

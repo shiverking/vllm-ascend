@@ -88,14 +88,24 @@ class TestAscendConfig(TestBase):
     def test_audio_encoder_aclgraph_sizes(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "audio_encoder_aclgraph_sizes": [128, 128],
+            "audio_encoder_aclgraph_sizes": [
+                1024,
+                128,
+                256,
+                384,
+                512,
+                640,
+                768,
+                896,
+                128,
+            ],
         }
 
         ascend_config = init_ascend_config(test_vllm_config)
 
         self.assertEqual(
             ascend_config.audio_encoder_aclgraph_sizes,
-            (128,),
+            (128, 256, 384, 512, 640, 768, 896, 1024),
         )
 
     @_clean_up_ascend_config
@@ -111,14 +121,34 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_audio_encoder_aclgraph_sizes_reject_non_prototype_sizes(self, mock_fix_incompatible_config):
+    def test_audio_encoder_aclgraph_sizes_reject_unaligned_sizes(
+        self, mock_fix_incompatible_config
+    ):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
             "audio_encoder_aclgraph_sizes": [104, 128],
         }
 
-        with self.assertRaisesRegex(ValueError, r"sizes=\[128\]"):
+        with self.assertRaisesRegex(ValueError, r"multiples of 128"):
             init_ascend_config(test_vllm_config)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_audio_encoder_aclgraph_sizes_have_no_count_limit(
+        self, mock_fix_incompatible_config
+    ):
+        test_vllm_config = VllmConfig()
+        sizes = [128 * index for index in range(1, 17)]
+        test_vllm_config.additional_config = {
+            "audio_encoder_aclgraph_sizes": sizes,
+        }
+
+        ascend_config = init_ascend_config(test_vllm_config)
+
+        self.assertEqual(
+            ascend_config.audio_encoder_aclgraph_sizes,
+            tuple(sizes),
+        )
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
