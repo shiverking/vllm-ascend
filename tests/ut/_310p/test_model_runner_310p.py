@@ -54,14 +54,14 @@ class TestNPUModelRunner310(TestBase):
     def test_capture_model_captures_configured_audio_graphs_at_startup(self):
         runner = object.__new__(NPUModelRunner310)
         runner.ascend_config = SimpleNamespace(
-            audio_encoder_aclgraph_sizes=(520, 312, 104)
+            audio_encoder_aclgraph_sizes=(128,)
         )
         runner.load_config = SimpleNamespace(use_tqdm_on_load=True)
         runner.model = MagicMock()
 
         def capture_audio_graphs(*args, **kwargs):
             self.assertTrue(torch.is_inference_mode_enabled())
-            return (520, 312, 104)
+            return (128,)
 
         with (
             patch(

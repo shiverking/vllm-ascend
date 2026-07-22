@@ -88,14 +88,14 @@ class TestAscendConfig(TestBase):
     def test_audio_encoder_aclgraph_sizes(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "audio_encoder_aclgraph_sizes": [104, 520, 208, 1040, 104],
+            "audio_encoder_aclgraph_sizes": [128, 128],
         }
 
         ascend_config = init_ascend_config(test_vllm_config)
 
         self.assertEqual(
             ascend_config.audio_encoder_aclgraph_sizes,
-            (1040, 520, 208, 104),
+            (128,),
         )
 
     @_clean_up_ascend_config
@@ -111,13 +111,13 @@ class TestAscendConfig(TestBase):
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_audio_encoder_aclgraph_sizes_reject_too_many_sizes(self, mock_fix_incompatible_config):
+    def test_audio_encoder_aclgraph_sizes_reject_non_prototype_sizes(self, mock_fix_incompatible_config):
         test_vllm_config = VllmConfig()
         test_vllm_config.additional_config = {
-            "audio_encoder_aclgraph_sizes": [104, 208, 312, 416, 520],
+            "audio_encoder_aclgraph_sizes": [104, 128],
         }
 
-        with self.assertRaisesRegex(ValueError, "at most 4 sizes"):
+        with self.assertRaisesRegex(ValueError, r"sizes=\[128\]"):
             init_ascend_config(test_vllm_config)
 
     @_clean_up_ascend_config
