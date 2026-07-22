@@ -8,7 +8,10 @@ import torch_npu
 from vllm_ascend._310p.audio_encoder_acl_graph import (
     build_padded_attention_mask,
 )
-from vllm_ascend.utils import is_310p as is_310p_hw
+from vllm_ascend.utils import (
+    ACL_FORMAT_FRACTAL_NZ,
+    is_310p as is_310p_hw,
+)
 
 
 torch_npu.npu.set_compile_mode(jit_compile=False)
@@ -83,19 +86,36 @@ def _unpad_attention(
     return output
 
 
-def _print_results(rows: list[dict[str, float]]) -> None:
+def _safe_speedup(baseline_ms: float, target_ms: float) -> float:
+    return baseline_ms / target_ms if target_ms > 0 else float("inf")
+
+
+def _print_results(
+    rows: list[dict[str, float]],
+    unpad_format: int,
+    prompt_format: int,
+) -> None:
     print("\nAudio Encoder Attention operator benchmark on Ascend 310P")
     print(
         "Times are Device event milliseconds per call; mask construction, "
         "mask H2D, QKV layout conversion, and graph capture are excluded."
     )
     print(
+        "The single-op graph result is a replay diagnostic and must not be "
+        "extrapolated to the complete Audio Encoder graph."
+    )
+    print(
         f"warmup={WARMUP_ITERATIONS}, iterations={BENCHMARK_ITERATIONS}, "
         f"heads={NUM_HEADS}, head_size={HEAD_SIZE}, graph_size={GRAPH_SIZE}"
     )
     print(
+        f"input formats: unpad={unpad_format} "
+        f"(FRACTAL_NZ={ACL_FORMAT_FRACTAL_NZ}), prompt={prompt_format}"
+    )
+    print(
         "tokens | unpad eager p50/min/p90 | PFA eager p50/min/p90 | "
-        "PFA graph p50/min/p90 | eager speedup | graph speedup"
+        "PFA single-op graph p50/min/p90 | eager speedup | "
+        "graph diagnostic speedup"
     )
     for row in rows:
         print(
@@ -106,8 +126,8 @@ def _print_results(rows: list[dict[str, float]]) -> None:
             f"{row['pfa_p90']:.4f} | "
             f"{row['graph_p50']:.4f}/{row['graph_min']:.4f}/"
             f"{row['graph_p90']:.4f} | "
-            f"{row['unpad_p50'] / row['pfa_p50']:.3f}x | "
-            f"{row['unpad_p50'] / row['graph_p50']:.3f}x"
+            f"{_safe_speedup(row['unpad_p50'], row['pfa_p50']):.3f}x | "
+            f"{_safe_speedup(row['unpad_p50'], row['graph_p50']):.3f}x"
         )
 
 
@@ -118,18 +138,47 @@ def _print_results(rows: list[dict[str, float]]) -> None:
 @torch.inference_mode()
 def test_audio_encoder_attention_operator_performance_310p():
     torch.manual_seed(0)
-    query_tnd = torch.randn(
+    query_tnd_nd = torch.randn(
         GRAPH_SIZE,
         NUM_HEADS,
         HEAD_SIZE,
         device="npu",
         dtype=torch.float16,
     )
-    key_tnd = torch.randn_like(query_tnd)
-    value_tnd = torch.randn_like(query_tnd)
-    query_bnsd = query_tnd.transpose(0, 1).unsqueeze(0).contiguous()
-    key_bnsd = key_tnd.transpose(0, 1).unsqueeze(0).contiguous()
-    value_bnsd = value_tnd.transpose(0, 1).unsqueeze(0).contiguous()
+    key_tnd_nd = torch.randn_like(query_tnd_nd)
+    value_tnd_nd = torch.randn_like(query_tnd_nd)
+
+    # Match the production 310P path: QKV linear outputs are FRACTAL_NZ,
+    # then PromptFlashAttention receives the result of the same
+    # view/transpose/contiguous sequence used by MMEncoderAttention.
+    query_tnd_nz = torch_npu.npu_format_cast(
+        query_tnd_nd,
+        ACL_FORMAT_FRACTAL_NZ,
+    )
+    key_tnd_nz = torch_npu.npu_format_cast(
+        key_tnd_nd,
+        ACL_FORMAT_FRACTAL_NZ,
+    )
+    value_tnd_nz = torch_npu.npu_format_cast(
+        value_tnd_nd,
+        ACL_FORMAT_FRACTAL_NZ,
+    )
+    query_bnsd = (
+        query_tnd_nz.view(1, GRAPH_SIZE, NUM_HEADS, HEAD_SIZE)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    key_bnsd = (
+        key_tnd_nz.view(1, GRAPH_SIZE, NUM_HEADS, HEAD_SIZE)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    value_bnsd = (
+        value_tnd_nz.view(1, GRAPH_SIZE, NUM_HEADS, HEAD_SIZE)
+        .transpose(1, 2)
+        .contiguous()
+    )
+    prompt_format = torch_npu.get_npu_format(query_bnsd)
 
     masks = {
         tokens: build_padded_attention_mask((tokens,))[0].npu()
@@ -156,15 +205,31 @@ def test_audio_encoder_attention_operator_performance_310p():
             static_value,
             static_mask,
         )
+    torch.npu.synchronize()
 
     rows = []
+    unpad_format = ACL_FORMAT_FRACTAL_NZ
     for tokens in TOKEN_SIZES:
         sequence_lengths = torch.tensor([tokens], dtype=torch.int32)
-        query = query_tnd[:tokens].contiguous()
-        key = key_tnd[:tokens].contiguous()
-        value = value_tnd[:tokens].contiguous()
+        query = torch_npu.npu_format_cast(
+            query_tnd_nd[:tokens].contiguous(),
+            ACL_FORMAT_FRACTAL_NZ,
+        )
+        key = torch_npu.npu_format_cast(
+            key_tnd_nd[:tokens].contiguous(),
+            ACL_FORMAT_FRACTAL_NZ,
+        )
+        value = torch_npu.npu_format_cast(
+            value_tnd_nd[:tokens].contiguous(),
+            ACL_FORMAT_FRACTAL_NZ,
+        )
         unpad_output = torch.empty_like(query)
         mask = masks[tokens]
+
+        assert torch_npu.get_npu_format(query) == ACL_FORMAT_FRACTAL_NZ
+        assert torch_npu.get_npu_format(key) == ACL_FORMAT_FRACTAL_NZ
+        assert torch_npu.get_npu_format(value) == ACL_FORMAT_FRACTAL_NZ
+        assert torch_npu.get_npu_format(unpad_output) == ACL_FORMAT_FRACTAL_NZ
 
         eager_unpad = _unpad_attention(
             query,
@@ -234,4 +299,4 @@ def test_audio_encoder_attention_operator_performance_310p():
             }
         )
 
-    _print_results(rows)
+    _print_results(rows, unpad_format, prompt_format)
