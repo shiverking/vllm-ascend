@@ -126,21 +126,9 @@ class NPUModelRunner310(NPUModelRunner):
             size for size in audio_graph_sizes if size not in captured
         )
         if missing:
-            model = self.get_model()
-            encoder = getattr(model, "audio_tower", None)
-            pool = getattr(encoder, "_ascend_audio_aclgraph_pool", None)
-            errors = (
-                {
-                    size: pool.runners[size].capture_error
-                    for size in missing
-                    if pool.runners[size].capture_error is not None
-                }
-                if pool is not None
-                else {}
-            )
             raise RuntimeError(
                 "Audio encoder ACLGraph startup capture did not complete: "
-                f"missing={list(missing)}, errors={errors}"
+                f"missing={list(missing)}"
             )
         audio_graph_memory = max(
             torch.npu.memory_reserved() - memory_before,

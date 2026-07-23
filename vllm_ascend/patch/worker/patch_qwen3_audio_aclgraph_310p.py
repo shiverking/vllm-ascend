@@ -66,7 +66,6 @@ def _forward_encoder_body_with_aclgraph(
     cu_seqlens: torch.Tensor,
     max_seqlen: torch.Tensor | None,
     sequence_lengths: torch.Tensor,
-    num_audios: int = 1,
 ) -> torch.Tensor:
     if (
         sequence_lengths.device.type == "cpu"
@@ -78,16 +77,6 @@ def _forward_encoder_body_with_aclgraph(
         )
         self._ascend_sequence_lengths_reuse_logged = True
 
-    if not get_ascend_config().audio_encoder_aclgraph_sizes:
-        return _original_forward_encoder_body(
-            self,
-            hidden_states,
-            cu_seqlens,
-            max_seqlen,
-            sequence_lengths,
-            num_audios,
-        )
-
     pool = getattr(self, "_ascend_audio_aclgraph_pool", None)
     if pool is None:
         return _original_forward_encoder_body(
@@ -96,14 +85,12 @@ def _forward_encoder_body_with_aclgraph(
             cu_seqlens,
             max_seqlen,
             sequence_lengths,
-            num_audios,
         )
     return pool.run(
         hidden_states,
         cu_seqlens,
         max_seqlen,
         sequence_lengths,
-        num_audios,
     )
 
 

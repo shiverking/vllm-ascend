@@ -133,8 +133,6 @@ class FixedAudioEncoderAclGraphRunner:
         self.static_attention_mask: torch.Tensor | None = None
         self.host_attention_mask: torch.Tensor | None = None
         self.static_output: torch.Tensor | None = None
-        self.capture_failed = False
-        self.capture_error: str | None = None
 
     def _run_eager(
         self,
@@ -142,7 +140,6 @@ class FixedAudioEncoderAclGraphRunner:
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
         sequence_lengths: torch.Tensor,
-        num_audios: int,
     ) -> torch.Tensor:
         return self.eager_forward(
             self.encoder,
@@ -150,7 +147,6 @@ class FixedAudioEncoderAclGraphRunner:
             cu_seqlens,
             max_seqlen,
             sequence_lengths,
-            num_audios,
         )
 
     def _run_graph_body(self) -> torch.Tensor:
@@ -164,7 +160,6 @@ class FixedAudioEncoderAclGraphRunner:
                 self.static_cu_seqlens,
                 self.static_max_seqlen,
                 self.static_sequence_lengths,
-                1,
             )
 
     def _capture(
@@ -204,9 +199,9 @@ class FixedAudioEncoderAclGraphRunner:
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
         sequence_lengths: torch.Tensor,
-    ) -> bool:
+    ) -> None:
         if self.graph is not None:
-            return True
+            return
         try:
             self._capture(
                 hidden_states,
@@ -215,10 +210,7 @@ class FixedAudioEncoderAclGraphRunner:
                 sequence_lengths,
             )
             torch.npu.synchronize()
-            return True
-        except Exception as exc:
-            self.capture_failed = True
-            self.capture_error = f"{type(exc).__name__}: {exc}"
+        except Exception:
             self.graph = None
             self.static_input = None
             self.static_cu_seqlens = None
@@ -227,7 +219,7 @@ class FixedAudioEncoderAclGraphRunner:
             self.static_attention_mask = None
             self.host_attention_mask = None
             self.static_output = None
-            return False
+            raise
 
     def replay(
         self,
@@ -306,7 +298,7 @@ class AudioEncoderAclGraphPool:
             list(sizes),
         )
 
-    def _capture_runner(self, runner: FixedAudioEncoderAclGraphRunner) -> bool:
+    def _capture_runner(self, runner: FixedAudioEncoderAclGraphRunner) -> None:
         hidden_size = int(self.encoder.ln_post.normalized_shape[0])
         hidden_states = torch.zeros(
             (runner.num_tokens, hidden_size),
@@ -322,7 +314,7 @@ class AudioEncoderAclGraphPool:
             self.encoder.device
         )
         max_seqlen = self.encoder.compute_attn_mask_seqlen(cu_seqlens)
-        return runner.capture(
+        runner.capture(
             hidden_states,
             cu_seqlens,
             max_seqlen,
@@ -353,11 +345,13 @@ class AudioEncoderAclGraphPool:
                     if show_progress:
                         progress.set_postfix(tokens=size)
                     runner = self.runners[size]
-                    if not self._capture_runner(runner):
+                    try:
+                        self._capture_runner(runner)
+                    except Exception as exc:
                         raise RuntimeError(
                             "Audio encoder ACLGraph capture failed for "
-                            f"size {size}: {runner.capture_error}"
-                        )
+                            f"size {size}: {type(exc).__name__}: {exc}"
+                        ) from exc
                     captured.append(size)
         torch.npu.synchronize()
         logger.info(
@@ -393,19 +387,19 @@ class AudioEncoderAclGraphPool:
 
         offsets = tuple(accumulate((0, *topology)))
         count = len(topology)
-        plan_costs: list[tuple[int, int, int, int] | None] = [None] * (
+        plan_costs: list[tuple[int, int, int] | None] = [None] * (
             count + 1
         )
         plans: list[tuple[AudioExecutionChunk, ...] | None] = [None] * (
             count + 1
         )
-        plan_costs[count] = (0, 0, 0, 0)
+        plan_costs[count] = (0, 0, 0)
         plans[count] = ()
 
         for start in range(count - 1, -1, -1):
             candidates: list[
                 tuple[
-                    tuple[int, int, int, int],
+                    tuple[int, int, int],
                     tuple[AudioExecutionChunk, ...],
                 ]
             ] = []
@@ -425,8 +419,7 @@ class AudioEncoderAclGraphPool:
                         (
                             tail_cost[0] + topology[start],
                             tail_cost[1],
-                            tail_cost[2],
-                            tail_cost[3] + 1,
+                            tail_cost[2] + 1,
                         ),
                         (eager_chunk, *tail_plan),
                     )
@@ -460,9 +453,8 @@ class AudioEncoderAclGraphPool:
                         (
                             (
                                 tail_cost[0],
-                                tail_cost[1] + runner.num_tokens,
-                                tail_cost[2] + padding,
-                                tail_cost[3] + 1,
+                                tail_cost[1] + padding,
+                                tail_cost[2] + 1,
                             ),
                             (graph_chunk, *tail_plan),
                         )
@@ -541,7 +533,6 @@ class AudioEncoderAclGraphPool:
             chunk_cu_seqlens,
             chunk_max_seqlen,
             chunk_sequence_lengths,
-            1,
         )
 
     def _execute_plan(
@@ -602,14 +593,7 @@ class AudioEncoderAclGraphPool:
         topology: tuple[int, ...],
         max_seqlen: torch.Tensor | None,
     ) -> tuple[torch.Tensor, list[int], int, int, int]:
-        if self._execution_stream is None:
-            return self._execute_plan(
-                plan,
-                hidden_states,
-                topology,
-                max_seqlen,
-            )
-
+        assert self._execution_stream is not None
         assert self._input_ready_event is not None
         assert self._output_ready_event is not None
         with self._execution_lock:
@@ -633,7 +617,6 @@ class AudioEncoderAclGraphPool:
         cu_seqlens: torch.Tensor,
         max_seqlen: torch.Tensor | None,
         sequence_lengths: torch.Tensor,
-        num_audios: int,
     ) -> torch.Tensor:
         self._batch_count += 1
         batch_id = self._batch_count
@@ -657,7 +640,6 @@ class AudioEncoderAclGraphPool:
                 cu_seqlens,
                 max_seqlen,
                 sequence_lengths,
-                num_audios,
             )
 
         topology = tuple(sequence_lengths.tolist())
