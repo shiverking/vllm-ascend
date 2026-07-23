@@ -21,8 +21,14 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
+from vllm_ascend._310p.audio_encoder_acl_graph import (
+    AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT,
+    get_audio_encoder_prompt_attention_mask,
+)
+
 MIN_PAD_SIZE: int = 64  # min_size to pad weight
 MAX_PAD_SIZE: int = 128  # max_size to pad weight
+
 
 class AscendMMEncoderAttention310(MMEncoderAttention):
     def __init__(
@@ -91,25 +97,7 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
         kv_len = key.size(1)
         is_reshaped = query.dim() == 4
 
-        if sequence_lengths is not None:
-            if (
-                sequence_lengths.device.type == "cpu"
-                and sequence_lengths.dtype == torch.int32
-                and sequence_lengths.is_contiguous()
-            ):
-                seq_lens_cpu = sequence_lengths
-            else:
-                seq_lens_cpu = sequence_lengths.to(device="cpu", dtype=torch.int32).contiguous()
-        else:
-            if cu_seqlens is None:
-                cu_seqlens = torch.arange(
-                    0,
-                    (bsz + 1) * q_len,
-                    step=q_len,
-                    dtype=torch.int32,
-                    device="cpu",
-                )
-            seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
+        prompt_attention_mask = get_audio_encoder_prompt_attention_mask()
 
         # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
         q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
@@ -122,19 +110,128 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
             k = F.pad(k, (0, pad_len), mode="constant", value=0)
             v = F.pad(v, (0, pad_len), mode="constant", value=0)
 
-        context_layer = torch.empty_like(q)
+        if prompt_attention_mask is not None:
+            if bsz != 1 or q_len != kv_len:
+                raise ValueError(
+                    "310P padded audio encoder graph requires self-attention "
+                    "with batch size 1"
+                )
+            if (
+                prompt_attention_mask.dim() != 2
+                or prompt_attention_mask.shape[0]
+                != prompt_attention_mask.shape[1]
+            ):
+                raise ValueError(
+                    "310P padded audio encoder graph requires a square "
+                    "attention mask"
+                )
+            attention_tokens = int(prompt_attention_mask.shape[0])
+            if attention_tokens % AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT != 0:
+                raise ValueError(
+                    "310P padded audio encoder attention mask size must be "
+                    "a multiple of "
+                    f"{AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT}: "
+                    f"actual={attention_tokens}"
+                )
+            if attention_tokens < q_len:
+                raise ValueError(
+                    "310P padded audio encoder attention mask is smaller "
+                    f"than Q/K: mask={attention_tokens}, q_len={q_len}"
+                )
+            sequence_padding = attention_tokens - q_len
+            if sequence_padding:
+                q = F.pad(q, (0, 0, 0, 0, 0, sequence_padding))
+                k = F.pad(k, (0, 0, 0, 0, 0, sequence_padding))
+                v = F.pad(v, (0, 0, 0, 0, 0, sequence_padding))
+            padded_head_size = q.shape[-1]
+            q_bnsd = (
+                q.view(
+                    bsz,
+                    attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            k_bnsd = (
+                k.view(
+                    bsz,
+                    attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            v_bnsd = (
+                v.view(
+                    bsz,
+                    attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )
+                .transpose(1, 2)
+                .contiguous()
+            )
+            context_layer = torch_npu.npu_prompt_flash_attention(
+                q_bnsd,
+                k_bnsd,
+                v_bnsd,
+                atten_mask=prompt_attention_mask,
+                num_heads=self.num_heads,
+                num_key_value_heads=self.num_heads,
+                scale_value=self.scale_value,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
+                input_layout="BNSD",
+                sparse_mode=0,
+            )
+            context_layer = (
+                context_layer.transpose(1, 2)
+                .contiguous()
+                .view(
+                    bsz * attention_tokens,
+                    self.num_heads,
+                    padded_head_size,
+                )[: bsz * q_len]
+            )
+        else:
+            if sequence_lengths is not None:
+                if (
+                    sequence_lengths.device.type == "cpu"
+                    and sequence_lengths.dtype == torch.int32
+                    and sequence_lengths.is_contiguous()
+                ):
+                    seq_lens_cpu = sequence_lengths
+                else:
+                    seq_lens_cpu = sequence_lengths.to(
+                        device="cpu", dtype=torch.int32
+                    ).contiguous()
+            else:
+                if cu_seqlens is None:
+                    cu_seqlens = torch.arange(
+                        0,
+                        (bsz + 1) * q_len,
+                        step=q_len,
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
 
-        # operator requires pta version >= 2.5.1
-        torch_npu._npu_flash_attention_unpad(
-            query=q,
-            key=k,
-            value=v,
-            seq_len=seq_lens_cpu,
-            scale_value=self.scale_value,
-            num_heads=self.num_heads,
-            num_kv_heads=self.num_kv_heads,
-            out=context_layer,
-        )
+            context_layer = torch.empty_like(q)
+
+            # operator requires pta version >= 2.5.1
+            torch_npu._npu_flash_attention_unpad(
+                query=q,
+                key=k,
+                value=v,
+                seq_len=seq_lens_cpu,
+                scale_value=self.scale_value,
+                num_heads=self.num_heads,
+                num_kv_heads=self.num_kv_heads,
+                out=context_layer,
+            )
 
         if self.enable_pad:
             context_layer = context_layer[..., :origin_shape]

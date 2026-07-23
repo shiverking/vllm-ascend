@@ -23,7 +23,7 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
-MAX_AUDIO_ENCODER_ACLGRAPH_SIZES = 5
+MAX_AUDIO_ENCODER_ACLGRAPHS_310P = 7
 
 
 def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
@@ -44,12 +44,13 @@ def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
             "additional_config.audio_encoder_aclgraph_sizes must contain "
             "only positive integers"
         )
-    sizes = tuple(sorted(set(value), reverse=True))
-    if len(sizes) > MAX_AUDIO_ENCODER_ACLGRAPH_SIZES:
+    sizes = tuple(sorted(set(value)))
+    if len(sizes) > MAX_AUDIO_ENCODER_ACLGRAPHS_310P:
         raise ValueError(
             "additional_config.audio_encoder_aclgraph_sizes supports at most "
-            f"{MAX_AUDIO_ENCODER_ACLGRAPH_SIZES} sizes on Ascend 310P because "
-            "each captured graph retains hardware event resources"
+            f"{MAX_AUDIO_ENCODER_ACLGRAPHS_310P} graph sizes on Ascend 310P; "
+            "capturing more full audio encoder graphs can exhaust CANN event "
+            f"resources. Got {len(sizes)} unique sizes: {list(sizes)}"
         )
     return sizes
 
