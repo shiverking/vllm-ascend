@@ -48,7 +48,7 @@ def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
     if len(sizes) > MAX_AUDIO_ENCODER_ACLGRAPHS_310P:
         raise ValueError(
             "additional_config.audio_encoder_aclgraph_sizes supports at most "
-            f"{MAX_AUDIO_ENCODER_ACLGRAPHS_310P} graph sizes on Ascend 310P; "
+            f"{MAX_AUDIO_ENCODER_ACLGRAPHS_310P} graph sizes; "
             "capturing more full audio encoder graphs can exhaust CANN event "
             f"resources. Got {len(sizes)} unique sizes: {list(sizes)}"
         )
