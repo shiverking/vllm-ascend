@@ -213,9 +213,9 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Transpose while the tensor is still ND. Transposing an NZ tensor
-        # leaves its private physical layout inconsistent with the logical
-        # [K, N] shape expected by npu_quant_matmul.
-        layer.weight.data = maybe_trans_nz(layer.weight.data.transpose(0, 1).contiguous())
+        # Keep dynamic-linear weights in ND on 310P. FRACTAL_NZ weights make
+        # npu_quant_matmul select a QuantBatchMatmulV3 NZ-NZ kernel that can
+        # raise an AICore exception for packed projections such as QKV.
+        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()

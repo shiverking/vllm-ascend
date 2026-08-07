@@ -85,17 +85,17 @@ class TestAscendW8A8DynamicLinearLayout310(TestBase):
         mock_npu_format_cast.assert_called_once_with(quantized_x, ACL_FORMAT_FRACTAL_ND)
         self.assertIs(mock_npu_quant_matmul.call_args.args[0], quantized_x_nd)
 
-    @patch("vllm_ascend.utils.is_310p", return_value=True)
     @patch("torch_npu.npu_format_cast")
-    def test_weight_is_transposed_before_nz_conversion(self, mock_npu_format_cast, _mock_is_310p):
-        mock_npu_format_cast.side_effect = lambda x, _fmt: x
+    def test_weight_is_transposed_and_kept_in_nd(self, mock_npu_format_cast):
         layer = MagicMock()
-        layer.weight.data = torch.randint(-127, 128, (128, 256), dtype=torch.int8)
+        loaded_weight = torch.randint(-127, 128, (128, 256), dtype=torch.int8)
+        layer.weight.data = loaded_weight
         layer.weight_scale.data = torch.randn(128, 1, dtype=torch.float32)
         layer.weight_offset.data = torch.randn(128, 1, dtype=torch.float32)
 
         self.method.process_weights_after_loading(layer)
 
-        formatted_weight = mock_npu_format_cast.call_args.args[0]
-        self.assertEqual(formatted_weight.shape, (256, 128))
-        self.assertTrue(formatted_weight.is_contiguous())
+        self.assertEqual(layer.weight.data.shape, (256, 128))
+        self.assertTrue(layer.weight.data.is_contiguous())
+        self.assertTrue(torch.equal(layer.weight.data, loaded_weight.transpose(0, 1)))
+        mock_npu_format_cast.assert_not_called()
