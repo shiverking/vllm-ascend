@@ -28,7 +28,7 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.ops.fused_moe.experts_selector import zero_experts_compute
 from vllm_ascend.ops.fused_moe.moe_runtime_args import build_fused_experts_input
 from vllm_ascend.quantization.methods.base import AscendMoEScheme, QuantType
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, maybe_trans_nz
+from vllm_ascend.utils import maybe_trans_nz
 
 from .registry import register_scheme
 from .w8a8_base import AscendW8A8Linear310pScheme
@@ -191,10 +191,9 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         # NOTE(310P):
         # - There is an accuracy issue currently, which is expected to be fixed in the next version.
         quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
-        if torch_npu.get_npu_format(quantized_x) != ACL_FORMAT_FRACTAL_ND:
-            quantized_x = torch_npu.npu_format_cast(quantized_x, ACL_FORMAT_FRACTAL_ND)
-        need_unsqz = x.dim() == 3 and x.shape[1] == 1
-        if need_unsqz:
+        need_unsqz = False
+        if pertoken_scale.dim() == 2:
+            need_unsqz = True
             quantized_x = quantized_x.squeeze(dim=1)
             pertoken_scale = pertoken_scale.squeeze(dim=1)
 
@@ -213,9 +212,7 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         return output
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        # Keep dynamic-linear weights in ND on 310P. FRACTAL_NZ weights make
-        # npu_quant_matmul select a QuantBatchMatmulV3 NZ-NZ kernel that can
-        # raise an AICore exception for packed projections such as QKV.
-        layer.weight.data = layer.weight.data.transpose(0, 1).contiguous()
+        # cast quantized weight tensors in NZ format for higher inference speed
+        layer.weight.data = maybe_trans_nz(layer.weight.data).transpose(0, 1)
         layer.weight_scale.data = layer.weight_scale.data.flatten()
         layer.weight_offset.data = layer.weight_offset.data.flatten()
