@@ -191,9 +191,8 @@ class AscendW8A8DynamicLinearMethod310(AscendW8A8Linear310pScheme):
         # NOTE(310P):
         # - There is an accuracy issue currently, which is expected to be fixed in the next version.
         quantized_x, pertoken_scale = torch_npu.npu_dynamic_quant(x)
-        need_unsqz = False
-        if pertoken_scale.dim() == 2:
-            need_unsqz = True
+        need_unsqz = x.dim() == 3 and x.shape[1] == 1
+        if need_unsqz:
             quantized_x = quantized_x.squeeze(dim=1)
             pertoken_scale = pertoken_scale.squeeze(dim=1)
 
