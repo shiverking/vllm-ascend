@@ -3,7 +3,30 @@ from unittest import mock
 import pytest
 import torch
 
-from vllm_ascend.device.device_op import A5DeviceAdaptor, BaseDeviceAdaptor
+from vllm_ascend.device.device_op import (
+    A5DeviceAdaptor,
+    Ascend310PDeviceAdaptor,
+    BaseDeviceAdaptor,
+)
+
+
+@pytest.mark.parametrize(
+    ("dim", "indices"),
+    [
+        (0, torch.tensor([0, -1])),
+        (1, torch.tensor([1, 3])),
+        (0, torch.tensor([], dtype=torch.long)),
+    ],
+)
+def test_310p_index_fill_matches_torch(dim, indices):
+    actual = torch.arange(12).reshape(3, 4)
+    expected = actual.clone()
+    expected.index_fill_(dim, indices, -1)
+
+    result = Ascend310PDeviceAdaptor.index_fill(actual, dim, indices, -1)
+
+    assert result is actual
+    torch.testing.assert_close(actual, expected)
 
 
 def test_npu_flash_attention_uses_fusion_attention_for_fp32():

@@ -40,6 +40,16 @@ else:
 
 
 class BaseDeviceAdaptor:
+    @staticmethod
+    def index_fill(
+        tensor: torch.Tensor,
+        dim: int,
+        indices: torch.Tensor,
+        value: int,
+    ) -> torch.Tensor:
+        tensor.index_fill_(dim, indices, value)
+        return tensor
+
     @classmethod
     def reshape_and_cache(cls, key, value, key_cache, value_cache, slot_mapping):
         torch_npu._npu_reshape_and_cache(
@@ -1674,10 +1684,38 @@ class A5DeviceAdaptor(BaseDeviceAdaptor):
         return results
 
 
+class Ascend310PDeviceAdaptor(BaseDeviceAdaptor):
+    @staticmethod
+    def index_fill(
+        tensor: torch.Tensor,
+        dim: int,
+        indices: torch.Tensor,
+        value: int,
+    ) -> torch.Tensor:
+        if indices.numel() == 0:
+            return tensor
+        dim_size = tensor.size(dim)
+        normalized_indices = torch.where(indices < 0, indices + dim_size, indices)
+        positions = torch.arange(
+            dim_size,
+            device=tensor.device,
+            dtype=normalized_indices.dtype,
+        )
+        mask = torch.eq(
+            positions.unsqueeze(1), normalized_indices.unsqueeze(0)
+        ).any(dim=1)
+        selection = [slice(None)] * tensor.dim()
+        selection[dim] = mask
+        tensor[tuple(selection)] = value
+        return tensor
+
+
 def get_device_adaptor() -> type["BaseDeviceAdaptor"]:
     ascend_device_type = get_ascend_device_type()
     if ascend_device_type == AscendDeviceType.A5:
         return A5DeviceAdaptor
+    if ascend_device_type == AscendDeviceType._310P:
+        return Ascend310PDeviceAdaptor
     return BaseDeviceAdaptor
 
 

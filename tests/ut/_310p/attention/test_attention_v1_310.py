@@ -42,6 +42,26 @@ class TestAscendAttentionBackend310(TestBase):
         result = AscendAttentionBackend310.get_kv_cache_shape(10, 20, 30, 40)
         self.assertEqual(result, (2, 10, 75, 20, 16))
 
+    def test_drafting_query_lens_uses_independent_buffer(self):
+        builder = object.__new__(AscendAttentionMetadataBuilder310)
+        builder._query_lens_cpu_buffer = torch.empty(2, dtype=torch.int32)
+
+        first_step = builder._fill_query_lens_cpu(
+            2,
+            torch.tensor([0, 2, 5], dtype=torch.int32),
+            is_drafting=True,
+        )
+        builder._fill_query_lens_cpu(
+            2,
+            torch.tensor([0, 1, 2], dtype=torch.int32),
+            is_drafting=True,
+        )
+
+        torch.testing.assert_close(
+            first_step,
+            torch.tensor([2, 3], dtype=torch.int32),
+        )
+
 
 class TestAscendAttentionBackendImpl310(TestBase):
     def setUp(self):

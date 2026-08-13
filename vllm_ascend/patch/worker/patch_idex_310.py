@@ -20,9 +20,12 @@ vllm.model_executor.layers.fla.ops.index.prepare_chunk_offsets = prepare_chunk_o
 # 310P GDN causal conv1d uses buffer_replay; keep shared gdn.py unchanged.
 gdn_ops.update_conv1d_graph_params = update_conv1d_graph_params_310p
 
-# 310P: skip NPU index_fill_ when there are no discarded requests.
-AscendSpecDecodeBaseProposer.prepare_next_token_ids_padded = (  # type: ignore[method-assign]
-    AscendSpecDecodeBaseProposer310.prepare_next_token_ids_padded
+# 310P: protect the persistent drafter input buffer during token shifting.
+AscendSpecDecodeBaseProposer.set_inputs_first_pass = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310.set_inputs_first_pass
+)
+AscendSpecDecodeBaseProposer._run_merged_draft = (  # type: ignore[method-assign]
+    AscendSpecDecodeBaseProposer310._run_merged_draft
 )
 
 # Patch _warmup_prefill_kernels to no-op on 310P: triton.next_power_of_2 does

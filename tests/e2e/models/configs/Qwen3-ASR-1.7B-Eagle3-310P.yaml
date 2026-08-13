@@ -1,0 +1,32 @@
+model_name: "/home/models/Qwen3-ASR-1.7B"
+model_type: "vllm-asr"
+hardware: "Ascend 310P"
+
+serve:
+  tensor_parallel_size: 1
+  dtype: float16
+  max_model_len: 4096
+  max_num_seqs: 16
+  gpu_memory_utilization: 0.9
+  trust_remote_code: false
+  speculative_config:
+    method: eagle3
+    model: "/home/y00899301/vllm_draft_ep5"
+    num_speculative_tokens: 3
+    draft_tensor_parallel_size: 1
+  compilation_config:
+    cudagraph_mode: FULL_DECODE_ONLY
+    cudagraph_capture_sizes: [1, 4, 8]
+
+tasks:
+  - name: "librispeech_test_clean_eagle3"
+    dataset: "openslr/librispeech_asr"
+    split: "test"
+    dataset_config: "clean"
+    metrics:
+      # Provisional gate; replace with the measured 310P real-weight result.
+      - name: "wer"
+        value: 0.04
+
+num_fewshot: 0
+limit: 100

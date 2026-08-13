@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import string
 from dataclasses import dataclass
@@ -61,10 +62,13 @@ def build_serve_args(eval_config: dict) -> list[str]:
         "tensor_parallel_size": "--tensor-parallel-size",
         "dtype": "--dtype",
         "max_model_len": "--max-model-len",
+        "max_num_seqs": "--max-num-seqs",
         "gpu_memory_utilization": "--gpu-memory-utilization",
         "trust_remote_code": "--trust-remote-code",
         "enforce_eager": "--enforce-eager",
         "quantization": "--quantization",
+        "speculative_config": "--speculative-config",
+        "compilation_config": "--compilation-config",
     }
     args: list[str] = []
     for key, flag in flag_map.items():
@@ -74,9 +78,32 @@ def build_serve_args(eval_config: dict) -> list[str]:
         if isinstance(value, bool):
             if value:
                 args.append(flag)
+        elif isinstance(value, (dict, list)):
+            args.extend([flag, json.dumps(value, separators=(",", ":"))])
         else:
             args.extend([flag, str(value)])
     return args
+
+
+def test_build_serve_args_serializes_speculative_configs() -> None:
+    args = build_serve_args(
+        {
+            "serve": {
+                "max_num_seqs": 8,
+                "speculative_config": {"method": "eagle3", "num_speculative_tokens": 3},
+                "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+            }
+        }
+    )
+
+    assert args == [
+        "--max-num-seqs",
+        "8",
+        "--speculative-config",
+        '{"method":"eagle3","num_speculative_tokens":3}',
+        "--compilation-config",
+        '{"cudagraph_mode":"FULL_DECODE_ONLY"}',
+    ]
 
 
 def audio_to_wav_bytes(audio_array: np.ndarray, sample_rate: int) -> bytes:

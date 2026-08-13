@@ -22,6 +22,8 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 def _prepare_inputs_source() -> str:
@@ -51,6 +53,28 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    def test_eagle3_uniform_batch_uses_spec_decode_state(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.speculative_config = SimpleNamespace(method="eagle3")
+        runner.uniform_decode_query_len = 4
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=torch.tensor([8, 12]).numpy()
+        )
+
+        with patch.object(
+            NPUModelRunner,
+            "_build_attn_state",
+            return_value=AscendAttentionState.ChunkedPrefill,
+        ):
+            result = runner._build_attn_state(
+                2,
+                torch.tensor([4, 4]).numpy(),
+                torch.tensor([1, 1]).numpy(),
+            )
+
+        self.assertEqual(result, AscendAttentionState.SpecDecoding)
+        self.assertEqual(runner.attn_state, AscendAttentionState.SpecDecoding)
+
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8

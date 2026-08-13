@@ -18,6 +18,21 @@ It is recommended to download the model weight to the shared directory of multip
 
 `Qwen3-ASR-1.7B` is supported in `vllm-ascend`.
 
+### Supported Features
+
+| Feature | Ascend 310P status |
+|---------|--------------------|
+| FP16, single NPU | Supported |
+| Audio input | Supported |
+| EAGLE3 speculative decoding | Experimental |
+| FULL_DECODE_ONLY ACLGraph | Experimental |
+| Expert parallel / FlashComm1 | Not applicable (dense, single NPU) |
+
+The 310P EAGLE3 path described below uses `/home/models/Qwen3-ASR-1.7B`
+as the target and `/home/y00899301/vllm_draft_ep5` as the draft model. The
+draft checkpoint must contain the `d2t` tensor in `model.safetensors`; the
+standalone `draft_to_target.pt` file is not read by vLLM.
+
 You can use our official docker image to run `Qwen3-ASR-1.7B` directly.
 
 ```{code-block} bash
@@ -47,6 +62,8 @@ In addition, if you don't want to use the docker image as above, you can also bu
 
 ## Deployment
 
+### Baseline
+
 ``` bash
 
 vllm serve "Qwen/Qwen3-ASR-1.7B" \
@@ -55,6 +72,39 @@ vllm serve "Qwen/Qwen3-ASR-1.7B" \
   --gpu-memory-utilization 0.9 \
   --enforce-eager \
   --port 8000
+```
+
+### EAGLE3 on Ascend 310P
+
+Run the server from `/workspace` so the installed editable vLLM and
+vLLM Ascend packages are used. The practical 310P baseline is 4096 tokens;
+the draft checkpoint is limited to 65536 tokens, so a 128K test is not
+applicable.
+
+```bash
+cd /workspace
+vllm serve /home/models/Qwen3-ASR-1.7B \
+  --served-model-name qwen3-asr-eagle3 \
+  --dtype float16 \
+  --tensor-parallel-size 1 \
+  --max-model-len 4096 \
+  --max-num-seqs 16 \
+  --gpu-memory-utilization 0.9 \
+  --speculative-config '{"method":"eagle3","model":"/home/y00899301/vllm_draft_ep5","num_speculative_tokens":3,"draft_tensor_parallel_size":1}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,4,8]}' \
+  --port 8000
+```
+
+To isolate graph failures, add `--enforce-eager` and add
+`"enforce_eager":true` to `--speculative-config`. For a fast architecture
+check, also add `--load-format dummy`; dummy weights do not validate `d2t`,
+real weight loading, transcription quality, or EAGLE3 acceptance rate.
+
+The existing 310P audio encoder graph can be enabled together with the
+decoder graph by adding an observed set of audio sequence buckets, for example:
+
+```bash
+--additional-config '{"audio_encoder_aclgraph_sizes":[256,512,1024]}'
 ```
 
 ## Functional Verification
@@ -75,7 +125,26 @@ curl http://localhost:8000/v1/chat/completions
 }'
 ```
 
+For EAGLE3, set `"model":"qwen3-asr-eagle3"` and
+`"temperature":0` in the request. Verify all of the following:
+
+1. `GET /v1/models` returns HTTP 200.
+2. The first audio request returns a non-empty transcription and the server
+   remains alive.
+3. Greedy token IDs and transcription match the same FP16 server without
+   speculative decoding.
+4. Metrics report accepted draft tokens and logs show ACLGraph replay in graph
+   mode.
+
+Run batches of 1, 4, and 8 requests with mixed audio lengths to cover request
+replacement, draft query-length buffers, and KV slot mapping.
+
 ## Accuracy Evaluation
+
+For 310P EAGLE3, first compare 100 LibriSpeech test-clean samples against a
+no-speculation FP16 baseline, then run the existing 500-sample evaluation.
+Greedy outputs must match the baseline exactly. Record the measured 310P WER
+and acceptance rate separately; the A2 result below is not a 310P result.
 
 After all samples were processed, transcription quality was measured using:
 
