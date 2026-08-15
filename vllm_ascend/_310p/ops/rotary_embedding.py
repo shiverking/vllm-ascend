@@ -199,7 +199,9 @@ def _get_drafting_cos_and_sin(
     num_tokens = positions.shape[0]
     cos_sin = cos_sin_cache.index_select(0, positions)
     cos, sin = cos_sin.view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=1)
-    return cos.unsqueeze(0), sin.unsqueeze(0)
+    # ApplyRotaryPosEmb on 310P does not auto-convert strided views. ``chunk``
+    # above returns views, so materialize both inputs before calling the op.
+    return cos.unsqueeze(0).contiguous(), sin.unsqueeze(0).contiguous()
 
 
 class AscendMRotaryEmbedding310(MRotaryEmbedding):

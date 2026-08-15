@@ -89,3 +89,5 @@ def test_drafting_cos_sin_does_not_require_target_global_buffers():
     torch.testing.assert_close(sin, expected_sin)
     assert cos.shape == (1, 3, 1, 4)
     assert sin.shape == (1, 3, 1, 4)
+    assert cos.is_contiguous()
+    assert sin.is_contiguous()
