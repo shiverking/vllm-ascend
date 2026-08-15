@@ -16,7 +16,8 @@ serve:
     draft_tensor_parallel_size: 1
   compilation_config:
     cudagraph_mode: FULL_DECODE_ONLY
-    cudagraph_capture_sizes: [1, 4, 8]
+    # K=3: graph token count = request batch size * (K + 1).
+    cudagraph_capture_sizes: [4, 16, 32]
 
 tasks:
   - name: "librispeech_test_clean_eagle3"

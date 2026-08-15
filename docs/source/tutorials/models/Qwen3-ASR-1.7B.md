@@ -91,9 +91,14 @@ vllm serve /home/models/Qwen3-ASR-1.7B \
   --max-num-seqs 16 \
   --gpu-memory-utilization 0.9 \
   --speculative-config '{"method":"eagle3","model":"/home/y00899301/vllm_draft_ep5","num_speculative_tokens":3,"draft_tensor_parallel_size":1}' \
-  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[1,4,8]}' \
+  --compilation-config '{"cudagraph_mode":"FULL_DECODE_ONLY","cudagraph_capture_sizes":[4,16,32]}' \
   --port 8000
 ```
+
+With `num_speculative_tokens=K`, each verifier decode graph contains
+`batch_size * (K + 1)` tokens. The capture sizes above therefore cover request
+batches 1, 4, and 8 when `K=3`; they are token counts rather than request batch
+sizes.
 
 To isolate graph failures, add `--enforce-eager` and add
 `"enforce_eager":true` to `--speculative-config`. For a fast architecture
