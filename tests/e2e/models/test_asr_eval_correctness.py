@@ -141,6 +141,7 @@ def transcribe_batch(client, model_name: str, audio_items: list[dict], language:
             model=model_name,
             file=("audio.wav", wav_bytes, "audio/wav"),
             language=language,
+            extra_body={"max_completion_tokens": 256},
         )
         hypotheses.append(response.text)
     return hypotheses

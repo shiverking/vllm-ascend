@@ -109,24 +109,22 @@ decoder graph by adding an observed set of audio sequence buckets, for example:
 
 ## Functional Verification
 
-Once your server is started, you can query the model with input prompts:
+Once the server is started, use the transcription endpoint so vLLM builds the
+Qwen3-ASR generation prompt. Do not use a bare audio-only chat request as an
+ASR correctness check.
 
 ```shell
-curl http://localhost:8000/v1/chat/completions
-    -H "Content-Type: application/json"
-    -d '{
-    "messages": [
-    {"role": "user", "content": [
-        {"type": "audio_url",
-        "audio_url":
-        {"url": "https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav"}}
-    ]}
-    ]
-}'
+curl -sS http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F "file=@/path/to/asr_en.wav" \
+  -F "model=qwen3-asr-eagle3" \
+  -F "language=en" \
+  -F "temperature=0" \
+  -F "max_completion_tokens=256"
 ```
 
-For EAGLE3, set `"model":"qwen3-asr-eagle3"` and
-`"temperature":0` in the request. Verify all of the following:
+For the baseline server, replace `qwen3-asr-eagle3` with the model ID returned
+by `/v1/models`. Keep the endpoint, audio, language, temperature, and completion
+limit identical when comparing baseline and EAGLE3. Verify all of the following:
 
 1. `GET /v1/models` returns HTTP 200.
 2. The first audio request returns a non-empty transcription and the server
