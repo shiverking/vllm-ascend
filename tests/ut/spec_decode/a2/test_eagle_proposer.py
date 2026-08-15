@@ -468,10 +468,14 @@ class TestEagleProposerLoadModel(TestBase):
     @patch("vllm_ascend.spec_decode.llm_base_proposer.supports_multimodal")
     def test_load_model_multimodal(self, mock_supports_multi, mock_pp_group, mock_get_model, mock_get_layers):
         mock_model = MagicMock()
+        mock_model.config = MagicMock(spec=[])
         mock_model.get_language_model.return_value.lm_head = MagicMock()
         mock_supports_multi.return_value = True
         original_embed = MagicMock()
-        mock_get_model.return_value = MagicMock(model=MagicMock(embed_tokens=original_embed))
+        mock_get_model.return_value = MagicMock(
+            config=MagicMock(spec=[]),
+            model=MagicMock(embed_tokens=original_embed),
+        )
 
         mock_target_layer1 = MagicMock()
         mock_draft_layer2 = MagicMock()
@@ -485,6 +489,7 @@ class TestEagleProposerLoadModel(TestBase):
             self.proposer.load_model(mock_model)
             self.assertEqual(mock_model.get_language_model.call_count, 2)
             self.assertIs(self.proposer.model.lm_head, mock_model.get_language_model.return_value.lm_head)
+            self.assertFalse(hasattr(self.proposer.model.config, "image_token_index"))
 
 
 class TestEagleProposerDummyRun(TestBase):
