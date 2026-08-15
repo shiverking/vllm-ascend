@@ -18,6 +18,7 @@ import torch
 from vllm_ascend._310p.ops import rotary_embedding as rotary_310
 from vllm_ascend._310p.ops.rotary_embedding import (
     AscendMRotaryEmbedding310,
+    _get_drafting_cos_and_sin,
     set_mrope_apply_rotary_slices,
 )
 
@@ -73,3 +74,18 @@ def test_set_mrope_apply_rotary_slices_reuses_buffer_address():
     second_ptr = rotary_310._mrope_cos_slice.data_ptr()
 
     assert first_ptr == second_ptr
+
+
+def test_drafting_cos_sin_does_not_require_target_global_buffers():
+    cache = torch.arange(8 * 4, dtype=torch.float32).view(8, 4)
+    positions = torch.tensor([1, 3, 6], dtype=torch.int64)
+
+    cos, sin = _get_drafting_cos_and_sin(cache, positions)
+
+    selected = cache.index_select(0, positions).view(3, 2, 2)
+    expected_cos = selected[:, :1].repeat(1, 1, 2).unsqueeze(0)
+    expected_sin = selected[:, 1:].repeat(1, 1, 2).unsqueeze(0)
+    torch.testing.assert_close(cos, expected_cos)
+    torch.testing.assert_close(sin, expected_sin)
+    assert cos.shape == (1, 3, 1, 4)
+    assert sin.shape == (1, 3, 1, 4)

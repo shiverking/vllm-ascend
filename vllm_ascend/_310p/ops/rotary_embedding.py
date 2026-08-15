@@ -28,7 +28,6 @@ from vllm.model_executor.layers.rotary_embedding.mrope import apply_interleaved_
 from vllm_ascend.ops.rotary_embedding import (
     AscendRotaryEmbedding,
     get_cos_and_sin_slice,
-    update_cos_sin,
 )
 
 # Filled once per model forward in NPUModelRunner310._model_forward; read by every MRoPE layer.
@@ -136,8 +135,9 @@ def _rope_forward_oot(
     if self.cos_sin_cache.dtype != query.dtype:
         self.cos_sin_cache = self.cos_sin_cache.to(query.dtype)
     if getattr(self, "_is_drafting_update_enabled", False):
-        update_cos_sin(positions)
-    cos, sin = get_cos_and_sin_slice()
+        cos, sin = _get_drafting_cos_and_sin(self.cos_sin_cache, positions)
+    else:
+        cos, sin = get_cos_and_sin_slice()
     if offsets is not None:
         raise NotImplementedError("Batched rotary embedding is currently not supported on NPU.")
     rotary_mode = "half" if is_neox_style else "interleave"
@@ -184,6 +184,22 @@ def _rope_forward_oot(
             is_neox_style,
         )
     return query.view(query_shape), key.view(key_shape)
+
+
+def _get_drafting_cos_and_sin(
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Build 1-D RoPE inputs without relying on the target model buffers.
+
+    Multimodal targets do not allocate the global 1-D RoPE buffers. An EAGLE
+    draft model still uses regular 1-D RoPE, so derive its inputs from the
+    draft embedding's own cache.
+    """
+    num_tokens = positions.shape[0]
+    cos_sin = cos_sin_cache.index_select(0, positions)
+    cos, sin = cos_sin.view(num_tokens, 2, -1).repeat(1, 1, 2).chunk(2, dim=1)
+    return cos.unsqueeze(0), sin.unsqueeze(0)
 
 
 class AscendMRotaryEmbedding310(MRotaryEmbedding):
