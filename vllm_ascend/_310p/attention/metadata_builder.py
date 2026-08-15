@@ -81,6 +81,7 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
         self.attn_mask_builder: Any = AttentionMaskBuilder310(self.device, max_model_len)
 
         self._query_lens_cpu_buffer: torch.Tensor | None = None
+        self._splitfuse_mask_buffers: dict[tuple[int, ...], torch.Tensor] = {}
         if device.type != "cpu":
             max_num_seqs = vllm_config.scheduler_config.max_num_seqs
             self._query_lens_cpu_buffer = torch.empty(max_num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
@@ -104,6 +105,27 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
             query_start_loc_cpu[:num_reqs],
             out=buffer,
         )
+        return buffer
+
+    def _get_persistent_splitfuse_mask(
+        self,
+        attn_metadata: AscendMetadata,
+        query_start_loc_cpu: torch.Tensor | None = None,
+        seq_lens_cpu: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Build splitfuse masks outside ACLGraph and keep their addresses stable."""
+        mask = AttentionMaskBuilder310.get_splitfuse_mask(
+            attn_metadata,
+            self.device,
+            query_start_loc_cpu=query_start_loc_cpu,
+            seq_lens_cpu=seq_lens_cpu,
+        )
+        key = tuple(mask.shape)
+        buffer = self._splitfuse_mask_buffers.get(key)
+        if buffer is None:
+            self._splitfuse_mask_buffers[key] = mask
+            return mask
+        buffer.copy_(mask)
         return buffer
 
     def build(
@@ -137,6 +159,17 @@ class AscendAttentionMetadataBuilder310(AscendAttentionMetadataBuilder):
 
         if is_compressed_mask_supported():
             attn_metadata.attn_mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(self.device)
+        else:
+            # Build from host metadata before torch.npu.graph and update an
+            # address-stable replay buffer.
+            seq_lens_cpu = common_attn_metadata._seq_lens_cpu
+            if seq_lens_cpu is None:
+                seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+            attn_metadata.attn_mask = self._get_persistent_splitfuse_mask(
+                attn_metadata,
+                query_start_loc_cpu=query_start_loc_cpu,
+                seq_lens_cpu=None if seq_lens_cpu is None else seq_lens_cpu[:num_reqs],
+            )
 
         return attn_metadata
 

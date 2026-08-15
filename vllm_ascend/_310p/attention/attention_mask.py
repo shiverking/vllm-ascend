@@ -70,7 +70,13 @@ class AttentionMaskBuilder310:
         return mask
 
     @classmethod
-    def get_splitfuse_mask(cls, attn_metadata: AscendMetadata, device: torch.device):
+    def get_splitfuse_mask(
+        cls,
+        attn_metadata: AscendMetadata,
+        device: torch.device,
+        query_start_loc_cpu: torch.Tensor | None = None,
+        seq_lens_cpu: torch.Tensor | None = None,
+    ):
         """
         Generates and formats the attention mask for SplitFuse (chunked prefill) decoding.
 
@@ -87,10 +93,18 @@ class AttentionMaskBuilder310:
         """
         if cls.chunked_prefill_attn_mask is None:
             cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(cls.max_seqlen, device)
-        qsl = attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
+        qsl = (
+            query_start_loc_cpu.to(dtype=torch.int32)
+            if query_start_loc_cpu is not None
+            else attn_metadata.query_start_loc.to("cpu", dtype=torch.int32)
+        )
         qlens = qsl[1:] - qsl[:-1]
         q_list = qlens.tolist()
-        context_lens = attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
+        context_lens = (
+            seq_lens_cpu.to(dtype=torch.int32)
+            if seq_lens_cpu is not None
+            else attn_metadata.seq_lens.to("cpu", dtype=torch.int32)
+        )
         c_list = context_lens.tolist()
         pos_list = [p for ql, cl in zip(q_list, c_list) for p in range(cl - ql, cl)]
         position = torch.tensor(pos_list, dtype=torch.int32, device=device)

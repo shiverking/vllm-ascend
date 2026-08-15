@@ -53,6 +53,16 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    def test_spec_dummy_capture_always_rebuilds_attention_metadata(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner._spec_dummy_capture = True
+
+        self.assertTrue(
+            runner._should_build_dummy_attn_metadata(
+                cudagraph_runtime_mode=None,
+            )
+        )
+
     def test_eagle3_uniform_batch_uses_spec_decode_state(self):
         runner = object.__new__(NPUModelRunner310)
         runner.speculative_config = SimpleNamespace(method="eagle3")

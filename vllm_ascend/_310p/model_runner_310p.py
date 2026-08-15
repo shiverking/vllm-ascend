@@ -223,6 +223,20 @@ class NPUModelRunner310(NPUModelRunner):
             self.attn_state = AscendAttentionState.SpecDecoding
         return super()._build_attention_metadata(*args, **kwargs)
 
+    def _should_build_dummy_attn_metadata(
+        self,
+        force_attention: bool = False,
+        is_profile: bool = False,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+    ) -> bool:
+        # FULL_DECODE_ONLY performs a NONE-mode warmup before capture. Speculative
+        # warmups still need fresh splitfuse metadata and graph-stable mask buffers.
+        return self._spec_dummy_capture or super()._should_build_dummy_attn_metadata(
+            force_attention=force_attention,
+            is_profile=is_profile,
+            cudagraph_runtime_mode=cudagraph_runtime_mode,
+        )
+
     def _pad_query_start_loc_for_fia(
         self,
         num_tokens_padded: int,

@@ -62,6 +62,25 @@ class TestAscendAttentionBackend310(TestBase):
             torch.tensor([2, 3], dtype=torch.int32),
         )
 
+    @patch(
+        "vllm_ascend._310p.attention.metadata_builder.AttentionMaskBuilder310.get_splitfuse_mask"
+    )
+    def test_splitfuse_mask_uses_persistent_buffer(self, mock_get_mask):
+        builder = object.__new__(AscendAttentionMetadataBuilder310)
+        builder.device = torch.device("cpu")
+        builder._splitfuse_mask_buffers = {}
+        metadata = MagicMock()
+
+        mock_get_mask.return_value = torch.ones((1, 2, 3))
+        first = builder._get_persistent_splitfuse_mask(metadata)
+        first_data_ptr = first.data_ptr()
+
+        mock_get_mask.return_value = torch.full((1, 2, 3), 2.0)
+        second = builder._get_persistent_splitfuse_mask(metadata)
+
+        self.assertEqual(second.data_ptr(), first_data_ptr)
+        torch.testing.assert_close(second, torch.full((1, 2, 3), 2.0))
+
 
 class TestAscendAttentionBackendImpl310(TestBase):
     def setUp(self):
@@ -133,6 +152,7 @@ class TestAscendAttentionBackendImpl310(TestBase):
         self.assertIs(result, output)
 
     @patch("torch_npu.npu_format_cast", return_value=torch.randn((1, 128, 16, 16), dtype=torch.float16))
+    @patch("vllm_ascend._310p.attention.attention_v1.AttentionMaskBuilder310.get_splitfuse_mask")
     @patch("torch_npu._npu_reshape_and_cache")
     @patch("torch_npu._npu_paged_attention_splitfuse")
     @patch("vllm_ascend.ascend_forward_context.get_forward_context")
@@ -141,6 +161,7 @@ class TestAscendAttentionBackendImpl310(TestBase):
         mock_get_forward_context,
         mock_npu_paged_attention_splitfuse,
         mock_npu_reshape_and_cache,
+        mock_get_splitfuse_mask,
         mock_format_cast,
     ):
         """Test forward pass in ChunkedPrefill state"""
@@ -167,6 +188,7 @@ class TestAscendAttentionBackendImpl310(TestBase):
         output = self.impl.forward_impl(query, key, value, None, metadata, output)
 
         mock_npu_paged_attention_splitfuse.assert_called_once()
+        mock_get_splitfuse_mask.assert_not_called()
 
     @patch("torch_npu.npu_format_cast", return_value=torch.randn((1, 128, 16, 16), dtype=torch.float16))
     @patch("torch_npu._npu_reshape_and_cache")

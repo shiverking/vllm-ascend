@@ -289,8 +289,18 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             )
             return output
 
-        # Generate the specific mask for splitfuse
-        mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
+        # The 310P metadata builder materializes this mask before graph capture.
+        # Keep an eager fallback for callers which construct metadata directly.
+        mask = attn_metadata.attn_mask
+        if mask is None:
+            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
+            if _EXTRA_CTX.capturing:
+                raise RuntimeError(
+                    "310P splitfuse requires a prebuilt attention mask during graph capture; "
+                    "ensure AscendAttentionMetadataBuilder310.build() ran before forward."
+                )
+            mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
             key_cache=self.key_cache,
