@@ -441,10 +441,23 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                         " is not trained."
                     )
 
-        if self.method == "mtp" and self.vllm_config.model_config.is_deepseek_mla:
-            for _, layer_module in self.model.model.layers.items():
-                if torch.equal(layer_module.shared_head.head.weight, model.lm_head.weight):
-                    layer_module.shared_head.head = model.lm_head
+        if self.method == "mtp" and hasattr(model, "lm_head"):
+            # MTP uses the target vocabulary projection. Sharing is required
+            # for Qwen3-ASR because the exported MTP shard intentionally does
+            # not duplicate the large LM head.
+            self.model.lm_head = model.lm_head
+            layers = getattr(getattr(self.model, "model", None), "layers", None)
+            if layers is not None:
+                layer_values = (
+                    layers.values() if isinstance(layers, nn.ModuleDict) else layers
+                )
+                for layer_module in layer_values:
+                    shared_head = getattr(layer_module, "shared_head", None)
+                    if shared_head is not None and hasattr(shared_head, "head"):
+                        shared_head.head = model.lm_head
+            logger.info(
+                "[spec_decode/base] MTP is sharing the target model LM head."
+            )
 
         if self.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs() and self.use_cuda_graph:
             logger.info(
@@ -1018,6 +1031,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 model_kwargs["hidden_states"] = model_hidden_states
                 if self.method == "mtp":
                     model_kwargs["positions"] = model_positions
+            if self._uses_serial_mtp_layers():
+                model_kwargs["spec_step_idx"] = 0
 
         ret_hidden_states = self.model(**model_kwargs)
         if not self.model_returns_tuple():
@@ -1193,6 +1208,8 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             }
             if self.pass_hidden_states_to_model:
                 model_kwargs["hidden_states"] = model_hidden_states
+            if self._uses_serial_mtp_layers():
+                model_kwargs["spec_step_idx"] = draft_index + 1
 
             ret_hidden_states = self.model(**model_kwargs)
             if not self.model_returns_tuple():

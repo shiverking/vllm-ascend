@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import string
 from dataclasses import dataclass
@@ -76,6 +77,9 @@ def build_serve_args(eval_config: dict) -> list[str]:
                 args.append(flag)
         else:
             args.extend([flag, str(value)])
+    speculative_config = serve_cfg.get("speculative_config")
+    if speculative_config is not None:
+        args.extend(["--speculative-config", json.dumps(speculative_config)])
     return args
 
 
