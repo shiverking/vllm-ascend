@@ -220,9 +220,9 @@ class NPUModelRunner310(NPUModelRunner):
         )
 
     def _build_attention_metadata(self, *args: Any, **kwargs: Any):
-        # SpecDecoding capture is only valid for the MLA MTP fast path. Dense
-        # MTP uses chunked-prefill metadata and eager verification.
-        if self._mtp_spec_dummy_capture and self.model_config.use_mla:
+        # Keep MTP verification identifiable so the 310P backend can select
+        # its correctness-first explicit causal-mask path.
+        if self._mtp_spec_dummy_capture:
             self.attn_state = AscendAttentionState.SpecDecoding
         return super()._build_attention_metadata(*args, **kwargs)
 
@@ -264,7 +264,6 @@ class NPUModelRunner310(NPUModelRunner):
         if (
             self.speculative_config is not None
             and self.speculative_config.method == "mtp"
-            and self.model_config.use_mla
             and not np.all(self.input_batch.num_computed_tokens_cpu[:num_reqs] == 0)
             and np.all(num_scheduled_tokens == self.uniform_decode_query_len)
         ):

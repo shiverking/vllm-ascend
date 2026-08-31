@@ -108,6 +108,16 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.support_compressed_mask = is_compressed_mask_supported()
+        speculative_config = self.vllm_config.speculative_config
+        draft_model_config = getattr(
+            speculative_config,
+            "draft_model_config",
+            None,
+        )
+        draft_hf_config = getattr(draft_model_config, "hf_config", None)
+        self.use_explicit_qwen3_asr_mtp_mask = (
+            getattr(draft_hf_config, "model_type", None) == "qwen3_asr_mtp"
+        )
 
     def _flash_attention(
         self,
@@ -270,7 +280,19 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 non_blocking=True,
             )
 
-        if self.support_compressed_mask:
+        # The compressed splitfuse-v2 path is not greedy-equivalent for dense
+        # Qwen3-ASR multi-query verification on 310P: later query positions can
+        # observe an incorrect causal prefix, producing repeated tokens or an
+        # early EOS. Use the explicit causal mask and legacy splitfuse kernel
+        # for speculative verification until the v2 path is validated.
+        if (
+            self.support_compressed_mask
+            and not (
+                self.use_explicit_qwen3_asr_mtp_mask
+                and attn_metadata.attn_state
+                == AscendAttentionState.SpecDecoding
+            )
+        ):
             # splitfuse_v2 requires fixed ND [2048, 2048]; parent build() may set FRACTAL_NZ mask.
             mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
             torch_npu._npu_paged_attention_splitfuse_v2(

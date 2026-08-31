@@ -53,7 +53,7 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
-    def test_dense_mtp_uniform_verify_keeps_chunked_prefill_state(self):
+    def test_dense_mtp_uniform_verify_uses_310p_spec_state(self):
         runner = object.__new__(NPUModelRunner310)
         runner.input_batch = SimpleNamespace(
             num_computed_tokens_cpu=np.array([32], dtype=np.int32)
@@ -69,8 +69,8 @@ class TestNPUModelRunner310(TestBase):
             np.array([1], dtype=np.int32),
         )
 
-        self.assertEqual(state, AscendAttentionState.ChunkedPrefill)
-        self.assertEqual(runner.attn_state, AscendAttentionState.ChunkedPrefill)
+        self.assertEqual(state, AscendAttentionState.SpecDecoding)
+        self.assertEqual(runner.attn_state, AscendAttentionState.SpecDecoding)
 
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
