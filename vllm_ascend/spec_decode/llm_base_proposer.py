@@ -298,20 +298,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
         if supports_multimodal(model):
             # handle multimodality
-            if self.get_model_name(model) in [
-                "Qwen2_5_VLForConditionalGeneration",
-                "Qwen3VLForConditionalGeneration",
-                "Qwen3VLMoeForConditionalGeneration",
-                "Qwen3_5ForConditionalGeneration",
-                "Qwen3_5MoeForConditionalGeneration",
-            ]:
-                self.model.config.image_token_index = model.config.image_token_id
-            elif self.get_model_name(model) == "PixtralForConditionalGeneration":
-                self.model.config.image_token_index = model.config.vision_config.image_token_id
-            elif self.get_model_name(model) == "KimiK25ForConditionalGeneration":
-                self.model.config.image_token_index = model.config.media_placeholder_token_id
-            else:
-                self.model.config.image_token_index = model.config.image_token_index
+            self._maybe_copy_image_token_index(model)
             target_language_model = model.get_language_model()
         else:
             target_language_model = model
@@ -338,6 +325,27 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             len(self._draft_attn_layer_names),
             self.kernel_block_size,
         )
+
+    def _maybe_copy_image_token_index(self, target_model: nn.Module) -> None:
+        model_name = self.get_model_name(target_model)
+        image_token_index = None
+        if model_name in [
+            "Qwen2_5_VLForConditionalGeneration",
+            "Qwen3VLForConditionalGeneration",
+            "Qwen3VLMoeForConditionalGeneration",
+            "Qwen3_5ForConditionalGeneration",
+            "Qwen3_5MoeForConditionalGeneration",
+        ]:
+            image_token_index = target_model.config.image_token_id
+        elif model_name == "PixtralForConditionalGeneration":
+            image_token_index = target_model.config.vision_config.image_token_id
+        elif model_name == "KimiK25ForConditionalGeneration":
+            image_token_index = target_model.config.media_placeholder_token_id
+        elif hasattr(target_model.config, "image_token_index"):
+            image_token_index = target_model.config.image_token_index
+
+        if image_token_index is not None:
+            self.model.config.image_token_index = image_token_index
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """
@@ -1138,6 +1146,7 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         base_mtp_positions = (
             positions.clone() if self.qwen3_asr_mtp_uses_base_positions else None
         )
+
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 

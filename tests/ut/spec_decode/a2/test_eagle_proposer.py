@@ -2,6 +2,7 @@
 import inspect
 import unittest
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import MagicMock, patch
 
@@ -36,6 +37,32 @@ _CPU_GPU_BUFFER_TARGET = (
 )
 
 BLOCK_SIZE = 16
+
+
+def test_audio_multimodal_model_does_not_require_image_token_index():
+    proposer = llm_base_proposer.AscendSpecDecodeBaseProposer.__new__(
+        llm_base_proposer.AscendSpecDecodeBaseProposer
+    )
+    proposer.model = SimpleNamespace(config=SimpleNamespace())
+    target_model = SimpleNamespace(config=SimpleNamespace())
+
+    proposer._maybe_copy_image_token_index(target_model)
+
+    assert not hasattr(proposer.model.config, "image_token_index")
+
+
+def test_generic_multimodal_model_copies_image_token_index():
+    proposer = llm_base_proposer.AscendSpecDecodeBaseProposer.__new__(
+        llm_base_proposer.AscendSpecDecodeBaseProposer
+    )
+    proposer.model = SimpleNamespace(config=SimpleNamespace())
+    target_model = SimpleNamespace(
+        config=SimpleNamespace(image_token_index=151655)
+    )
+
+    proposer._maybe_copy_image_token_index(target_model)
+
+    assert proposer.model.config.image_token_index == 151655
 
 
 @dataclass
