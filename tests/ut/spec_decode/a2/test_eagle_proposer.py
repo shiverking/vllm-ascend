@@ -2758,6 +2758,61 @@ class TestRunMergedDraft(TestBase):
         )
         self.assertIs(forward_context.attn_metadata, multi_steps_attn_metadata[2])
 
+    def test_run_merged_draft_qwen3_asr_mtp5_reuses_base_positions(self):
+        self.proposer.method = "mtp"
+        self.proposer.num_speculative_tokens = 5
+        self.proposer.qwen3_asr_mtp_uses_base_positions = True
+        self.proposer.draft_model_config.hf_config.model_type = "qwen3_asr_mtp"
+        self.proposer.model = MockDraftModel(returns_tuple=True)
+        self.proposer.input_ids[:2] = torch.tensor([101, 202], dtype=torch.int32)
+        self.proposer.positions[:2] = torch.tensor([7, 11], dtype=torch.int32)
+        self.proposer.hidden_states[:2] = torch.arange(
+            8, dtype=torch.float32
+        ).view(2, 4)
+        forward_context = MagicMock()
+        forward_context.moe_layer_index = 0
+        forward_context.attn_metadata = None
+        multi_steps_attn_metadata = [MagicMock() for _ in range(5)]
+        mock_ascend_config = MagicMock()
+        mock_ascend_config.enable_reduce_sample = False
+
+        with (
+            patch.object(llm_base_proposer, "lmhead_tp_enable", return_value=False),
+            patch.object(
+                llm_base_proposer,
+                "get_ascend_config",
+                return_value=mock_ascend_config,
+            ),
+            patch.object(
+                llm_base_proposer,
+                "get_forward_context",
+                return_value=forward_context,
+            ),
+        ):
+            draft_token_ids = self.proposer._run_merged_draft(
+                num_input_tokens=2,
+                batch_size=2,
+                token_indices_to_sample=torch.tensor([0, 1], dtype=torch.int64),
+                target_positions=self.proposer.positions[:2],
+                inputs_embeds=None,
+                multi_steps_attn_metadata=multi_steps_attn_metadata,
+                num_tokens=2,
+                is_prefill=False,
+            )
+
+        self.assertEqual(draft_token_ids.shape, (2, 5))
+        self.assertEqual(
+            [call["spec_step_idx"] for call in self.proposer.model.calls],
+            [0, 1, 2, 3, 4],
+        )
+        for call in self.proposer.model.calls:
+            self.assertTrue(
+                torch.equal(
+                    call["positions"][:2],
+                    torch.tensor([7, 11], dtype=torch.int32),
+                )
+            )
+
     def test_run_merged_draft_early_return_conditions(self):
         test_cases = [
             (1, False, torch.tensor([1, 3], dtype=torch.int64), (2, 1)),

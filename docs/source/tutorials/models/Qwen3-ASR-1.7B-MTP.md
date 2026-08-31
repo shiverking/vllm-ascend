@@ -26,7 +26,8 @@ Qwen3-ASR target 模型完成。本文默认单卡 Ascend 310P、BF16、TP=1。
 ::::{tab-item} 310P
 
 将仓库分别安装到 `/vllm-workspace/vllm` 和
-`/vllm-workspace/vllm-ascend`，模型放到 `/models/Qwen3-ASR-1.7B-MTP3`。
+`/vllm-workspace/vllm-ascend`。本文的MTP-5示例模型目录为
+`/models/Qwen3-ASR-1.7B-MTP5-stage2-3384`。
 
 ::::
 
@@ -44,18 +45,24 @@ Qwen3-ASR target 模型完成。本文默认单卡 Ascend 310P、BF16、TP=1。
 在 `/workspace` 直接启动：
 
 ```bash
-vllm serve /models/Qwen3-ASR-1.7B-MTP3 \
-  --served-model-name qwen3-asr-mtp3 \
+vllm serve /models/Qwen3-ASR-1.7B-MTP5-stage2-3384 \
+  --served-model-name qwen3-asr-mtp5 \
   --dtype bfloat16 \
   --tensor-parallel-size 1 \
   --max-model-len 8192 \
   --max-num-seqs 16 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":3}' \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":5}' \
   --port 8000
 ```
 
-Eager隔离命令是在上述命令末尾增加 `--enforce-eager`。MTP-5可将模型
-目录替换为MTP-5导出目录，并依次测试K=3、4、5。
+Eager隔离命令是在上述命令末尾增加 `--enforce-eager`。同一个MTP-5
+checkpoint应依次测试K=3、4、5，只需修改`num_speculative_tokens`；最终采用
+真实端到端耗时最短的K，不默认K=5最快。
+
+导出的`config.json`必须包含`mtp_num_hidden_layers=5`和
+`mtp_branch_position_mode`。当前训练配置使用`base`：各串行MTP层复用target
+最后位置的RoPE坐标，但KV槽位和序列长度仍逐步前进。缺少该字段的旧导出包
+按`shifted`兼容模式处理，应重新导出后再进行接受率验收。
 
 ## Functional Verification
 
@@ -64,7 +71,7 @@ curl -sf http://127.0.0.1:8000/v1/models
 
 curl http://127.0.0.1:8000/v1/audio/transcriptions \
   -F file=@/workspace/test.wav \
-  -F model=qwen3-asr-mtp3 \
+  -F model=qwen3-asr-mtp5 \
   -F language=en \
   -F temperature=0
 ```
@@ -80,7 +87,7 @@ LibriSpeech test-clean 500条基线WER为0.035；真实训练checkpoint尚未完
 
 ## Performance
 
-依次测试K=1/2/3及batch=1/4/8/16，记录接受长度、decode TPS、P50/P90
+依次测试K=3/4/5及batch=1/4/8/16，记录接受长度、decode TPS、P50/P90
 端到端耗时和峰值显存。商用目标为batch=1 decode TPS提升至少20%，短音频
 P50端到端耗时降低至少10%。配置理论上限为65,536；首轮实用验证为
 8K/16K/32K，128K不适用。

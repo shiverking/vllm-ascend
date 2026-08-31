@@ -1135,6 +1135,9 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             positions = self.mrope_positions[:, token_indices_to_sample]
         else:
             positions = self.positions[token_indices_to_sample]
+        base_mtp_positions = (
+            positions.clone() if self.qwen3_asr_mtp_uses_base_positions else None
+        )
         hidden_states = hidden_states[token_indices_to_sample]
         token_indices_to_sample = self.arange[:batch_size]
 
@@ -1175,7 +1178,12 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
-            self._set_positions(batch_size, clamped_positions)
+            model_positions = (
+                base_mtp_positions
+                if base_mtp_positions is not None
+                else clamped_positions
+            )
+            self._set_positions(batch_size, model_positions)
             self.hidden_states[:batch_size] = hidden_states.view(batch_size, -1)
             if self.supports_mm_inputs:
                 self.inputs_embeds[:batch_size] = self.model.embed_input_ids(input_ids)
