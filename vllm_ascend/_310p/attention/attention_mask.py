@@ -99,6 +99,48 @@ class AttentionMaskBuilder310:
         return splitfuse_mask_nz
 
     @classmethod
+    def get_uniform_splitfuse_mask(
+        cls,
+        seq_lens: torch.Tensor,
+        query_len: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Build a graph-safe SplitFuse mask for uniform decode batches.
+
+        FULL_DECODE_ONLY captures a fixed number of verification tokens per
+        request.  Derive their absolute positions entirely on device so graph
+        capture and replay never synchronize the captured stream with the host.
+        Padded requests can have a zero sequence length; clamping keeps their
+        ignored mask rows in bounds.
+        """
+        if (
+            cls.chunked_prefill_attn_mask is None
+            or cls.chunked_prefill_attn_mask.device != device
+        ):
+            cls.chunked_prefill_attn_mask = cls.gen_causal_additive_mask(
+                cls.max_seqlen,
+                device,
+            )
+
+        token_offsets = torch.arange(
+            query_len,
+            dtype=seq_lens.dtype,
+            device=device,
+        )
+        positions = (
+            seq_lens.unsqueeze(1) - query_len + token_offsets.unsqueeze(0)
+        ).reshape(-1)
+        positions = positions.clamp(0, cls.max_seqlen - 1)
+        splitfuse_mask = cls.chunked_prefill_attn_mask.index_select(
+            0,
+            positions,
+        )
+        return torch_npu.npu_format_cast(
+            nd_to_nz_spec(splitfuse_mask).contiguous(),
+            ACL_FORMAT_FRACTAL_NZ,
+        )
+
+    @classmethod
     def get_compressed_splitfuse_mask(cls, device: torch.device):
         """
         Generates the fixed ND attention mask for compressed SplitFuse PA.

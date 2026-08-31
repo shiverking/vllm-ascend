@@ -43,3 +43,22 @@ class TestAttentionMaskBuilder310(TestBase):
         attn_metadata.seq_lens = torch.tensor([7, 4])
         attn_mask = self.attention_mask_builder.get_splitfuse_mask(attn_metadata, torch.device("cpu"))
         self.assertEqual(attn_mask.shape, (1, self.max_seqlen // 16, 16, 16))
+
+    @patch("torch_npu.npu_format_cast")
+    def test_uniform_splitfuse_mask_matches_general_mask(self, mock_format_cast):
+        mock_format_cast.side_effect = lambda x, y: x
+        attn_metadata = MagicMock()
+        attn_metadata.query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+        attn_metadata.seq_lens = torch.tensor([7, 4], dtype=torch.int32)
+
+        expected = self.attention_mask_builder.get_splitfuse_mask(
+            attn_metadata,
+            torch.device("cpu"),
+        )
+        actual = self.attention_mask_builder.get_uniform_splitfuse_mask(
+            attn_metadata.seq_lens,
+            query_len=2,
+            device=torch.device("cpu"),
+        )
+
+        self.assertTrue(torch.equal(actual, expected))

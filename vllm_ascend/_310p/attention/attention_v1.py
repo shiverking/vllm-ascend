@@ -118,6 +118,11 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         self.use_explicit_qwen3_asr_mtp_mask = (
             getattr(draft_hf_config, "model_type", None) == "qwen3_asr_mtp"
         )
+        self.qwen3_asr_mtp_query_len = (
+            1 + speculative_config.num_speculative_tokens
+            if self.use_explicit_qwen3_asr_mtp_mask
+            else None
+        )
 
     def _flash_attention(
         self,
@@ -255,6 +260,8 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             attn_metadata (AscendMetadata): Metadata containing start locations and block tables.
             output: The output tensor.
         """
+        from vllm_ascend.ascend_forward_context import _EXTRA_CTX
+
         num_actual_tokens = int(attn_metadata.num_actual_tokens)
         query = query[:num_actual_tokens]
         output_slice = output[:num_actual_tokens]
@@ -262,8 +269,6 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # Host qLens filled in AscendAttentionMetadataBuilder310.build(); eager fallback only.
         qlens = get_query_lens_cpu(attn_metadata)
         if qlens is None:
-            from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-
             if _EXTRA_CTX.capturing:
                 raise RuntimeError(
                     "310P splitfuse requires attn_metadata.query_lens_cpu during graph capture; "
@@ -285,6 +290,11 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
         # observe an incorrect causal prefix, producing repeated tokens or an
         # early EOS. Use the explicit causal mask and legacy splitfuse kernel
         # for speculative verification until the v2 path is validated.
+        use_qwen3_asr_mtp_graph_mask = (
+            self.use_explicit_qwen3_asr_mtp_mask
+            and self.qwen3_asr_mtp_query_len == 2
+            and _EXTRA_CTX.capturing
+        )
         if (
             self.support_compressed_mask
             and not (
@@ -292,6 +302,7 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
                 and attn_metadata.attn_state
                 == AscendAttentionState.SpecDecoding
             )
+            and not use_qwen3_asr_mtp_graph_mask
         ):
             # splitfuse_v2 requires fixed ND [2048, 2048]; parent build() may set FRACTAL_NZ mask.
             mask = AttentionMaskBuilder310.get_compressed_splitfuse_mask(query.device)
@@ -311,8 +322,20 @@ class AscendAttentionBackendImpl310(AscendAttentionBackendImpl):
             )
             return output
 
-        # Generate the specific mask for splitfuse
-        mask = AttentionMaskBuilder310.get_splitfuse_mask(attn_metadata, query.device)
+        # The generic explicit mask reads dynamic lengths back to the host. For
+        # MTP-1 FULL_DECODE_ONLY, verification is a uniform two-token batch, so
+        # construct the equivalent mask entirely on device for graph capture.
+        if use_qwen3_asr_mtp_graph_mask:
+            mask = AttentionMaskBuilder310.get_uniform_splitfuse_mask(
+                attn_metadata.seq_lens,
+                self.qwen3_asr_mtp_query_len,
+                query.device,
+            )
+        else:
+            mask = AttentionMaskBuilder310.get_splitfuse_mask(
+                attn_metadata,
+                query.device,
+            )
         torch_npu._npu_paged_attention_splitfuse(
             query=query,
             key_cache=self.key_cache,

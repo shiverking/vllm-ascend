@@ -264,3 +264,57 @@ class TestAscendAttentionBackendImpl310(TestBase):
         mock_splitfuse_v2.assert_not_called()
         self.assertIs(mock_splitfuse.call_args.kwargs["mask"], explicit_mask)
         self.assertIs(result, output)
+
+    @patch("torch_npu._npu_paged_attention_splitfuse_v2", create=True)
+    @patch("torch_npu._npu_paged_attention_splitfuse", create=True)
+    @patch(
+        "vllm_ascend._310p.attention.attention_v1."
+        "AttentionMaskBuilder310.get_splitfuse_mask"
+    )
+    @patch(
+        "vllm_ascend._310p.attention.attention_v1."
+        "AttentionMaskBuilder310.get_uniform_splitfuse_mask"
+    )
+    @patch("vllm_ascend.ascend_forward_context._EXTRA_CTX")
+    def test_mtp1_graph_capture_uses_device_causal_mask(
+        self,
+        mock_extra_ctx,
+        mock_get_uniform_splitfuse_mask,
+        mock_get_splitfuse_mask,
+        mock_splitfuse,
+        mock_splitfuse_v2,
+    ):
+        query = torch.randn(4, 8, 64)
+        output = torch.empty_like(query)
+        metadata = self.attn_metadata
+        metadata.attn_state = AscendAttentionState.ChunkedPrefill
+        metadata.num_actual_tokens = 4
+        metadata.query_start_loc = torch.tensor([0, 2, 4], dtype=torch.int32)
+        metadata.seq_lens = torch.tensor([34, 51], dtype=torch.int32)
+        metadata.block_tables = torch.zeros(2, 5, dtype=torch.int32)
+        metadata.query_lens_cpu = torch.tensor([2, 2], dtype=torch.int32)
+        self.impl.key_cache = torch.empty(1)
+        self.impl.value_cache = torch.empty(1)
+        self.impl.support_compressed_mask = True
+        self.impl.use_explicit_qwen3_asr_mtp_mask = True
+        self.impl.qwen3_asr_mtp_query_len = 2
+        mock_extra_ctx.capturing = True
+        explicit_mask = torch.empty(1)
+        mock_get_uniform_splitfuse_mask.return_value = explicit_mask
+
+        result = self.impl.forward_chunked_prefill_310(
+            query,
+            metadata,
+            output,
+        )
+
+        mock_get_uniform_splitfuse_mask.assert_called_once_with(
+            metadata.seq_lens,
+            2,
+            query.device,
+        )
+        mock_get_splitfuse_mask.assert_not_called()
+        mock_splitfuse.assert_called_once()
+        mock_splitfuse_v2.assert_not_called()
+        self.assertIs(mock_splitfuse.call_args.kwargs["mask"], explicit_mask)
+        self.assertIs(result, output)
