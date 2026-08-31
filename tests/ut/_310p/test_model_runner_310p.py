@@ -17,11 +17,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 
 
 def _prepare_inputs_source() -> str:
@@ -51,6 +53,25 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    def test_dense_mtp_uniform_verify_keeps_chunked_prefill_state(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.array([32], dtype=np.int32)
+        )
+        runner.speculative_config = SimpleNamespace(method="mtp")
+        runner.model_config = SimpleNamespace(use_mla=False)
+        runner.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
+        runner.uniform_decode_query_len = 6
+
+        state = runner._build_attn_state(
+            1,
+            np.array([6], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+        )
+
+        self.assertEqual(state, AscendAttentionState.ChunkedPrefill)
+        self.assertEqual(runner.attn_state, AscendAttentionState.ChunkedPrefill)
+
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8

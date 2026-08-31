@@ -6,7 +6,56 @@ import numpy as np
 import torch
 from vllm.v1.kv_cache_interface import FullAttentionSpec, KVCacheConfig, KVCacheGroupSpec, KVCacheTensor
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
+
+
+class TestNPUModelRunnerAttentionState(unittest.TestCase):
+    def _build_runner(self, *, use_mla: bool):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.input_batch = SimpleNamespace(
+            num_computed_tokens_cpu=np.array([32], dtype=np.int32)
+        )
+        runner.speculative_config = SimpleNamespace(method="mtp")
+        runner.model_config = SimpleNamespace(use_mla=use_mla)
+        runner.scheduler_config = SimpleNamespace(enable_chunked_prefill=True)
+        return runner
+
+    def test_dense_mtp_single_token_uses_decode_metadata(self):
+        runner = self._build_runner(use_mla=False)
+
+        state = runner._build_attn_state(
+            1,
+            np.array([1], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+        )
+
+        self.assertEqual(state, AscendAttentionState.DecodeOnly)
+        self.assertEqual(runner.attn_state, AscendAttentionState.DecodeOnly)
+
+    def test_dense_mtp_verification_uses_chunked_prefill_metadata(self):
+        runner = self._build_runner(use_mla=False)
+
+        state = runner._build_attn_state(
+            1,
+            np.array([6], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+        )
+
+        self.assertEqual(state, AscendAttentionState.ChunkedPrefill)
+        self.assertEqual(runner.attn_state, AscendAttentionState.ChunkedPrefill)
+
+    def test_mla_mtp_keeps_spec_decoding_metadata(self):
+        runner = self._build_runner(use_mla=True)
+
+        state = runner._build_attn_state(
+            1,
+            np.array([6], dtype=np.int32),
+            np.array([1], dtype=np.int32),
+        )
+
+        self.assertEqual(state, AscendAttentionState.SpecDecoding)
+        self.assertEqual(runner.attn_state, AscendAttentionState.SpecDecoding)
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
