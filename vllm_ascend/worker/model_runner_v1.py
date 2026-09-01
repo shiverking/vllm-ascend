@@ -2406,7 +2406,13 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
-        self.valid_sampled_token_count_gpu: torch.Tensor | None = None # type: ignore[no-redef]
+        # Padded drafters consume the current sampler output directly. Clear
+        # all previous-step device references before producing the next draft,
+        # matching the paired vLLM GPUModelRunner lifecycle.
+        self._draft_token_ids = None
+        self._draft_token_req_ids = None
+        self.valid_sampled_token_count_gpu = None
+        self.input_batch.prev_sampled_token_ids = None
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2424,6 +2430,25 @@ class NPUModelRunner(GPUModelRunner):
                 batch_desc,
             )
             self._copy_draft_token_ids_to_cpu(scheduler_output)
+
+        use_padded_batch = bool(
+            self.speculative_config
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+                or self.speculative_config.uses_extract_hidden_states()
+                or self.speculative_config.use_ngram_gpu()
+            )
+            and not self.speculative_config.disable_padded_drafter_batch
+        )
+
+        # Run the device-side proposer before async bookkeeping writes its
+        # placeholder token and advances num_tokens_no_spec. Otherwise the
+        # drafter observes a sequence one token ahead of the target state,
+        # which corrupts the next-token/KV handoff and causes repetitions.
+        if use_padded_batch:
+            with record_function_or_nullcontext("draft_token"):
+                propose_draft_token_ids(sampler_output.sampled_token_ids)
 
         (
             logprobs_lists,
@@ -2443,21 +2468,7 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
-                use_padded_batch = (
-                    self.speculative_config
-                    and (
-                        self.speculative_config.use_eagle()
-                        or self.speculative_config.uses_draft_model()
-                        or self.speculative_config.uses_extract_hidden_states()
-                        or self.speculative_config.use_ngram_gpu()
-                    )
-                    and not self.speculative_config.disable_padded_drafter_batch
-                )
-                if use_padded_batch:
-                    # EAGLE speculative decoding can use the GPU sampled tokens
-                    # as inputs, and does not need to wait for bookkeeping to finish.
-                    propose_draft_token_ids(sampler_output.sampled_token_ids)
-                if self.speculative_config and not use_padded_batch:
+                if not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
                     propose_draft_token_ids(valid_sampled_token_ids)

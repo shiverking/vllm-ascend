@@ -1,3 +1,4 @@
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -48,6 +49,19 @@ class TestNPUModelRunnerAsyncStateUpdate(unittest.TestCase):
 
         self.assertEqual(runner.requests["request-0"].prev_num_draft_len, 0)
         parent_update.assert_called_once()
+
+
+class TestNPUModelRunnerPaddedDraftOrdering(unittest.TestCase):
+    def test_padded_draft_runs_before_async_bookkeeping(self):
+        """Padded MTP must consume sampled IDs before placeholders are added."""
+        source = inspect.getsource(NPUModelRunner.sample_tokens)
+
+        padded_draft = source.index(
+            "propose_draft_token_ids(sampler_output.sampled_token_ids)"
+        )
+        bookkeeping = source.index("self._bookkeeping_sync(")
+
+        self.assertLess(padded_draft, bookkeeping)
 
 
 class TestNPUModelRunnerAttentionState(unittest.TestCase):
