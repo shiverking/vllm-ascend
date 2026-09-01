@@ -52,16 +52,16 @@ class TestNPUModelRunnerAsyncStateUpdate(unittest.TestCase):
 
 
 class TestNPUModelRunnerPaddedDraftOrdering(unittest.TestCase):
-    def test_padded_draft_runs_before_async_bookkeeping(self):
-        """Padded MTP must consume sampled IDs before placeholders are added."""
+    def test_padded_draft_runs_after_async_bookkeeping(self):
+        """Keep padded draft generation in GPUModelRunner lifecycle order."""
         source = inspect.getsource(NPUModelRunner.sample_tokens)
 
+        bookkeeping = source.index("self._bookkeeping_sync(")
         padded_draft = source.index(
             "propose_draft_token_ids(sampler_output.sampled_token_ids)"
         )
-        bookkeeping = source.index("self._bookkeeping_sync(")
 
-        self.assertLess(padded_draft, bookkeeping)
+        self.assertLess(bookkeeping, padded_draft)
 
 
 class TestNPUModelRunnerAttentionState(unittest.TestCase):

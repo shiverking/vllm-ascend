@@ -2411,13 +2411,7 @@ class NPUModelRunner(GPUModelRunner):
             assert self.sampling_done_event is not None
             self.sampling_done_event.record()
 
-        # Padded drafters consume the current sampler output directly. Clear
-        # all previous-step device references before producing the next draft,
-        # matching the paired vLLM GPUModelRunner lifecycle.
-        self._draft_token_ids = None
-        self._draft_token_req_ids = None
-        self.valid_sampled_token_count_gpu = None
-        self.input_batch.prev_sampled_token_ids = None
+        self.valid_sampled_token_count_gpu: torch.Tensor | None = None  # type: ignore[no-redef]
 
         def propose_draft_token_ids(sampled_token_ids):
             assert spec_decode_common_attn_metadata is not None
@@ -2447,14 +2441,6 @@ class NPUModelRunner(GPUModelRunner):
             and not self.speculative_config.disable_padded_drafter_batch
         )
 
-        # Run the device-side proposer before async bookkeeping writes its
-        # placeholder token and advances num_tokens_no_spec. Otherwise the
-        # drafter observes a sequence one token ahead of the target state,
-        # which corrupts the next-token/KV handoff and causes repetitions.
-        if use_padded_batch:
-            with record_function_or_nullcontext("draft_token"):
-                propose_draft_token_ids(sampler_output.sampled_token_ids)
-
         (
             logprobs_lists,
             valid_sampled_token_ids,
@@ -2473,6 +2459,11 @@ class NPUModelRunner(GPUModelRunner):
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
+                if use_padded_batch:
+                    # Padded draft models consume device sampled tokens. Keep
+                    # this after bookkeeping to match GPUModelRunner's state
+                    # lifecycle; accepted-count correction handles async drift.
+                    propose_draft_token_ids(sampler_output.sampled_token_ids)
                 if not use_padded_batch:
                     # ngram and other speculative decoding methods use the sampled
                     # tokens on the CPU, so they are run after bookkeeping.
