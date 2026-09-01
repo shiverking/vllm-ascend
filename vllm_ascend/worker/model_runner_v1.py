@@ -682,7 +682,16 @@ class NPUModelRunner(GPUModelRunner):
         # This can be removed after the upstream fix is merged.
         req_data = scheduler_output.scheduled_cached_reqs
 
-        if self.use_async_scheduling:
+        # A lower scheduler token count is the normal correction after
+        # speculative rejection.  Keep ``prev_num_draft_len`` in that case so
+        # GPUModelRunner can reconcile the optimistic async state with the
+        # accepted-token count.  Clearing it here loses that correction and
+        # misaligns input tokens, positions, and KV state on the next step.
+        #
+        # Requests genuinely discarded from the previous speculative batch
+        # are handled by the narrower prev_req_id_to_index guard in
+        # execute_model().
+        if self.use_async_scheduling and not self.use_async_spec_decode:
             for i, req_id in enumerate(req_data.req_ids):
                 req_state = self.requests.get(req_id)
                 if req_state is None:

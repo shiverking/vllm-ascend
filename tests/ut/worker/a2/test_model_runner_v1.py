@@ -10,6 +10,46 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+class TestNPUModelRunnerAsyncStateUpdate(unittest.TestCase):
+    def _build_runner(self, *, use_async_spec_decode: bool):
+        runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.use_async_scheduling = True
+        runner.use_async_spec_decode = use_async_spec_decode
+        runner.requests = {
+            "request-0": SimpleNamespace(
+                num_computed_tokens=12,
+                prev_num_draft_len=3,
+            )
+        }
+        return runner
+
+    def _scheduler_output(self):
+        return SimpleNamespace(
+            scheduled_cached_reqs=SimpleNamespace(
+                req_ids=["request-0"],
+                num_computed_tokens=[10],
+            )
+        )
+
+    @patch("vllm.v1.worker.gpu_model_runner.GPUModelRunner._update_states")
+    def test_async_spec_rewind_preserves_previous_draft_length(self, parent_update):
+        runner = self._build_runner(use_async_spec_decode=True)
+
+        runner._update_states(self._scheduler_output())
+
+        self.assertEqual(runner.requests["request-0"].prev_num_draft_len, 3)
+        parent_update.assert_called_once()
+
+    @patch("vllm.v1.worker.gpu_model_runner.GPUModelRunner._update_states")
+    def test_non_spec_rewind_keeps_kv_load_failure_guard(self, parent_update):
+        runner = self._build_runner(use_async_spec_decode=False)
+
+        runner._update_states(self._scheduler_output())
+
+        self.assertEqual(runner.requests["request-0"].prev_num_draft_len, 0)
+        parent_update.assert_called_once()
+
+
 class TestNPUModelRunnerAttentionState(unittest.TestCase):
     def _build_runner(self, *, use_mla: bool):
         runner = NPUModelRunner.__new__(NPUModelRunner)
