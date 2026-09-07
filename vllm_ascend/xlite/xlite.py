@@ -618,6 +618,7 @@ class XliteWrapper:
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.hidden_states = torch.empty(max_num_tokens, hidden_size, device=f"npu:{local_rank}", dtype=dtype)
         self.logits = torch.empty(
+            1,
             vllm_config.scheduler_config.max_num_seqs,
             vllm_config.model_config.get_vocab_size(),
             device=f"npu:{local_rank}",
@@ -684,18 +685,18 @@ class XliteWrapper:
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the TP1 FP16 LM head through Xlite."""
-        if hidden_states.ndim != 2 or hidden_states.shape[0] > self.logits.shape[0]:
+        if hidden_states.ndim != 2 or hidden_states.shape[0] > self.logits.shape[1]:
             raise RuntimeError(
                 "Xlite LM Head expects [num_samples, hidden_size] with "
-                f"num_samples <= {self.logits.shape[0]}, got {tuple(hidden_states.shape)}"
+                f"num_samples <= {self.logits.shape[1]}, got {tuple(hidden_states.shape)}"
             )
         hidden_states = hidden_states.contiguous()
         sample_count = hidden_states.shape[0]
         indices = torch.arange(sample_count, dtype=torch.int32, device=hidden_states.device)
-        output = self.logits[:sample_count]
+        output = self.logits[:, :sample_count]
         stream = torch.npu.current_stream().npu_stream
         self.xlite_model.forward_get_logits(self.xlite_rt, hidden_states, indices, output, stream)
-        return output
+        return output[0]
 
     def get_xlite_runtime_stats(self) -> dict[str, Any]:
         """Return a JSON-serializable snapshot used by performance reports."""
