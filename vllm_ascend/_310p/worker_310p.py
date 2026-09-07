@@ -55,6 +55,17 @@ class NPUWorker310(NPUWorker):
         self.model_runner = NPUModelRunner310(self.vllm_config, self.device)
         logger.info_once("Using NPUWorker310 and NPUModelRunner310.")
 
+    def compile_or_warm_up_model(self):
+        compilation_times = super().compile_or_warm_up_model()
+        if self.model_config.enforce_eager and self.model_runner.ascend_config.audio_encoder_aclgraph_sizes:
+            graph_memory_bytes = self.model_runner.capture_audio_encoder_model()
+            logger.info(
+                "Captured dedicated 310P audio encoder ACLGraphs in eager decoder mode; "
+                "reserved memory=%d bytes",
+                graph_memory_bytes,
+            )
+        return compilation_times
+
     def save_sharded_state(
         self,
         path: str,

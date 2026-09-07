@@ -289,6 +289,12 @@ class AudioEncoderAclGraphPool:
             for size in sizes
         }
         self._batch_count = 0
+        self._graph_hit_batches = 0
+        self._partial_hit_batches = 0
+        self._eager_batches = 0
+        self._body_padding_tokens = 0
+        self._attention_padding_tokens = 0
+        self._eager_tokens = 0
         self._execution_lock = Lock()
         self._execution_stream: Any | None = None
         self._input_ready_event: Any | None = None
@@ -297,6 +303,17 @@ class AudioEncoderAclGraphPool:
             "[310P_AUDIO_GRAPH] pool enabled: sizes=%s",
             list(sizes),
         )
+
+    def get_runtime_stats(self) -> dict[str, int]:
+        return {
+            "batches": self._batch_count,
+            "graph_hit_batches": self._graph_hit_batches,
+            "partial_hit_batches": self._partial_hit_batches,
+            "eager_batches": self._eager_batches,
+            "body_padding_tokens": self._body_padding_tokens,
+            "attention_padding_tokens": self._attention_padding_tokens,
+            "eager_tokens": self._eager_tokens,
+        }
 
     def _capture_runner(self, runner: FixedAudioEncoderAclGraphRunner) -> None:
         hidden_size = int(self.encoder.ln_post.normalized_shape[0])
@@ -323,8 +340,7 @@ class AudioEncoderAclGraphPool:
 
     def capture_all(self, *, show_progress: bool) -> tuple[int, ...]:
         if (
-            self.encoder.enforce_eager
-            or get_tensor_model_parallel_world_size() != 1
+            get_tensor_model_parallel_world_size() != 1
             or self.encoder.dtype != torch.float16
             or self.encoder.device.type != "npu"
         ):
@@ -477,8 +493,6 @@ class AudioEncoderAclGraphPool:
         hidden_states: torch.Tensor,
         sequence_lengths: torch.Tensor,
     ) -> str | None:
-        if self.encoder.enforce_eager:
-            return "enforce_eager"
         if get_tensor_model_parallel_world_size() != 1:
             return "unsupported_tp"
         if hidden_states.dtype != torch.float16:
@@ -625,6 +639,8 @@ class AudioEncoderAclGraphPool:
             sequence_lengths,
         )
         if reason is not None:
+            self._eager_batches += 1
+            self._eager_tokens += hidden_states.shape[0]
             logger.info(
                 "[310P_AUDIO_GRAPH] batch=%d, hit=False, actual=%d, "
                 "graphs=[], body_padding=0, attention_padding=0, "
@@ -661,8 +677,16 @@ class AudioEncoderAclGraphPool:
         hit: bool | str
         if graph_sizes and eager_tokens:
             hit = "partial"
+            self._partial_hit_batches += 1
+        elif graph_sizes:
+            hit = True
+            self._graph_hit_batches += 1
         else:
-            hit = bool(graph_sizes)
+            hit = False
+            self._eager_batches += 1
+        self._body_padding_tokens += body_padding_tokens
+        self._attention_padding_tokens += attention_padding_tokens
+        self._eager_tokens += eager_tokens
         logger.info(
             "[310P_AUDIO_GRAPH] batch=%d, hit=%s, actual=%d, graphs=%s, "
             "body_padding=%d, attention_padding=%d, eager=%d",
