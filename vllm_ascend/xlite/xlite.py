@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections import Counter
 from collections.abc import Callable, Sequence
 from typing import Any, TypeAlias, cast
 
@@ -31,7 +32,7 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size,
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
-from xlite._C import AttnMeta, AttnMHA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax
+from xlite._C import AttnMeta, AttnMHA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax, get_build_info
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetadata
@@ -413,6 +414,19 @@ class LlamaXliteModel(XliteModel):
             setattr(xlite_model, f"{xlite_prefix}_deq_scale", weight_scale)
 
 
+class Qwen3ASRXliteModel(LlamaXliteModel):
+    """Dense Qwen3 decoder embedded in Qwen3-ASR."""
+
+    _attn_metadata_type = AscendMetadata
+    _supported_architectures = ["Qwen3ASRForConditionalGeneration"]
+
+    def _build_model_config(self) -> None:
+        super()._build_model_config()
+        # The 310P correctness backend delegates matmul to ACLNN and consumes
+        # ordinary ND [N, K] weights. Audio-tower parameters are not mapped.
+        self.xlite_config.weight_nz = False
+
+
 class QwenMoeXliteModel(LlamaXliteModel):
     """xlite adapter for Qwen MoE architectures."""
 
@@ -578,6 +592,14 @@ class XliteWrapper:
         """
         self.runnable = runnable
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
+        self.build_info = dict(get_build_info())
+        self._validate_build_contract(vllm_config)
+        self.runtime_stats: dict[str, Any] = {
+            "prefill_requests": 0,
+            "decode_requests": 0,
+            "batch_distribution": Counter(),
+            "fallback_reasons": Counter(),
+        }
 
         rank = torch.distributed.get_rank()
         local_rank = get_world_group().local_rank
@@ -595,6 +617,34 @@ class XliteWrapper:
 
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self.hidden_states = torch.empty(max_num_tokens, hidden_size, device=f"npu:{local_rank}", dtype=dtype)
+        self.logits = torch.empty(
+            vllm_config.scheduler_config.max_num_seqs,
+            vllm_config.model_config.get_vocab_size(),
+            device=f"npu:{local_rank}",
+            dtype=dtype,
+        )
+
+    def _validate_build_contract(self, vllm_config: VllmConfig) -> None:
+        architecture = vllm_config.model_config.architectures[0]
+        is_310p_contract = str(self.build_info.get("soc", "")).lower().startswith("ascend310p")
+        if not is_310p_contract and architecture != "Qwen3ASRForConditionalGeneration":
+            return
+        expected = {
+            "soc": "Ascend310P3",
+            "kernel_set": "llm_fp16",
+            "abi": 1,
+            "cache_layout": "BSHD",
+        }
+        mismatches = {
+            key: (self.build_info.get(key), value)
+            for key, value in expected.items()
+            if self.build_info.get(key) != value
+        }
+        if mismatches:
+            raise RuntimeError(
+                "Incompatible Xlite 310P build contract: "
+                f"expected={expected}, actual={self.build_info}, mismatches={mismatches}"
+            )
 
     def __getattr__(self, key: str) -> Any:
         """Proxy unknown attributes to the wrapped runnable model.
@@ -632,9 +682,40 @@ class XliteWrapper:
         """
         self.kv_caches = kv_caches
 
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        """Run the TP1 FP16 LM head through Xlite."""
+        if hidden_states.ndim != 2 or hidden_states.shape[0] > self.logits.shape[0]:
+            raise RuntimeError(
+                "Xlite LM Head expects [num_samples, hidden_size] with "
+                f"num_samples <= {self.logits.shape[0]}, got {tuple(hidden_states.shape)}"
+            )
+        hidden_states = hidden_states.contiguous()
+        sample_count = hidden_states.shape[0]
+        indices = torch.arange(sample_count, dtype=torch.int32, device=hidden_states.device)
+        output = self.logits[:sample_count]
+        stream = torch.npu.current_stream().npu_stream
+        self.xlite_model.forward_get_logits(self.xlite_rt, hidden_states, indices, output, stream)
+        return output
+
+    def get_xlite_runtime_stats(self) -> dict[str, Any]:
+        """Return a JSON-serializable snapshot used by performance reports."""
+        stats = {
+            "build_info": self.build_info,
+            "prefill_requests": self.runtime_stats["prefill_requests"],
+            "decode_requests": self.runtime_stats["decode_requests"],
+            "batch_distribution": dict(self.runtime_stats["batch_distribution"]),
+            "fallback_reasons": dict(self.runtime_stats["fallback_reasons"]),
+            "attention_backend": self.build_info.get("attention_backend"),
+        }
+        audio_tower = getattr(self.runnable, "audio_tower", None)
+        audio_pool = getattr(audio_tower, "_ascend_audio_aclgraph_pool", None)
+        if audio_pool is not None:
+            stats["audio_encoder"] = audio_pool.get_runtime_stats()
+        return stats
+
     def __call__(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
@@ -654,11 +735,20 @@ class XliteWrapper:
         forward_context = get_forward_context()
         attn_metadata: Any = forward_context.attn_metadata
         if attn_metadata is None:
+            if self.full_mode:
+                raise RuntimeError("Xlite full mode requires Ascend attention metadata; refusing native fallback")
+            self.runtime_stats["fallback_reasons"]["missing_attention_metadata"] += 1
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
         attn_metadata = next(iter(attn_metadata.values()), None)
         if not isinstance(attn_metadata, self.adapter_xlite_model._attn_metadata_type):
+            if self.full_mode:
+                raise RuntimeError(
+                    "Xlite full mode received incompatible attention metadata: "
+                    f"{type(attn_metadata).__name__}"
+                )
+            self.runtime_stats["fallback_reasons"]["incompatible_attention_metadata"] += 1
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         with_prefill = attn_metadata.attn_state not in (
@@ -679,6 +769,7 @@ class XliteWrapper:
         if not use_xlite_graph:
             # fall back to runnable for prefill in decode-only mode
             # or when the number of tokens exceeds the graph capacity in non-full mode
+            self.runtime_stats["fallback_reasons"]["decode_only_prefill"] += 1
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         seq_lens = attn_metadata_router.seq_lens
@@ -686,26 +777,41 @@ class XliteWrapper:
         query_lens = torch.diff(cum_query_lens, prepend=seq_lens.new_zeros(1))
         cached_lens = torch.clamp(seq_lens - query_lens, min=0)
 
-        num_tokens = forward_context.batch_descriptor.num_tokens
+        query_lens_list = query_lens.tolist()
+        cached_lens_list = cached_lens.tolist()
+        for query_len, cached_len in zip(query_lens_list, cached_lens_list):
+            if query_len == 1 and cached_len > 0:
+                self.runtime_stats["decode_requests"] += 1
+            else:
+                self.runtime_stats["prefill_requests"] += 1
+        self.runtime_stats["batch_distribution"][len(query_lens_list)] += 1
+
         num_actual_tokens = attn_metadata.num_actual_tokens
         xlite_attn_metadata = AttnMeta()
-        xlite_attn_metadata.lens = query_lens.tolist()
-        xlite_attn_metadata.cached_lens = cached_lens.tolist()
+        xlite_attn_metadata.lens = query_lens_list
+        xlite_attn_metadata.cached_lens = cached_lens_list
         xlite_attn_metadata.block_tables_cpu = attn_metadata_router.block_tables.tolist()
         if positions.ndim == 2:
             xlite_attn_metadata.positions = positions[:, :num_actual_tokens].contiguous()
-            positions = positions[0]
         else:
-            xlite_attn_metadata.positions = positions
+            xlite_attn_metadata.positions = positions[:num_actual_tokens].contiguous()
 
-        # Compatibility between DP and Non-DP scenarios
-        h = self.hidden_states[:num_tokens]
+        h = self.hidden_states[:num_actual_tokens]
         stream = torch.npu.current_stream().npu_stream
         if inputs_embeds is None:
+            if input_ids is None:
+                raise RuntimeError("Xlite forward requires either input_ids or inputs_embeds")
             self.xlite_model.forward(
-                self.xlite_rt, input_ids, xlite_attn_metadata, self.kv_caches, self.freq_cis, h, stream
+                self.xlite_rt,
+                input_ids[:num_actual_tokens].contiguous(),
+                xlite_attn_metadata,
+                self.kv_caches,
+                self.freq_cis,
+                h,
+                stream,
             )
         else:
+            inputs_embeds = inputs_embeds[:num_actual_tokens].contiguous()
             deepstack_input_embeds = getattr(self.runnable, "deepstack_input_embeds", [])
             xlite_deepstack_input_embeds = [
                 deepstack_input[: inputs_embeds.size(0)] for deepstack_input in deepstack_input_embeds

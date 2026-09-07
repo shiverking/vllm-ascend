@@ -51,6 +51,77 @@ def test_prepare_inputs_keeps_aclgraph_metadata_on_cpu() -> None:
 
 
 class TestNPUModelRunner310(TestBase):
+    @staticmethod
+    def _make_xlite_runner(**overrides):
+        runner = object.__new__(NPUModelRunner310)
+        values = {
+            "dtype": torch.float16,
+            "max_model_len": 2048,
+            "architectures": ["Qwen3ASRForConditionalGeneration"],
+        }
+        values.update(overrides.pop("model_config", {}))
+        runner.model_config = SimpleNamespace(**values)
+        runner.cache_config = SimpleNamespace(block_size=overrides.pop("block_size", 128))
+        runner.scheduler_config = SimpleNamespace(
+            max_num_seqs=overrides.pop("max_num_seqs", 20),
+            max_num_batched_tokens=overrides.pop("max_num_batched_tokens", 4096),
+        )
+        runner.ascend_config = SimpleNamespace(xlite_graph_config=SimpleNamespace(full_mode=True))
+        runner.vllm_config = SimpleNamespace(
+            parallel_config=SimpleNamespace(
+                tensor_parallel_size=overrides.pop("tensor_parallel_size", 1),
+                pipeline_parallel_size=overrides.pop("pipeline_parallel_size", 1),
+                data_parallel_size=overrides.pop("data_parallel_size", 1),
+            ),
+            quant_config=overrides.pop("quant_config", None),
+        )
+        assert not overrides
+        return runner
+
+    def test_xlite_310p_config_accepts_poc_contract(self):
+        runner = self._make_xlite_runner()
+        runner._validate_xlite_310p_config()
+
+    def test_xlite_310p_config_rejects_unsafe_modes(self):
+        runner = self._make_xlite_runner(
+            block_size=64,
+            max_num_seqs=21,
+            tensor_parallel_size=2,
+            model_config={"dtype": torch.bfloat16, "max_model_len": 4096},
+        )
+        with self.assertRaisesRegex(ValueError, "dtype must be float16") as raised:
+            runner._validate_xlite_310p_config()
+        message = str(raised.exception)
+        self.assertIn("tensor_parallel_size must be 1", message)
+        self.assertIn("block_size must be 128", message)
+        self.assertIn("max_num_seqs must be <= 20", message)
+        self.assertIn("max_model_len must be <= 2048", message)
+
+    def test_xlite_310p_allocates_fp16_bshd_nd_cache(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner.device = torch.device("cpu")
+        cache_spec = AttentionSpec(
+            block_size=128,
+            num_kv_heads=8,
+            head_size=128,
+            dtype=torch.float16,
+        )
+
+        def fake_empty_with_format(*, size, dtype, device, acl_format):
+            self.assertEqual(acl_format, 2)
+            return torch.empty(size, dtype=dtype, device=device)
+
+        with patch(
+            "vllm_ascend._310p.model_runner_310p.torch_npu.empty_with_format",
+            side_effect=fake_empty_with_format,
+        ) as empty_with_format:
+            key, value = runner._allocate_xlite_attention_cache(17, cache_spec)
+
+        self.assertEqual(key.shape, (17, 128, 8, 128))
+        self.assertEqual(value.shape, key.shape)
+        self.assertEqual(key.dtype, torch.float16)
+        self.assertEqual(empty_with_format.call_count, 2)
+
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)
         runner.max_num_reqs = 8

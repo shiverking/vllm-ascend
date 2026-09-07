@@ -50,11 +50,16 @@ from vllm_ascend._310p.sample.rejection_sampler import AscendRejectionSampler310
 from vllm_ascend._310p.sample.sampler import AscendSampler310
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.spec_decode.utils import update_num_computed_tokens_for_batch_change
-from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, lmhead_tp_enable
+from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN = 1
 _ATTENTION_BLOCK_SIZE_LIMIT = 128 * 128
+_XLITE_310P_BLOCK_SIZE = 128
+_XLITE_310P_MAX_BATCH = 20
+_XLITE_310P_MAX_MODEL_LEN = 2048
+_XLITE_310P_MAX_BATCHED_TOKENS = 4096
+_XLITE_310P_ARCHITECTURE = "Qwen3ASRForConditionalGeneration"
 
 
 class NPUModelRunner310(NPUModelRunner):
@@ -75,6 +80,9 @@ class NPUModelRunner310(NPUModelRunner):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self._xlite_enabled = self.ascend_config.xlite_graph_config.enabled
+        if self._xlite_enabled:
+            self._validate_xlite_310p_config()
         self.input_batch = NPUInputBatch(
             max_num_reqs=self.max_num_reqs,
             max_model_len=max(self.model_config.max_model_len, self.max_encoder_len),
@@ -103,12 +111,109 @@ class NPUModelRunner310(NPUModelRunner):
             self.cudagraph_dispatcher.uniform_decode_query_len = _NGRAM_GRAPH_UNIFORM_DECODE_QUERY_LEN
             logger.info_once("Ngram speculative decoding uses uniform_decode_query_len=1 for graph capture.")
 
+    def _validate_xlite_310p_config(self) -> None:
+        errors: list[str] = []
+        parallel_config = self.vllm_config.parallel_config
+        if not self.ascend_config.xlite_graph_config.full_mode:
+            errors.append("xlite_graph_config.full_mode must be true")
+        if self.model_config.dtype != torch.float16:
+            errors.append(f"dtype must be float16, got {self.model_config.dtype}")
+        if parallel_config.tensor_parallel_size != 1:
+            errors.append("tensor_parallel_size must be 1")
+        if parallel_config.pipeline_parallel_size != 1:
+            errors.append("pipeline_parallel_size must be 1")
+        if parallel_config.data_parallel_size != 1:
+            errors.append("data_parallel_size must be 1")
+        if self.cache_config.block_size != _XLITE_310P_BLOCK_SIZE:
+            errors.append(f"block_size must be {_XLITE_310P_BLOCK_SIZE}")
+        if self.scheduler_config.max_num_seqs > _XLITE_310P_MAX_BATCH:
+            errors.append(f"max_num_seqs must be <= {_XLITE_310P_MAX_BATCH}")
+        if self.scheduler_config.max_num_batched_tokens > _XLITE_310P_MAX_BATCHED_TOKENS:
+            errors.append(f"max_num_batched_tokens must be <= {_XLITE_310P_MAX_BATCHED_TOKENS}")
+        if self.model_config.max_model_len > _XLITE_310P_MAX_MODEL_LEN:
+            errors.append(f"max_model_len must be <= {_XLITE_310P_MAX_MODEL_LEN}")
+        if self.vllm_config.quant_config is not None:
+            errors.append("quantization is not supported")
+        architectures = self.model_config.architectures
+        if architectures != [_XLITE_310P_ARCHITECTURE]:
+            errors.append(f"architecture must be {_XLITE_310P_ARCHITECTURE}, got {architectures}")
+        if errors:
+            raise ValueError("Invalid Ascend310P Xlite configuration: " + "; ".join(errors))
+
+    @staticmethod
+    def _convert_xlite_language_model_to_fp16_nd(model: nn.Module) -> None:
+        language_model = getattr(model, "language_model", None)
+        if language_model is None:
+            raise RuntimeError("Qwen3-ASR Xlite adapter cannot find runnable.language_model")
+        empty_or_zero: list[str] = []
+        for name, parameter in language_model.named_parameters():
+            data = parameter.data
+            if data.dtype != torch.float16:
+                data = data.to(dtype=torch.float16)
+            if torch_npu.get_npu_format(data) != ACL_FORMAT_FRACTAL_ND:
+                data = torch_npu.npu_format_cast(data, ACL_FORMAT_FRACTAL_ND)
+            parameter.data = data
+            if data.numel() == 0 or not bool(torch.any(data != 0).item()):
+                empty_or_zero.append(name)
+        if empty_or_zero:
+            raise RuntimeError(
+                "Xlite language-model parameters must be non-empty and non-zero: "
+                + ", ".join(empty_or_zero)
+            )
+        logger.info_once("Converted and validated Qwen3-ASR language-model weights as FP16 ND for Xlite.")
+
+    def load_model(self) -> None:
+        super().load_model()
+        if not self._xlite_enabled:
+            return
+        from vllm_ascend.xlite.xlite import XliteWrapper
+
+        raw_model = super().get_model()
+        self._convert_xlite_language_model_to_fp16_nd(raw_model)
+        self.model = XliteWrapper(raw_model, self.vllm_config)
+
+    def get_model(self) -> nn.Module:
+        if self._xlite_enabled:
+            from vllm_ascend.xlite.xlite import XliteWrapper
+
+            if isinstance(self.model, XliteWrapper):
+                return self.model.unwrap()
+        return super().get_model()
+
+    def initialize_kv_cache(
+        self,
+        kv_cache_config: KVCacheConfig,
+        is_profiling: bool = False,
+    ) -> None:
+        super().initialize_kv_cache(kv_cache_config, is_profiling=is_profiling)
+        if self._xlite_enabled:
+            self.model.register_kv_caches(self.kv_caches)
+
+    def _should_build_dummy_attn_metadata(
+        self,
+        force_attention: bool = False,
+        is_profile: bool = False,
+        cudagraph_runtime_mode: CUDAGraphMode | None = None,
+    ) -> bool:
+        base_condition = super()._should_build_dummy_attn_metadata(
+            force_attention, is_profile, cudagraph_runtime_mode
+        )
+        return base_condition or (self._xlite_enabled and not is_profile)
+
     @torch.inference_mode()
     def capture_model(self) -> int:
         graph_memory_bytes = super().capture_model()
+        return graph_memory_bytes + self.capture_audio_encoder_model()
+
+    @torch.inference_mode()
+    def capture_audio_encoder_model(self) -> int:
+        """Capture only the dedicated audio encoder graphs.
+
+        This remains callable when Xlite full mode disables decoder ACLGraph.
+        """
         audio_graph_sizes = self.ascend_config.audio_encoder_aclgraph_sizes
         if not audio_graph_sizes:
-            return graph_memory_bytes
+            return 0
 
         from vllm_ascend.patch.worker.patch_qwen3_audio_aclgraph_310p import (
             capture_audio_encoder_aclgraphs,
@@ -134,7 +239,7 @@ class NPUModelRunner310(NPUModelRunner):
             torch.npu.memory_reserved() - memory_before,
             0,
         )
-        return graph_memory_bytes + audio_graph_memory
+        return audio_graph_memory
 
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred = super()._update_states(scheduler_output)
@@ -700,6 +805,30 @@ class NPUModelRunner310(NPUModelRunner):
             static_forward_context=(self.compilation_config.static_forward_context),
         )
 
+    def _allocate_xlite_attention_cache(
+        self, num_blocks: int, kv_cache_spec: AttentionSpec
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if kv_cache_spec.block_size != _XLITE_310P_BLOCK_SIZE:
+            raise RuntimeError("Xlite 310P cache allocation requires logical block_size=128")
+        if kv_cache_spec.dtype != torch.float16:
+            raise RuntimeError(f"Xlite 310P KV cache must be FP16, got {kv_cache_spec.dtype}")
+        cache_shape = (
+            num_blocks,
+            kv_cache_spec.block_size,
+            kv_cache_spec.num_kv_heads,
+            kv_cache_spec.head_size,
+        )
+        kwargs = {
+            "size": cache_shape,
+            "dtype": kv_cache_spec.dtype,
+            "device": self.device,
+            "acl_format": ACL_FORMAT_FRACTAL_ND,
+        }
+        return (
+            torch_npu.empty_with_format(**kwargs),
+            torch_npu.empty_with_format(**kwargs),
+        )
+
     def initialize_kv_cache_tensors(self, kv_cache_config: KVCacheConfig) -> dict[str, torch.Tensor]:
         """
         Override the base class method.
@@ -782,6 +911,13 @@ class NPUModelRunner310(NPUModelRunner):
                     assert kv_cache_tensor.size % kv_cache_spec.page_size_bytes == 0
                     num_blocks = kv_cache_tensor.size // kv_cache_spec.page_size_bytes
                     assert num_blocks >= kv_cache_config.num_blocks
+                    if self._xlite_enabled:
+                        k_cache, v_cache = self._allocate_xlite_attention_cache(num_blocks, kv_cache_spec)
+                        for layer_name_inner in kv_cache_tensor.shared_by:
+                            if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
+                                kv_cache[layer_name_inner] = (k_cache, v_cache)
+                        continue
+
                     # Page attention operation on 310P limits block_size * head_size <= 128 * 128
                     supported_sizes = [
                         support_size
