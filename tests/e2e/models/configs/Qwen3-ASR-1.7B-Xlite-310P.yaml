@@ -1,0 +1,29 @@
+model_name: "Qwen/Qwen3-ASR-1.7B"
+model_type: "vllm-asr"
+hardware: "Ascend 310P"
+
+serve:
+  tensor_parallel_size: 1
+  dtype: float16
+  block_size: 128
+  max_model_len: 2048
+  max_num_seqs: 20
+  max_num_batched_tokens: 4096
+  enable_chunked_prefill: true
+  gpu_memory_utilization: 0.8
+  trust_remote_code: false
+  additional_config:
+    xlite_graph_config:
+      enabled: true
+      full_mode: true
+
+tasks:
+  - name: "librispeech_test_clean_xlite_310p"
+    dataset: "openslr/librispeech_asr"
+    split: "test"
+    dataset_config: "clean"
+    metrics:
+      - name: "wer"
+        value: 0.035
+
+limit: 100

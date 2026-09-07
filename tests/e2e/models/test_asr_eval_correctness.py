@@ -1,4 +1,5 @@
 import io
+import json
 import os
 import string
 from dataclasses import dataclass
@@ -65,6 +66,10 @@ def build_serve_args(eval_config: dict) -> list[str]:
         "trust_remote_code": "--trust-remote-code",
         "enforce_eager": "--enforce-eager",
         "quantization": "--quantization",
+        "block_size": "--block-size",
+        "max_num_seqs": "--max-num-seqs",
+        "max_num_batched_tokens": "--max-num-batched-tokens",
+        "enable_chunked_prefill": "--enable-chunked-prefill",
     }
     args: list[str] = []
     for key, flag in flag_map.items():
@@ -76,6 +81,8 @@ def build_serve_args(eval_config: dict) -> list[str]:
                 args.append(flag)
         else:
             args.extend([flag, str(value)])
+    if additional_config := serve_cfg.get("additional_config"):
+        args.extend(["--additional-config", json.dumps(additional_config)])
     return args
 
 

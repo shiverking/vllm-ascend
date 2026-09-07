@@ -108,3 +108,53 @@ In the current evaluation, **Qwen3-ASR-1.7B** processed **100 samples** in appro
 This result reflects end-to-end serving performance, including audio preprocessing, request construction, API communication, inference, and response parsing. Actual performance may vary depending on hardware, concurrency, audio length, and deployment configuration.
 
 Further benchmarking is recommended for latency distribution, concurrent throughput, long-audio scenarios, and system resource utilization.
+
+## Ascend 310P Xlite FP16 POC
+
+The 310P POC runs the audio encoder with the native vLLM-Ascend path and
+dispatches the complete language decoder and LM head to Xlite. It is limited to
+one device, FP16, 128-token KV blocks, at most 20 sequences, and a 2048-token
+context. Install an Xlite package whose build information reports
+`soc=Ascend310P3`, `kernel_set=llm_fp16`, `abi=1`, and
+`cache_layout=BSHD`; startup fails rather than silently falling back when this
+contract is not met.
+
+Start the correctness configuration with eager audio encoding:
+
+```bash
+vllm serve "Qwen/Qwen3-ASR-1.7B" \
+  --dtype float16 \
+  --tensor-parallel-size 1 \
+  --block-size 128 \
+  --max-model-len 2048 \
+  --max-num-seqs 20 \
+  --max-num-batched-tokens 4096 \
+  --enable-chunked-prefill \
+  --additional-config \
+  '{"xlite_graph_config":{"enabled":true,"full_mode":true}}' \
+  --port 8000
+```
+
+Verify a real WAV through the transcription API:
+
+```bash
+curl -sS http://127.0.0.1:8000/v1/audio/transcriptions \
+  -F "model=Qwen/Qwen3-ASR-1.7B" \
+  -F "file=@/absolute/path/to/audio.wav" \
+  -F "response_format=json"
+```
+
+For the performance configuration, add the dedicated audio encoder graph
+gears. Decoder eager mode does not disable these encoder-only captures:
+
+```bash
+--additional-config \
+'{"xlite_graph_config":{"enabled":true,"full_mode":true},"audio_encoder_aclgraph_sizes":[16,32,64,96,128]}'
+```
+
+Run the fixed 100-sample, 0--30 second benchmark three times at concurrency
+1/2/8/20 with `benchmarks/benchmark_qwen3_asr_xlite_310p.sh`. Set
+`CONFIG_LABEL` and restart the server for each of the four native/Xlite and
+eager/audio-graph configurations. Current Xlite build metadata explicitly
+reports `aclnn_per_request` while attention calls are serialized per request;
+this is the correctness fallback, not a claim of batched PromptFlashAttention.
