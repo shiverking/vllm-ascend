@@ -708,6 +708,7 @@ class XliteWrapper:
             "batch_distribution": dict(self.runtime_stats["batch_distribution"]),
             "fallback_reasons": dict(self.runtime_stats["fallback_reasons"]),
             "attention_backend": self.build_info.get("attention_backend"),
+            "runtime": dict(self.xlite_rt.get_stats()),
         }
         audio_tower = getattr(self.runnable, "audio_tower", None)
         audio_pool = getattr(audio_tower, "_ascend_audio_aclgraph_pool", None)
