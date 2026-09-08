@@ -592,6 +592,7 @@ class XliteWrapper:
         """
         self.runnable = runnable
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
+        self._allow_profile_fallback = False
         self.build_info = dict(get_build_info())
         self._validate_build_contract(vllm_config)
         self.runtime_stats: dict[str, Any] = {
@@ -736,20 +737,30 @@ class XliteWrapper:
         forward_context = get_forward_context()
         attn_metadata: Any = forward_context.attn_metadata
         if attn_metadata is None:
-            if self.full_mode:
+            if self.full_mode and not self._allow_profile_fallback:
                 raise RuntimeError("Xlite full mode requires Ascend attention metadata; refusing native fallback")
-            self.runtime_stats["fallback_reasons"]["missing_attention_metadata"] += 1
+            reason = "profile_without_kv_cache" if self._allow_profile_fallback else "missing_attention_metadata"
+            self.runtime_stats["fallback_reasons"][reason] += 1
+            if self._allow_profile_fallback:
+                logger.info_once(
+                    "Xlite uses the native model only for startup memory profiling before KV cache allocation."
+                )
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         attn_metadata = attn_metadata[0] if isinstance(attn_metadata, list) else attn_metadata
         attn_metadata = next(iter(attn_metadata.values()), None)
         if not isinstance(attn_metadata, self.adapter_xlite_model._attn_metadata_type):
-            if self.full_mode:
+            if self.full_mode and not self._allow_profile_fallback:
                 raise RuntimeError(
                     "Xlite full mode received incompatible attention metadata: "
                     f"{type(attn_metadata).__name__}"
                 )
-            self.runtime_stats["fallback_reasons"]["incompatible_attention_metadata"] += 1
+            reason = (
+                "profile_incompatible_attention_metadata"
+                if self._allow_profile_fallback
+                else "incompatible_attention_metadata"
+            )
+            self.runtime_stats["fallback_reasons"][reason] += 1
             return self.runnable(input_ids, positions, intermediate_tensors, inputs_embeds)
 
         with_prefill = attn_metadata.attn_state not in (

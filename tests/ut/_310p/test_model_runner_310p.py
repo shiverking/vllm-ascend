@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import AttentionSpec, MambaSpec
 
 from tests.ut.base import TestBase
 from vllm_ascend._310p.model_runner_310p import NPUModelRunner310
+from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
 def _prepare_inputs_source() -> str:
@@ -121,6 +122,21 @@ class TestNPUModelRunner310(TestBase):
         self.assertEqual(value.shape, key.shape)
         self.assertEqual(key.dtype, torch.float16)
         self.assertEqual(empty_with_format.call_count, 2)
+
+    def test_xlite_profile_fallback_is_scoped_to_dummy_profile(self):
+        runner = object.__new__(NPUModelRunner310)
+        runner._xlite_enabled = True
+        runner.model = SimpleNamespace(_allow_profile_fallback=False)
+
+        def inspect_profile_scope(*args, **kwargs):
+            self.assertTrue(runner.model._allow_profile_fallback)
+            return "profiled"
+
+        with patch.object(NPUModelRunner, "_dummy_run", side_effect=inspect_profile_scope):
+            result = runner._dummy_run(8, is_profile=True)
+
+        self.assertEqual(result, "profiled")
+        self.assertFalse(runner.model._allow_profile_fallback)
 
     def test_may_reinitialize_input_batch_expands_prefix_mamba_block_table(self):
         runner = object.__new__(NPUModelRunner310)

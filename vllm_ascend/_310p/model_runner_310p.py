@@ -743,6 +743,9 @@ class NPUModelRunner310(NPUModelRunner):
         )
         with temporary_context:
             self._mtp_spec_dummy_capture = mtp_spec_dummy_capture
+            xlite_profile_fallback = self._xlite_enabled and is_profile
+            if xlite_profile_fallback:
+                self.model._allow_profile_fallback = True
             try:
                 return super()._dummy_run(
                     num_tokens=num_tokens,
@@ -760,6 +763,8 @@ class NPUModelRunner310(NPUModelRunner):
                     profile_seq_lens=profile_seq_lens,
                 )
             finally:
+                if xlite_profile_fallback:
+                    self.model._allow_profile_fallback = False
                 self._mtp_spec_dummy_capture = False
 
     def _model_forward(
