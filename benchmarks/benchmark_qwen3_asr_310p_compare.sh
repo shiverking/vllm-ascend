@@ -20,6 +20,7 @@ SKIP_EXISTING="${SKIP_EXISTING:-1}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-20}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MODEL_MAX_LEN="${MODEL_MAX_LEN:-2048}"
+GPU_MEMORY_UTILIZATION=0.8
 AUDIO_GRAPH_SIZES="[26,52,78,128,256,384,512]"
 DECODE_GRAPH_SIZES="[1,2,4,8,16,20]"
 RUN_KIND="formal"
@@ -41,6 +42,8 @@ Options:
   --concurrencies "LIST"  Space-separated client concurrency values
   --num-prompts N         Measured requests per run
   --output-len N          Maximum generated tokens, including startup warmups
+  --gpu-memory-utilization FRACTION
+                         Server device memory budget in (0, 1] (default: 0.8)
   --repetitions N         Repetitions per concurrency (default: 1)
   --force                 Overwrite an existing result rather than skip it
   -h, --help              Show this help
@@ -64,12 +67,25 @@ while (( $# > 0 )); do
     --concurrencies) CONCURRENCIES="$2"; shift 2 ;;
     --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
     --output-len) OUTPUT_LEN="$2"; shift 2 ;;
+    --gpu-memory-utilization)
+      if (( $# < 2 )); then
+        echo "--gpu-memory-utilization requires a value in (0, 1]." >&2
+        exit 2
+      fi
+      GPU_MEMORY_UTILIZATION="$2"
+      shift 2
+      ;;
     --repetitions) REPETITIONS="$2"; shift 2 ;;
     --force) SKIP_EXISTING=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if ! [[ "${GPU_MEMORY_UTILIZATION}" =~ ^(0?\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
+  echo "Invalid --gpu-memory-utilization '${GPU_MEMORY_UTILIZATION}': expected a decimal in (0, 1]." >&2
+  exit 2
+fi
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
@@ -215,12 +231,14 @@ start_server() {
 
   log "Starting server configuration=${config}"
   log "Server log=${log_file}"
+  log "GPU memory utilization=${GPU_MEMORY_UTILIZATION}"
   log "Decoder slots=${MAX_NUM_SEQS}, batched tokens=${MAX_NUM_BATCHED_TOKENS}, audio graph sizes=${AUDIO_GRAPH_SIZES}"
   log "Cache policy: prefix cache disabled, multimodal processor cache disabled"
   # Process substitution keeps SERVER_PID attached to the setsid process while
   # tee mirrors the complete server log to both the terminal and the log file.
   setsid vllm serve "${MODEL}" \
     --dtype float16 \
+    --gpu-memory-utilization "${GPU_MEMORY_UTILIZATION}" \
     --tensor-parallel-size 1 \
     --block-size 128 \
     --max-model-len "${MODEL_MAX_LEN}" \
@@ -275,6 +293,7 @@ run_benchmark() {
       "configuration=${config}" \
       "client_concurrency=${concurrency}" \
       "server_max_num_seqs=${MAX_NUM_SEQS}" \
+      "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}" \
       "repetition=${repetition}" \
     2>&1 | tee "${RESULT_DIR}/client_logs/${stem}.log"
   log "[run ${RUN_NUMBER}] Finished ${stem}; result=${RESULT_DIR}/${stem}.json"
