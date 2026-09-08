@@ -603,6 +603,11 @@ class XliteGraphConfig:
     def __init__(self, xlite_graph_config, vllm_config):
         self.enabled = xlite_graph_config.get("enabled", False)
         self.full_mode = xlite_graph_config.get("full_mode", False)
+        self.decode_attention_backend = xlite_graph_config.get("decode_attention_backend", "legacy")
+        if self.decode_attention_backend not in ("legacy", "paged_310p"):
+            raise ValueError("decode_attention_backend must be legacy or paged_310p")
+        if self.decode_attention_backend == "paged_310p" and not (self.enabled and self.full_mode):
+            raise ValueError("paged_310p requires enabled Xlite full_mode")
         if self.enabled:
             if bool(vllm_config.speculative_config):
                 raise RuntimeError(

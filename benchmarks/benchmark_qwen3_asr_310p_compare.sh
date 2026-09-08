@@ -21,6 +21,7 @@ MAX_NUM_SEQS="${MAX_NUM_SEQS:-20}"
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MODEL_MAX_LEN="${MODEL_MAX_LEN:-2048}"
 GPU_MEMORY_UTILIZATION=0.8
+DECODE_ATTENTION_BACKEND=legacy
 AUDIO_GRAPH_SIZES="[26,52,78,128,256,384,512]"
 DECODE_GRAPH_SIZES="[1,2,4,8,16,20]"
 RUN_KIND="formal"
@@ -42,6 +43,8 @@ Options:
   --concurrencies "LIST"  Space-separated client concurrency values
   --num-prompts N         Measured requests per run
   --output-len N          Maximum generated tokens, including startup warmups
+  --decode-attention-backend BACKEND
+                         Xlite Decode: legacy or paged_310p (default: legacy)
   --gpu-memory-utilization FRACTION
                          Server device memory budget in (0, 1] (default: 0.8)
   --repetitions N         Repetitions per concurrency (default: 1)
@@ -67,6 +70,7 @@ while (( $# > 0 )); do
     --concurrencies) CONCURRENCIES="$2"; shift 2 ;;
     --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
     --output-len) OUTPUT_LEN="$2"; shift 2 ;;
+    --decode-attention-backend) DECODE_ATTENTION_BACKEND="${2:?backend required}"; shift 2 ;;
     --gpu-memory-utilization)
       if (( $# < 2 )); then
         echo "--gpu-memory-utilization requires a value in (0, 1]." >&2
@@ -81,6 +85,11 @@ while (( $# > 0 )); do
     *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+case "${DECODE_ATTENTION_BACKEND}" in
+  legacy|paged_310p) ;;
+  *) echo "Invalid decode attention backend: ${DECODE_ATTENTION_BACKEND}" >&2; exit 2 ;;
+esac
 
 if ! [[ "${GPU_MEMORY_UTILIZATION}" =~ ^(0?\.[0-9]*[1-9][0-9]*|1(\.0+)?)$ ]]; then
   echo "Invalid --gpu-memory-utilization '${GPU_MEMORY_UTILIZATION}': expected a decimal in (0, 1]." >&2
@@ -221,7 +230,7 @@ start_server() {
       ;;
     xlite_full)
       additional_config="{\"audio_encoder_aclgraph_sizes\":${AUDIO_GRAPH_SIZES},\
-\"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true}}"
+\"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\"}}"
       ;;
     *)
       echo "Unknown configuration: ${config}" >&2
@@ -232,6 +241,7 @@ start_server() {
   log "Starting server configuration=${config}"
   log "Server log=${log_file}"
   log "GPU memory utilization=${GPU_MEMORY_UTILIZATION}"
+  log "Xlite Decode backend=${DECODE_ATTENTION_BACKEND}; async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}; force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}; force_sync_aclnn=${XLITE_310P_FORCE_SYNC_ACLNN:-unset}"
   log "Decoder slots=${MAX_NUM_SEQS}, batched tokens=${MAX_NUM_BATCHED_TOKENS}, audio graph sizes=${AUDIO_GRAPH_SIZES}"
   log "Cache policy: prefix cache disabled, multimodal processor cache disabled"
   # Process substitution keeps SERVER_PID attached to the setsid process while
@@ -294,6 +304,9 @@ run_benchmark() {
       "client_concurrency=${concurrency}" \
       "server_max_num_seqs=${MAX_NUM_SEQS}" \
       "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}" \
+      "decode_attention_backend=${DECODE_ATTENTION_BACKEND}" \
+      "async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}" \
+      "force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}" \
       "repetition=${repetition}" \
     2>&1 | tee "${RESULT_DIR}/client_logs/${stem}.log"
   log "[run ${RUN_NUMBER}] Finished ${stem}; result=${RESULT_DIR}/${stem}.json"
