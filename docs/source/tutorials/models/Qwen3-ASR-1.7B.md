@@ -156,8 +156,18 @@ For a local-corpus comparison, run
 `benchmarks/benchmark_qwen3_asr_310p_compare.sh`. It restarts the server and
 compares native eager Decoder, native `FULL_DECODE_ONLY`, and Xlite full mode.
 All three configurations use the same audio encoder ACLGraphs. By default it
-runs 100 requests three times at client concurrency 1/2/4/8/16/20/32 and writes
-the per-request data plus a median `summary.csv`. The server-side
+runs 100 requests once at client concurrency 1/2/4/8/16/20/32 and writes the
+per-request data plus a `summary.csv`. The known model and local-corpus paths
+are defaults, so the formal comparison is one command:
+
+```bash
+bash benchmarks/benchmark_qwen3_asr_310p_compare.sh
+```
+
+Use `--smoke` for a 40-request startup check at concurrency 1/20/32. The
+script forces localhost health and benchmark requests to bypass inherited
+HTTP/HTTPS proxies, checks health every 20 seconds, and mirrors server logs to
+both the terminal and result directory. The server-side
 `max_num_seqs` remains 20 in every configuration, so concurrency 32 measures
 the same saturated 20-slot server with client-side queuing; it does not claim
 that the current Xlite POC supports a 32-request device batch.
