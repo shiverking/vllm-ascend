@@ -149,12 +149,19 @@ gears. Decoder eager mode does not disable these encoder-only captures:
 
 ```bash
 --additional-config \
-'{"xlite_graph_config":{"enabled":true,"full_mode":true},"audio_encoder_aclgraph_sizes":[16,32,64,96,128]}'
+'{"xlite_graph_config":{"enabled":true,"full_mode":true},"audio_encoder_aclgraph_sizes":[26,52,78,128,256,384,512]}'
 ```
 
-Run the fixed 100-sample, 0--30 second benchmark three times at concurrency
-1/2/8/20 with `benchmarks/benchmark_qwen3_asr_xlite_310p.sh`. Set
-`CONFIG_LABEL` and restart the server for each of the four native/Xlite and
-eager/audio-graph configurations. Current Xlite build metadata explicitly
-reports `aclnn_per_request` while attention calls are serialized per request;
-this is the correctness fallback, not a claim of batched PromptFlashAttention.
+For a local-corpus comparison, run
+`benchmarks/benchmark_qwen3_asr_310p_compare.sh`. It restarts the server and
+compares native eager Decoder, native `FULL_DECODE_ONLY`, and Xlite full mode.
+All three configurations use the same audio encoder ACLGraphs. By default it
+runs 100 requests three times at client concurrency 1/2/4/8/16/20/32 and writes
+the per-request data plus a median `summary.csv`. The server-side
+`max_num_seqs` remains 20 in every configuration, so concurrency 32 measures
+the same saturated 20-slot server with client-side queuing; it does not claim
+that the current Xlite POC supports a 32-request device batch.
+
+Current Xlite build metadata explicitly reports `aclnn_per_request` while
+attention calls are serialized per request; this is the correctness fallback,
+not a claim of batched PromptFlashAttention.
