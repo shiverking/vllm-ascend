@@ -8,11 +8,11 @@ MODEL="${MODEL:-/home/models/Qwen3-ASR-1.7B}"
 AUDIO_DIR="${AUDIO_DIR:-/home/y00899301/vllm_omni_debug/Qwen3-ASR-310P/test/asr/performance/corpus/en}"
 PORT="${PORT:-1025}"
 RESULT_DIR="${RESULT_DIR:-}"
-CONCURRENCIES="${CONCURRENCIES:-1 2 4 8 16 20 32}"
+CONCURRENCIES="${CONCURRENCIES:-1 2 4 8 16 20}"
 CONFIGS="${CONFIGS:-native_eager native_full_decode_only xlite_full}"
 REPETITIONS="${REPETITIONS:-1}"
 NUM_PROMPTS="${NUM_PROMPTS:-100}"
-NUM_WARMUPS="${NUM_WARMUPS:-10}"
+WARMUP_REQUESTS=2
 OUTPUT_LEN="${OUTPUT_LEN:-256}"
 SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-1200}"
 HEALTH_CHECK_INTERVAL="${HEALTH_CHECK_INTERVAL:-20}"
@@ -29,10 +29,10 @@ usage() {
 Usage: benchmark_qwen3_asr_310p_compare.sh [options]
 
 With no options, runs the formal 3-configuration comparison once at client
-concurrency 1/2/4/8/16/20/32 using the known model and corpus paths.
+concurrency 1/2/4/8/16/20 using the known model and corpus paths.
 
 Options:
-  --smoke                 Run 40 requests at concurrency 1/20/32, 2 warmups
+  --smoke                 Run 40 requests at concurrency 1/8/20
   --model PATH            Model path
   --audio-dir PATH        Directory containing local audio files
   --port PORT             Local serving port (default: 1025)
@@ -40,7 +40,6 @@ Options:
   --configs "LIST"        Space-separated configurations
   --concurrencies "LIST"  Space-separated client concurrency values
   --num-prompts N         Measured requests per run
-  --num-warmups N         Warmup requests per run
   --repetitions N         Repetitions per concurrency (default: 1)
   --force                 Overwrite an existing result rather than skip it
   -h, --help              Show this help
@@ -51,9 +50,8 @@ while (( $# > 0 )); do
   case "$1" in
     --smoke)
       RUN_KIND="smoke"
-      CONCURRENCIES="1 20 32"
+      CONCURRENCIES="1 8 20"
       NUM_PROMPTS=40
-      NUM_WARMUPS=2
       REPETITIONS=1
       shift
       ;;
@@ -64,7 +62,6 @@ while (( $# > 0 )); do
     --configs) CONFIGS="$2"; shift 2 ;;
     --concurrencies) CONCURRENCIES="$2"; shift 2 ;;
     --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
-    --num-warmups) NUM_WARMUPS="$2"; shift 2 ;;
     --repetitions) REPETITIONS="$2"; shift 2 ;;
     --force) SKIP_EXISTING=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -76,6 +73,8 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 RUN_ID="$(date +%Y%m%d-%H%M%S)"
 RESULT_DIR="${RESULT_DIR:-benchmark_results/qwen3_asr_310p_${RUN_KIND}_${RUN_ID}}"
 DATASET="${RESULT_DIR}/audio_manifest.jsonl"
+WARMUP_AUDIO_PATH_FILE="${RESULT_DIR}/warmup_audio.txt"
+WARMUP_AUDIO=""
 SERVER_PID=""
 RUN_NUMBER=0
 
@@ -88,11 +87,21 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
-mkdir -p "${RESULT_DIR}/server_logs" "${RESULT_DIR}/client_logs"
+mkdir -p "${RESULT_DIR}/server_logs" "${RESULT_DIR}/client_logs" \
+  "${RESULT_DIR}/warmup_responses"
 
 log "Preparing deterministic local audio manifest"
 python3 "${SCRIPT_DIR}/prepare_qwen3_asr_audio_dataset.py" \
-  --audio-dir "${AUDIO_DIR}" --output "${DATASET}"
+  --audio-dir "${AUDIO_DIR}" --output "${DATASET}" \
+  --warmup-output "${WARMUP_AUDIO_PATH_FILE}"
+WARMUP_AUDIO="$(<"${WARMUP_AUDIO_PATH_FILE}")"
+
+for concurrency in ${CONCURRENCIES}; do
+  if (( concurrency < 1 || concurrency > MAX_NUM_SEQS )); then
+    echo "Client concurrency ${concurrency} is outside [1, ${MAX_NUM_SEQS}]." >&2
+    exit 2
+  fi
+done
 
 stop_server() {
   if [[ -z "${SERVER_PID}" ]]; then
@@ -145,6 +154,25 @@ wait_for_server() {
   done
 }
 
+warm_up_server() {
+  local config="$1"
+  local warmup_index
+  local response_file
+
+  log "Running ${WARMUP_REQUESTS} startup warmups with held-out audio=${WARMUP_AUDIO}"
+  for warmup_index in $(seq 1 "${WARMUP_REQUESTS}"); do
+    response_file="${RESULT_DIR}/warmup_responses/${config}-${warmup_index}.json"
+    log "Warmup ${warmup_index}/${WARMUP_REQUESTS} for ${config}"
+    curl --noproxy '*' --silent --show-error --fail \
+      "http://127.0.0.1:${PORT}/v1/audio/transcriptions" \
+      --form-string "model=${MODEL}" \
+      --form "file=@${WARMUP_AUDIO}" \
+      --form-string "response_format=json" \
+      --output "${response_file}"
+  done
+  log "Startup warmups completed for ${config}"
+}
+
 start_server() {
   local config="$1"
   local log_file="${RESULT_DIR}/server_logs/${config}.log"
@@ -184,6 +212,7 @@ start_server() {
   log "Starting server configuration=${config}"
   log "Server log=${log_file}"
   log "Decoder slots=${MAX_NUM_SEQS}, batched tokens=${MAX_NUM_BATCHED_TOKENS}, audio graph sizes=${AUDIO_GRAPH_SIZES}"
+  log "Cache policy: prefix cache disabled, multimodal processor cache disabled"
   # Process substitution keeps SERVER_PID attached to the setsid process while
   # tee mirrors the complete server log to both the terminal and the log file.
   setsid vllm serve "${MODEL}" \
@@ -194,12 +223,15 @@ start_server() {
     --max-num-seqs "${MAX_NUM_SEQS}" \
     --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --enable-chunked-prefill \
+    --no-enable-prefix-caching \
+    --mm-processor-cache-gb 0 \
     --additional-config "${additional_config}" \
     --port "${PORT}" \
     "${extra_args[@]}" > >(tee "${log_file}") 2>&1 &
   SERVER_PID=$!
   log "Server PID=${SERVER_PID}; health checks bypass HTTP/HTTPS proxies"
   wait_for_server
+  warm_up_server "${config}"
 }
 
 run_benchmark() {
@@ -214,7 +246,7 @@ run_benchmark() {
     return
   fi
 
-  log "[run ${RUN_NUMBER}] Starting ${stem}: warmups=${NUM_WARMUPS}, measured requests=${NUM_PROMPTS}"
+  log "[run ${RUN_NUMBER}] Starting ${stem}: measured requests=${NUM_PROMPTS}"
   vllm bench serve \
     --backend openai-audio \
     --endpoint /v1/audio/transcriptions \
@@ -225,11 +257,10 @@ run_benchmark() {
     --dataset-path "${DATASET}" \
     --disable-shuffle \
     --output-len "${OUTPUT_LEN}" \
-    --num-warmups "${NUM_WARMUPS}" \
+    --num-warmups 0 \
     --num-prompts "${NUM_PROMPTS}" \
     --request-rate inf \
     --max-concurrency "${concurrency}" \
-    --temperature 0 \
     --percentile-metrics ttft,tpot,itl,e2el \
     --metric-percentiles 50,90,99 \
     --save-result \

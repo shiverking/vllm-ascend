@@ -15,6 +15,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--audio-dir", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--warmup-output",
+        type=Path,
+        help="Reserve the last sorted audio file and write its path here",
+    )
     parser.add_argument("--limit", type=int, default=0, help="0 means all files")
     args = parser.parse_args()
 
@@ -29,10 +34,19 @@ def main() -> int:
         for path in audio_dir.rglob("*")
         if path.is_file() and path.suffix.lower() in SUPPORTED_SUFFIXES
     )
-    if args.limit:
-        audio_files = audio_files[: args.limit]
     if not audio_files:
         parser.error(f"no supported audio files found below: {audio_dir}")
+
+    warmup_audio = None
+    if args.warmup_output is not None:
+        if len(audio_files) < 2:
+            parser.error("at least two audio files are required to reserve warmup audio")
+        warmup_audio = audio_files.pop()
+        args.warmup_output.parent.mkdir(parents=True, exist_ok=True)
+        args.warmup_output.write_text(str(warmup_audio) + "\n", encoding="utf-8")
+
+    if args.limit:
+        audio_files = audio_files[: args.limit]
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("w", encoding="utf-8", newline="\n") as output:
@@ -46,6 +60,8 @@ def main() -> int:
             )
 
     print(f"Wrote {len(audio_files)} audio samples to {args.output}")
+    if warmup_audio is not None:
+        print(f"Reserved warmup-only audio: {warmup_audio}")
     return 0
 
 
