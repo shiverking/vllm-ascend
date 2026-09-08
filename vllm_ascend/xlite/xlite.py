@@ -594,8 +594,14 @@ class XliteWrapper:
         self.runnable = runnable
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
         self.decode_attention_backend = get_ascend_config().xlite_graph_config.decode_attention_backend
+        self.matmul_optimization = get_ascend_config().xlite_graph_config.matmul_optimization
         self._allow_profile_fallback = False
         self.build_info = dict(get_build_info())
+        if self.matmul_optimization == "p3_aclnn" and not (
+            self.build_info.get("soc") == "Ascend310P3" and self.build_info.get("p3_aclnn") is True
+            and hasattr(Runtime, "set_matmul_optimization")
+        ):
+            raise RuntimeError(f"Xlite build does not support P3 ACLNN: {self.build_info}")
         validate_paged_decode_build(self.decode_attention_backend, self.build_info, Runtime)
         self._validate_build_contract(vllm_config)
         self.runtime_stats: dict[str, Any] = {
@@ -611,6 +617,15 @@ class XliteWrapper:
         self.xlite_rt = Runtime(local_rank, 0, rank, get_tensor_model_parallel_world_size(), self.data_parallel_size)
         if hasattr(self.xlite_rt, "set_decode_attention_backend"):
             self.xlite_rt.set_decode_attention_backend(self.decode_attention_backend)
+        self.matmul_policy_info = {"mode": "legacy"}
+        if self.matmul_optimization == "p3_aclnn":
+            from xlite.p3 import configure
+
+            self.matmul_policy_info = configure(
+                self.xlite_rt, self.matmul_optimization,
+                get_ascend_config().xlite_graph_config.matmul_policy,
+            )
+            logger.info("Xlite P3 MatMul policy: %s", self.matmul_policy_info)
 
         self.adapter_xlite_model = get_adapter_xlite_model(runnable, vllm_config)
         (self.xlite_model, self.freq_cis, hidden_size, dtype) = self.adapter_xlite_model.initialize()
@@ -713,6 +728,7 @@ class XliteWrapper:
         """Return a JSON-serializable snapshot used by performance reports."""
         stats = {
             "build_info": self.build_info,
+            "matmul_policy": self.matmul_policy_info,
             "prefill_requests": self.runtime_stats["prefill_requests"],
             "decode_requests": self.runtime_stats["decode_requests"],
             "batch_distribution": dict(self.runtime_stats["batch_distribution"]),
@@ -851,8 +867,8 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        if self.decode_attention_backend == "paged_310p":
+        if self.decode_attention_backend == "paged_310p" or self.matmul_optimization == "p3_aclnn":
             forwards = sum(self.runtime_stats["batch_distribution"].values())
             if forwards == 1 or forwards % 128 == 0:
-                logger.info("Xlite P2 runtime stats: %s", self.get_xlite_runtime_stats())
+                logger.info("Xlite optimization runtime stats: %s", self.get_xlite_runtime_stats())
         return h[:num_actual_tokens]

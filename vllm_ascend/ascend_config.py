@@ -604,6 +604,16 @@ class XliteGraphConfig:
         self.enabled = xlite_graph_config.get("enabled", False)
         self.full_mode = xlite_graph_config.get("full_mode", False)
         self.decode_attention_backend = xlite_graph_config.get("decode_attention_backend", "legacy")
+        self.matmul_optimization = xlite_graph_config.get("matmul_optimization", "legacy")
+        self.matmul_policy = xlite_graph_config.get("matmul_policy")
+        if self.matmul_optimization not in ("legacy", "p3_aclnn"):
+            raise ValueError("matmul_optimization must be legacy or p3_aclnn")
+        if self.matmul_policy and self.matmul_optimization != "p3_aclnn":
+            raise ValueError("matmul_policy requires p3_aclnn")
+        if self.matmul_optimization == "p3_aclnn" and not (
+            self.enabled and self.full_mode and self.decode_attention_backend == "legacy"
+        ):
+            raise ValueError("P3 requires enabled full_mode with legacy Attention")
         if self.decode_attention_backend not in ("legacy", "paged_310p"):
             raise ValueError("decode_attention_backend must be legacy or paged_310p")
         if self.decode_attention_backend == "paged_310p" and not (self.enabled and self.full_mode):

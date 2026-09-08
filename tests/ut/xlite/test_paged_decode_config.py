@@ -25,6 +25,17 @@ class PagedDecodeConfigTest(unittest.TestCase):
 
     def test_legacy_default(self):
         self.assertEqual(self.config({}).decode_attention_backend, "legacy")
+        self.assertEqual(self.config({}).matmul_optimization, "legacy")
+
+    def test_p3_config(self):
+        config = self.config({"enabled": True, "full_mode": True, "matmul_optimization": "p3_aclnn"})
+        self.assertEqual(config.matmul_optimization, "p3_aclnn")
+        for values in ({"matmul_optimization": "bad"}, {"matmul_policy": "x.json"},
+                       {"matmul_optimization": "p3_aclnn"},
+                       {"enabled": True, "full_mode": True, "matmul_optimization": "p3_aclnn",
+                        "decode_attention_backend": "paged_310p"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
 
     def test_paged_full_mode(self):
         self.assertEqual(self.config({"enabled": True, "full_mode": True,
