@@ -40,6 +40,7 @@ Options:
   --configs "LIST"        Space-separated configurations
   --concurrencies "LIST"  Space-separated client concurrency values
   --num-prompts N         Measured requests per run
+  --output-len N          Maximum generated tokens, including startup warmups
   --repetitions N         Repetitions per concurrency (default: 1)
   --force                 Overwrite an existing result rather than skip it
   -h, --help              Show this help
@@ -62,6 +63,7 @@ while (( $# > 0 )); do
     --configs) CONFIGS="$2"; shift 2 ;;
     --concurrencies) CONCURRENCIES="$2"; shift 2 ;;
     --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
+    --output-len) OUTPUT_LEN="$2"; shift 2 ;;
     --repetitions) REPETITIONS="$2"; shift 2 ;;
     --force) SKIP_EXISTING=0; shift ;;
     -h|--help) usage; exit 0 ;;
@@ -160,6 +162,7 @@ warm_up_server() {
   local response_file
 
   log "Running ${WARMUP_REQUESTS} startup warmups with held-out audio=${WARMUP_AUDIO}"
+  log "Warmup generation limit=${OUTPUT_LEN} tokens"
   for warmup_index in $(seq 1 "${WARMUP_REQUESTS}"); do
     response_file="${RESULT_DIR}/warmup_responses/${config}-${warmup_index}.json"
     log "Warmup ${warmup_index}/${WARMUP_REQUESTS} for ${config}"
@@ -168,6 +171,7 @@ warm_up_server() {
       --form-string "model=${MODEL}" \
       --form "file=@${WARMUP_AUDIO}" \
       --form-string "response_format=json" \
+      --form-string "max_completion_tokens=${OUTPUT_LEN}" \
       --output "${response_file}"
   done
   log "Startup warmups completed for ${config}"
