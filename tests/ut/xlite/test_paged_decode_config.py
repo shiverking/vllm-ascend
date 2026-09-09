@@ -64,8 +64,15 @@ class PagedDecodeConfigTest(unittest.TestCase):
                          "decode_attention_backend": "native_atb"}).decode_attention_backend,
             "native_atb")
 
+    def test_direct_atb_full_mode(self):
+        self.assertEqual(
+            self.config({"enabled": True, "full_mode": True,
+                         "decode_attention_backend": "direct_atb"}).decode_attention_backend,
+            "direct_atb")
+
     def test_invalid_and_decode_only_rejected(self):
         for values in ({"decode_attention_backend": "unknown"},
+                       {"decode_attention_backend": "direct_atb"},
                        {"decode_attention_backend": "native_atb"},
                        {"decode_attention_backend": "paged_310p"},
                        {"enabled": True, "decode_attention_backend": "paged_310p"}):
@@ -102,6 +109,14 @@ class PagedDecodeConfigTest(unittest.TestCase):
         module.validate_paged_decode_build("native_atb", native, runtime)
         with self.assertRaises(RuntimeError):
             module.validate_paged_decode_build("native_atb", {}, runtime)
+        direct = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
+                  "cache_layout": "BSHD", "direct_decode_attention": True,
+                  "native_decode_cache_layout": "NZ_5D",
+                  "direct_atb_task_queue_independent": True,
+                  "decode_attention_backends": ("direct_atb", "legacy")}
+        module.validate_paged_decode_build("direct_atb", direct, runtime)
+        with self.assertRaises(RuntimeError):
+            module.validate_paged_decode_build("direct_atb", {}, runtime)
 
 
 if __name__ == "__main__":

@@ -738,10 +738,11 @@ class XliteWrapper:
             kv_caches (Any): Runtime KV cache handles or tensors.
         """
         self.kv_caches = kv_caches
-        if self.decode_attention_backend != "native_atb":
+        if self.decode_attention_backend not in ("native_atb", "direct_atb"):
             return
         if not hasattr(self.xlite_model, "set_native_kv_cache_310p"):
-            raise RuntimeError("native_atb requires Xlite Model.set_native_kv_cache_310p")
+            raise RuntimeError(
+                f"{self.decode_attention_backend} requires Xlite Model.set_native_kv_cache_310p")
         native_caches = []
         for layer, cache_pair in enumerate(kv_caches):
             if len(cache_pair) != 2:
@@ -766,7 +767,8 @@ class XliteWrapper:
             ])
         self.native_decode_kv_caches = native_caches
         self.xlite_model.set_native_kv_cache_310p(native_caches)
-        logger.info("Xlite native_atb registered %d layers of 5D/NZ decode KV cache", len(native_caches))
+        logger.info("Xlite %s registered %d layers of 5D/NZ decode KV cache",
+                    self.decode_attention_backend, len(native_caches))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the TP1 FP16 LM head through Xlite."""
@@ -926,7 +928,7 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        if (self.decode_attention_backend in ("paged_310p", "native_atb")
+        if (self.decode_attention_backend in ("paged_310p", "native_atb", "direct_atb")
                 or self.matmul_optimization == "p3_aclnn"
                 or self.matmul_backend in ("m200_asr", "aclnn")):
             forwards = sum(self.runtime_stats["batch_distribution"].values())

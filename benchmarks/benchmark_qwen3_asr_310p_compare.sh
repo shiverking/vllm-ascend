@@ -47,7 +47,7 @@ Options:
   --num-prompts N         Measured requests per run
   --output-len N          Maximum generated tokens, including startup warmups
   --decode-attention-backend BACKEND
-                         Xlite Decode: legacy, native_atb, batched_aclnn or paged_310p (default: legacy)
+                         Xlite Decode: legacy, direct_atb, native_atb, batched_aclnn or paged_310p (default: legacy)
   --matmul-backend BACKEND
                          Xlite MatMul: m200_asr or aclnn (default: m200_asr)
   --matmul-optimization MODE
@@ -98,7 +98,7 @@ while (( $# > 0 )); do
 done
 
 case "${DECODE_ATTENTION_BACKEND}" in
-  legacy|native_atb|batched_aclnn|paged_310p) ;;
+  legacy|direct_atb|native_atb|batched_aclnn|paged_310p) ;;
   *) echo "Invalid decode attention backend: ${DECODE_ATTENTION_BACKEND}" >&2; exit 2 ;;
 esac
 case "${MATMUL_BACKEND}" in
