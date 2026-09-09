@@ -32,6 +32,7 @@ from vllm.distributed import get_ep_group, get_tensor_model_parallel_world_size,
 from vllm.forward_context import get_forward_context
 from vllm.logger import logger
 from vllm.sequence import IntermediateTensors
+from xlite import _C as xlite_C
 from xlite._C import AttnMeta, AttnMHA, Runtime, ScoringFuncSigmoid, ScoringFuncSoftmax, get_build_info
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -52,6 +53,24 @@ XliteForwardResult: TypeAlias = torch.Tensor | IntermediateTensors | tuple[torch
 
 _architecture_strategy_map: dict[str, type[XliteModel]] = {}
 """Mapping from model architecture names in `config.json` to their corresponding xlite adapter classes."""
+
+
+def _get_native_runtime_stats(runtime: Runtime) -> dict[str, Any]:
+    """Read runtime counters across supported Xlite ABI variants.
+
+    Older POC builds expose ``Runtime.get_stats()``, while the AtomGit-based
+    310P build exposes ``get_310p_matmul_stats(runtime)`` at module scope.
+    Runtime counters are diagnostic only and must never prevent model startup.
+    """
+    getter = getattr(runtime, "get_stats", None)
+    if callable(getter):
+        return dict(getter())
+
+    getter = getattr(xlite_C, "get_310p_matmul_stats", None)
+    if callable(getter):
+        return dict(getter(runtime))
+
+    return {}
 
 
 class XliteModel(ABC):
@@ -638,7 +657,7 @@ class XliteWrapper:
         logger.info(
             "Xlite decode backend=%s; runtime policy=%s",
             self.decode_attention_backend,
-            dict(self.xlite_rt.get_stats()),
+            _get_native_runtime_stats(self.xlite_rt),
         )
 
         max_num_tokens = vllm_config.scheduler_config.max_num_batched_tokens
@@ -734,7 +753,7 @@ class XliteWrapper:
             "batch_distribution": dict(self.runtime_stats["batch_distribution"]),
             "fallback_reasons": dict(self.runtime_stats["fallback_reasons"]),
             "attention_backend": self.build_info.get("attention_backend"),
-            "runtime": dict(self.xlite_rt.get_stats()),
+            "runtime": _get_native_runtime_stats(self.xlite_rt),
         }
         audio_tower = getattr(self.runnable, "audio_tower", None)
         audio_pool = getattr(audio_tower, "_ascend_audio_aclgraph_pool", None)
