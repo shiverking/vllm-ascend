@@ -617,10 +617,14 @@ class XliteGraphConfig:
             self.enabled and self.full_mode and self.decode_attention_backend == "legacy"
         ):
             raise ValueError("P3 requires enabled full_mode with legacy Attention")
-        if self.decode_attention_backend not in ("legacy", "paged_310p"):
-            raise ValueError("decode_attention_backend must be legacy or paged_310p")
-        if self.decode_attention_backend == "paged_310p" and not (self.enabled and self.full_mode):
-            raise ValueError("paged_310p requires enabled Xlite full_mode")
+        if self.decode_attention_backend not in ("legacy", "batched_aclnn", "paged_310p"):
+            raise ValueError(
+                "decode_attention_backend must be legacy, batched_aclnn or paged_310p")
+        if self.decode_attention_backend in ("batched_aclnn", "paged_310p") and not (
+            self.enabled and self.full_mode
+        ):
+            raise ValueError(
+                f"{self.decode_attention_backend} requires enabled Xlite full_mode")
         if self.enabled:
             if bool(vllm_config.speculative_config):
                 raise RuntimeError(

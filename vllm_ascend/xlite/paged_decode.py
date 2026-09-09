@@ -2,6 +2,16 @@
 
 
 def validate_paged_decode_build(backend, build_info, runtime_type):
+    if backend == "batched_aclnn":
+        expected = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
+                    "cache_layout": "BSHD", "batched_decode_attention": True}
+        supported = tuple(build_info.get("decode_attention_backends", ()))
+        if (any(build_info.get(key) != value for key, value in expected.items())
+                or backend not in supported
+                or not hasattr(runtime_type, "set_decode_attention_backend")):
+            raise RuntimeError(
+                f"Xlite build does not support batched_aclnn: {build_info}")
+        return
     if backend != "paged_310p":
         return
     expected = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,

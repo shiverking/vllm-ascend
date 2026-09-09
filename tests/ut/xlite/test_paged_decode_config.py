@@ -48,6 +48,16 @@ class PagedDecodeConfigTest(unittest.TestCase):
                                      "decode_attention_backend": "paged_310p"}).decode_attention_backend,
                          "paged_310p")
 
+    def test_batched_aclnn_full_mode(self):
+        self.assertEqual(
+            self.config({"enabled": True, "full_mode": True,
+                         "decode_attention_backend": "batched_aclnn"}).decode_attention_backend,
+            "batched_aclnn")
+        for values in ({"decode_attention_backend": "batched_aclnn"},
+                       {"enabled": True, "decode_attention_backend": "batched_aclnn"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
+
     def test_invalid_and_decode_only_rejected(self):
         for values in ({"decode_attention_backend": "unknown"},
                        {"decode_attention_backend": "paged_310p"},
@@ -72,6 +82,12 @@ class PagedDecodeConfigTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             module.validate_paged_decode_build("paged_310p", valid, SimpleNamespace())
         module.validate_paged_decode_build("legacy", {}, SimpleNamespace())
+        batched = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
+                   "cache_layout": "BSHD", "batched_decode_attention": True,
+                   "decode_attention_backends": ("batched_aclnn", "legacy")}
+        module.validate_paged_decode_build("batched_aclnn", batched, runtime)
+        with self.assertRaises(RuntimeError):
+            module.validate_paged_decode_build("batched_aclnn", {}, runtime)
 
 
 if __name__ == "__main__":
