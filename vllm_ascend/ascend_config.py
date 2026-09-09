@@ -604,6 +604,9 @@ class XliteGraphConfig:
         self.enabled = xlite_graph_config.get("enabled", False)
         self.full_mode = xlite_graph_config.get("full_mode", False)
         self.decode_attention_backend = xlite_graph_config.get("decode_attention_backend", "legacy")
+        self.matmul_backend = xlite_graph_config.get("matmul_backend", "m200_asr")
+        if self.matmul_backend not in ("m200_asr", "aclnn"):
+            raise ValueError("matmul_backend must be m200_asr or aclnn")
         self.matmul_optimization = xlite_graph_config.get("matmul_optimization", "legacy")
         self.matmul_policy = xlite_graph_config.get("matmul_policy")
         if self.matmul_optimization not in ("legacy", "p3_aclnn"):

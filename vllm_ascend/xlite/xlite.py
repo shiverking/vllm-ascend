@@ -613,6 +613,7 @@ class XliteWrapper:
         self.runnable = runnable
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
         self.decode_attention_backend = get_ascend_config().xlite_graph_config.decode_attention_backend
+        self.matmul_backend = get_ascend_config().xlite_graph_config.matmul_backend
         self.matmul_optimization = get_ascend_config().xlite_graph_config.matmul_optimization
         self._allow_profile_fallback = False
         self.build_info = dict(get_build_info())
@@ -621,6 +622,13 @@ class XliteWrapper:
             and hasattr(Runtime, "set_matmul_optimization")
         ):
             raise RuntimeError(f"Xlite build does not support P3 ACLNN: {self.build_info}")
+        if str(self.build_info.get("soc", "")).lower().startswith("ascend310p"):
+            supported_matmul_backends = tuple(self.build_info.get("matmul_backends", ()))
+            if (not hasattr(Runtime, "set_matmul_backend_310p")
+                    or self.matmul_backend not in supported_matmul_backends):
+                raise RuntimeError(
+                    "Xlite build does not support requested 310P MatMul backend "
+                    f"{self.matmul_backend!r}: {self.build_info}")
         validate_paged_decode_build(self.decode_attention_backend, self.build_info, Runtime)
         self._validate_build_contract(vllm_config)
         self.runtime_stats: dict[str, Any] = {
@@ -634,6 +642,8 @@ class XliteWrapper:
         local_rank = get_world_group().local_rank
         self.data_parallel_size = vllm_config.parallel_config.data_parallel_size
         self.xlite_rt = Runtime(local_rank, 0, rank, get_tensor_model_parallel_world_size(), self.data_parallel_size)
+        if hasattr(self.xlite_rt, "set_matmul_backend_310p"):
+            self.xlite_rt.set_matmul_backend_310p(self.matmul_backend)
         if hasattr(self.xlite_rt, "set_decode_attention_backend"):
             self.xlite_rt.set_decode_attention_backend(self.decode_attention_backend)
         self.matmul_policy_info = {"mode": "legacy"}
@@ -655,8 +665,9 @@ class XliteWrapper:
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB")
         logger.info(
-            "Xlite decode backend=%s; runtime policy=%s",
+            "Xlite decode backend=%s; MatMul backend=%s; runtime policy=%s",
             self.decode_attention_backend,
+            self.matmul_backend,
             _get_native_runtime_stats(self.xlite_rt),
         )
 
@@ -886,7 +897,9 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        if self.decode_attention_backend == "paged_310p" or self.matmul_optimization == "p3_aclnn":
+        if (self.decode_attention_backend == "paged_310p"
+                or self.matmul_optimization == "p3_aclnn"
+                or self.matmul_backend in ("m200_asr", "aclnn")):
             forwards = sum(self.runtime_stats["batch_distribution"].values())
             if forwards == 1 or forwards % 128 == 0:
                 logger.info("Xlite optimization runtime stats: %s", self.get_xlite_runtime_stats())

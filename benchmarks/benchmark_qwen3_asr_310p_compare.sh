@@ -22,6 +22,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MODEL_MAX_LEN="${MODEL_MAX_LEN:-2048}"
 GPU_MEMORY_UTILIZATION=0.8
 DECODE_ATTENTION_BACKEND=legacy
+MATMUL_BACKEND=m200_asr
 MATMUL_OPTIMIZATION=legacy
 MATMUL_POLICY=""
 AUDIO_GRAPH_SIZES="[26,52,78,128,256,384,512]"
@@ -47,6 +48,8 @@ Options:
   --output-len N          Maximum generated tokens, including startup warmups
   --decode-attention-backend BACKEND
                          Xlite Decode: legacy or paged_310p (default: legacy)
+  --matmul-backend BACKEND
+                         Xlite MatMul: m200_asr or aclnn (default: m200_asr)
   --matmul-optimization MODE
                          legacy or p3_aclnn (default: legacy)
   --matmul-policy PATH    Offline P3 policy JSON on the serving host
@@ -76,6 +79,7 @@ while (( $# > 0 )); do
     --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
     --output-len) OUTPUT_LEN="$2"; shift 2 ;;
     --decode-attention-backend) DECODE_ATTENTION_BACKEND="${2:?backend required}"; shift 2 ;;
+    --matmul-backend) MATMUL_BACKEND="${2:?backend required}"; shift 2 ;;
     --matmul-optimization) MATMUL_OPTIMIZATION="${2:?mode required}"; shift 2 ;;
     --matmul-policy) MATMUL_POLICY="${2:?policy required}"; shift 2 ;;
     --gpu-memory-utilization)
@@ -96,6 +100,10 @@ done
 case "${DECODE_ATTENTION_BACKEND}" in
   legacy|paged_310p) ;;
   *) echo "Invalid decode attention backend: ${DECODE_ATTENTION_BACKEND}" >&2; exit 2 ;;
+esac
+case "${MATMUL_BACKEND}" in
+  m200_asr|aclnn) ;;
+  *) echo "Invalid MatMul backend: ${MATMUL_BACKEND}" >&2; exit 2 ;;
 esac
 case "${MATMUL_OPTIMIZATION}" in
   legacy|p3_aclnn) ;;
@@ -247,7 +255,7 @@ start_server() {
       ;;
     xlite_full)
       additional_config="{\"audio_encoder_aclgraph_sizes\":${AUDIO_GRAPH_SIZES},\
-\"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\"}}"
+\"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\",\"matmul_backend\":\"${MATMUL_BACKEND}\"}}"
       additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}")"
       ;;
     *)
@@ -259,7 +267,7 @@ start_server() {
   log "Starting server configuration=${config}"
   log "Server log=${log_file}"
   log "GPU memory utilization=${GPU_MEMORY_UTILIZATION}"
-  log "MatMul optimization=${MATMUL_OPTIMIZATION}; policy=${MATMUL_POLICY:-default12288}"
+  log "MatMul backend=${MATMUL_BACKEND}; optimization=${MATMUL_OPTIMIZATION}; policy=${MATMUL_POLICY:-default12288}"
   log "Xlite Decode backend=${DECODE_ATTENTION_BACKEND}; async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}; force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}; force_sync_aclnn=${XLITE_310P_FORCE_SYNC_ACLNN:-unset}"
   log "Decoder slots=${MAX_NUM_SEQS}, batched tokens=${MAX_NUM_BATCHED_TOKENS}, audio graph sizes=${AUDIO_GRAPH_SIZES}"
   log "Cache policy: prefix cache disabled, multimodal processor cache disabled"
@@ -324,6 +332,7 @@ run_benchmark() {
       "server_max_num_seqs=${MAX_NUM_SEQS}" \
       "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}" \
       "decode_attention_backend=${DECODE_ATTENTION_BACKEND}" \
+      "matmul_backend=${MATMUL_BACKEND}" \
       "matmul_optimization=${MATMUL_OPTIMIZATION}" \
       "matmul_policy=${MATMUL_POLICY:-default12288}" \
       "async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}" \
