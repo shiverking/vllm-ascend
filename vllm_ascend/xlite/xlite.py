@@ -738,6 +738,35 @@ class XliteWrapper:
             kv_caches (Any): Runtime KV cache handles or tensors.
         """
         self.kv_caches = kv_caches
+        if self.decode_attention_backend != "native_atb":
+            return
+        if not hasattr(self.xlite_model, "set_native_kv_cache_310p"):
+            raise RuntimeError("native_atb requires Xlite Model.set_native_kv_cache_310p")
+        native_caches = []
+        for layer, cache_pair in enumerate(kv_caches):
+            if len(cache_pair) != 2:
+                raise RuntimeError(f"native_atb layer {layer} does not contain a K/V pair")
+            k_cache, v_cache = cache_pair
+            expected_tail = (128, 8, 128)
+            if (k_cache.dtype != torch.float16 or tuple(k_cache.shape[1:]) != expected_tail
+                    or tuple(v_cache.shape) != tuple(k_cache.shape)):
+                raise RuntimeError(
+                    f"native_atb requires FP16 BSHD [blocks,128,8,128], got {tuple(k_cache.shape)}"
+                )
+            native_shape = (k_cache.shape[0], 64, 128, 16)
+            kwargs = {
+                "size": native_shape,
+                "dtype": torch.float16,
+                "device": k_cache.device,
+                "acl_format": 29,  # ACL_FORMAT_FRACTAL_NZ
+            }
+            native_caches.append([
+                torch_npu.empty_with_format(**kwargs),
+                torch_npu.empty_with_format(**kwargs),
+            ])
+        self.native_decode_kv_caches = native_caches
+        self.xlite_model.set_native_kv_cache_310p(native_caches)
+        logger.info("Xlite native_atb registered %d layers of 5D/NZ decode KV cache", len(native_caches))
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Run the TP1 FP16 LM head through Xlite."""
@@ -897,7 +926,7 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        if (self.decode_attention_backend == "paged_310p"
+        if (self.decode_attention_backend in ("paged_310p", "native_atb")
                 or self.matmul_optimization == "p3_aclnn"
                 or self.matmul_backend in ("m200_asr", "aclnn")):
             forwards = sum(self.runtime_stats["batch_distribution"].values())

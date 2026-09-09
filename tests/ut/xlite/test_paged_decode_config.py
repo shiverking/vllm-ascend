@@ -58,8 +58,15 @@ class PagedDecodeConfigTest(unittest.TestCase):
             with self.subTest(values=values), self.assertRaises(ValueError):
                 self.config(values)
 
+    def test_native_atb_full_mode(self):
+        self.assertEqual(
+            self.config({"enabled": True, "full_mode": True,
+                         "decode_attention_backend": "native_atb"}).decode_attention_backend,
+            "native_atb")
+
     def test_invalid_and_decode_only_rejected(self):
         for values in ({"decode_attention_backend": "unknown"},
+                       {"decode_attention_backend": "native_atb"},
                        {"decode_attention_backend": "paged_310p"},
                        {"enabled": True, "decode_attention_backend": "paged_310p"}):
             with self.subTest(values=values), self.assertRaises(ValueError):
@@ -88,6 +95,13 @@ class PagedDecodeConfigTest(unittest.TestCase):
         module.validate_paged_decode_build("batched_aclnn", batched, runtime)
         with self.assertRaises(RuntimeError):
             module.validate_paged_decode_build("batched_aclnn", {}, runtime)
+        native = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
+                  "cache_layout": "BSHD", "native_decode_attention": True,
+                  "native_decode_cache_layout": "NZ_5D",
+                  "decode_attention_backends": ("native_atb", "legacy")}
+        module.validate_paged_decode_build("native_atb", native, runtime)
+        with self.assertRaises(RuntimeError):
+            module.validate_paged_decode_build("native_atb", {}, runtime)
 
 
 if __name__ == "__main__":
