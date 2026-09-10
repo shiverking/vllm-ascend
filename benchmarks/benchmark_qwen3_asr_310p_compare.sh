@@ -139,6 +139,13 @@ log() {
   printf '[%s] %s\n' "$(date '+%F %T')" "$*"
 }
 
+if [[ "${DECODE_ATTENTION_BACKEND}" == "direct_atb" ]]; then
+  # Direct ATB keeps one Operation per Decoder layer.  The official Setup
+  # cache can therefore reuse the steady-state tensor plan for that layer.
+  export ATB_OPSRUNNER_SETUP_CACHE_ENABLE=1
+  log "Direct ATB per-layer Setup cache enabled"
+fi
+
 mkdir -p "${RESULT_DIR}/server_logs" "${RESULT_DIR}/client_logs" \
   "${RESULT_DIR}/warmup_responses"
 
@@ -337,6 +344,7 @@ run_benchmark() {
       "matmul_policy=${MATMUL_POLICY:-default12288}" \
       "async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}" \
       "force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}" \
+      "atb_setup_cache=${ATB_OPSRUNNER_SETUP_CACHE_ENABLE:-unset}" \
       "repetition=${repetition}" \
     2>&1 | tee "${RESULT_DIR}/client_logs/${stem}.log"
   log "[run ${RUN_NUMBER}] Finished ${stem}; result=${RESULT_DIR}/${stem}.json"

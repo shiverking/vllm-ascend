@@ -6,7 +6,10 @@ def validate_paged_decode_build(backend, build_info, runtime_type):
         expected = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
                     "cache_layout": "BSHD", "direct_decode_attention": True,
                     "native_decode_cache_layout": "NZ_5D",
-                    "direct_atb_task_queue_independent": True}
+                    "direct_atb_task_queue_independent": True,
+                    "direct_atb_runtime_version": 2,
+                    "direct_atb_operation_scope": "per_layer",
+                    "direct_atb_setup_cache": True}
         supported = tuple(build_info.get("decode_attention_backends", ()))
         if (any(build_info.get(key) != value for key, value in expected.items())
                 or backend not in supported
