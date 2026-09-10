@@ -324,6 +324,10 @@ run_benchmark() {
   fi
 
   log "[run ${RUN_NUMBER}] Starting ${stem}: measured requests=${NUM_PROMPTS}"
+  # openai-audio is multipart/form-data and is not classified as a generic
+  # OpenAI-compatible generation backend by vllm bench. Pass temperature in
+  # its request body so TranscriptionRequest receives deterministic greedy
+  # sampling without triggering serve.py's backend validation.
   vllm bench serve \
     --backend openai-audio \
     --endpoint /v1/audio/transcriptions \
@@ -334,7 +338,7 @@ run_benchmark() {
     --dataset-path "${DATASET}" \
     --disable-shuffle \
     --output-len "${OUTPUT_LEN}" \
-    --temperature 0 \
+    --extra-body '{"temperature":0}' \
     --num-warmups 0 \
     --num-prompts "${NUM_PROMPTS}" \
     --request-rate inf \
