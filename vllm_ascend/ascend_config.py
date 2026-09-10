@@ -604,6 +604,15 @@ class XliteGraphConfig:
         self.enabled = xlite_graph_config.get("enabled", False)
         self.full_mode = xlite_graph_config.get("full_mode", False)
         self.decode_attention_backend = xlite_graph_config.get("decode_attention_backend", "legacy")
+        self.prefill_attention_backend = xlite_graph_config.get("prefill_attention_backend", "legacy")
+        if self.prefill_attention_backend not in ("legacy", "batched_aclnn_probe"):
+            raise ValueError(
+                "prefill_attention_backend must be legacy or batched_aclnn_probe")
+        if self.prefill_attention_backend != "legacy" and not (
+            self.enabled and self.full_mode and self.decode_attention_backend == "direct_atb"
+        ):
+            raise ValueError(
+                "batched_aclnn_probe requires enabled Xlite full_mode with direct_atb Decode")
         self.matmul_backend = xlite_graph_config.get("matmul_backend", "m200_asr")
         if self.matmul_backend not in ("m200_asr", "aclnn"):
             raise ValueError("matmul_backend must be m200_asr or aclnn")

@@ -613,6 +613,7 @@ class XliteWrapper:
         self.runnable = runnable
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
         self.decode_attention_backend = get_ascend_config().xlite_graph_config.decode_attention_backend
+        self.prefill_attention_backend = get_ascend_config().xlite_graph_config.prefill_attention_backend
         self.matmul_backend = get_ascend_config().xlite_graph_config.matmul_backend
         self.matmul_optimization = get_ascend_config().xlite_graph_config.matmul_optimization
         self._allow_profile_fallback = False
@@ -646,6 +647,13 @@ class XliteWrapper:
             self.xlite_rt.set_matmul_backend_310p(self.matmul_backend)
         if hasattr(self.xlite_rt, "set_decode_attention_backend"):
             self.xlite_rt.set_decode_attention_backend(self.decode_attention_backend)
+        if self.prefill_attention_backend == "batched_aclnn_probe":
+            if (self.build_info.get("batched_prefill_attention") is not True
+                    or not hasattr(self.xlite_rt, "set_batched_prefill_attention_310p")):
+                raise RuntimeError(
+                    "Xlite build does not support the requested batched Prefill probe: "
+                    f"{self.build_info}")
+            self.xlite_rt.set_batched_prefill_attention_310p(True)
         self.matmul_policy_info = {"mode": "legacy"}
         if self.matmul_optimization == "p3_aclnn":
             from xlite.p3 import configure
@@ -665,8 +673,9 @@ class XliteWrapper:
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB")
         logger.info(
-            "Xlite decode backend=%s; MatMul backend=%s; runtime policy=%s",
+            "Xlite decode backend=%s; Prefill backend=%s; MatMul backend=%s; runtime policy=%s",
             self.decode_attention_backend,
+            self.prefill_attention_backend,
             self.matmul_backend,
             _get_native_runtime_stats(self.xlite_rt),
         )

@@ -25,6 +25,7 @@ class PagedDecodeConfigTest(unittest.TestCase):
 
     def test_legacy_default(self):
         self.assertEqual(self.config({}).decode_attention_backend, "legacy")
+        self.assertEqual(self.config({}).prefill_attention_backend, "legacy")
         self.assertEqual(self.config({}).matmul_optimization, "legacy")
         self.assertEqual(self.config({}).matmul_backend, "m200_asr")
 
@@ -69,6 +70,23 @@ class PagedDecodeConfigTest(unittest.TestCase):
             self.config({"enabled": True, "full_mode": True,
                          "decode_attention_backend": "direct_atb"}).decode_attention_backend,
             "direct_atb")
+
+    def test_batched_prefill_probe_requires_direct_atb_full_mode(self):
+        config = self.config({
+            "enabled": True,
+            "full_mode": True,
+            "decode_attention_backend": "direct_atb",
+            "prefill_attention_backend": "batched_aclnn_probe",
+        })
+        self.assertEqual(config.prefill_attention_backend, "batched_aclnn_probe")
+        for values in (
+            {"prefill_attention_backend": "unknown"},
+            {"prefill_attention_backend": "batched_aclnn_probe"},
+            {"enabled": True, "full_mode": True,
+             "prefill_attention_backend": "batched_aclnn_probe"},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
 
     def test_invalid_and_decode_only_rejected(self):
         for values in ({"decode_attention_backend": "unknown"},

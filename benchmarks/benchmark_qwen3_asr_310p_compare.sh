@@ -22,6 +22,7 @@ MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 MODEL_MAX_LEN="${MODEL_MAX_LEN:-2048}"
 GPU_MEMORY_UTILIZATION=0.8
 DECODE_ATTENTION_BACKEND=legacy
+PREFILL_ATTENTION_BACKEND=legacy
 MATMUL_BACKEND=m200_asr
 MATMUL_OPTIMIZATION=legacy
 MATMUL_POLICY=""
@@ -48,6 +49,8 @@ Options:
   --output-len N          Maximum generated tokens, including startup warmups
   --decode-attention-backend BACKEND
                          Xlite Decode: legacy, direct_atb, native_atb, batched_aclnn or paged_310p (default: legacy)
+  --prefill-attention-backend BACKEND
+                         Xlite Prefill: legacy or batched_aclnn_probe (default: legacy)
   --matmul-backend BACKEND
                          Xlite MatMul: m200_asr or aclnn (default: m200_asr)
   --matmul-optimization MODE
@@ -79,6 +82,7 @@ while (( $# > 0 )); do
     --num-prompts) NUM_PROMPTS="$2"; shift 2 ;;
     --output-len) OUTPUT_LEN="$2"; shift 2 ;;
     --decode-attention-backend) DECODE_ATTENTION_BACKEND="${2:?backend required}"; shift 2 ;;
+    --prefill-attention-backend) PREFILL_ATTENTION_BACKEND="${2:?backend required}"; shift 2 ;;
     --matmul-backend) MATMUL_BACKEND="${2:?backend required}"; shift 2 ;;
     --matmul-optimization) MATMUL_OPTIMIZATION="${2:?mode required}"; shift 2 ;;
     --matmul-policy) MATMUL_POLICY="${2:?policy required}"; shift 2 ;;
@@ -101,6 +105,13 @@ case "${DECODE_ATTENTION_BACKEND}" in
   legacy|direct_atb|native_atb|batched_aclnn|paged_310p) ;;
   *) echo "Invalid decode attention backend: ${DECODE_ATTENTION_BACKEND}" >&2; exit 2 ;;
 esac
+case "${PREFILL_ATTENTION_BACKEND}" in
+  legacy|batched_aclnn_probe) ;;
+  *) echo "Invalid prefill attention backend: ${PREFILL_ATTENTION_BACKEND}" >&2; exit 2 ;;
+esac
+if [[ "${PREFILL_ATTENTION_BACKEND}" != legacy && "${DECODE_ATTENTION_BACKEND}" != direct_atb ]]; then
+  echo "batched_aclnn_probe requires --decode-attention-backend direct_atb" >&2; exit 2
+fi
 case "${MATMUL_BACKEND}" in
   m200_asr|aclnn) ;;
   *) echo "Invalid MatMul backend: ${MATMUL_BACKEND}" >&2; exit 2 ;;
@@ -262,7 +273,7 @@ start_server() {
       ;;
     xlite_full)
       additional_config="{\"audio_encoder_aclgraph_sizes\":${AUDIO_GRAPH_SIZES},\
-\"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\",\"matmul_backend\":\"${MATMUL_BACKEND}\"}}"
+\"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\",\"prefill_attention_backend\":\"${PREFILL_ATTENTION_BACKEND}\",\"matmul_backend\":\"${MATMUL_BACKEND}\"}}"
       additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}")"
       ;;
     *)
@@ -275,7 +286,7 @@ start_server() {
   log "Server log=${log_file}"
   log "GPU memory utilization=${GPU_MEMORY_UTILIZATION}"
   log "MatMul backend=${MATMUL_BACKEND}; optimization=${MATMUL_OPTIMIZATION}; policy=${MATMUL_POLICY:-default12288}"
-  log "Xlite Decode backend=${DECODE_ATTENTION_BACKEND}; async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}; force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}; force_sync_aclnn=${XLITE_310P_FORCE_SYNC_ACLNN:-unset}"
+  log "Xlite Decode backend=${DECODE_ATTENTION_BACKEND}; Prefill backend=${PREFILL_ATTENTION_BACKEND}; async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}; force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}; force_sync_aclnn=${XLITE_310P_FORCE_SYNC_ACLNN:-unset}"
   log "Decoder slots=${MAX_NUM_SEQS}, batched tokens=${MAX_NUM_BATCHED_TOKENS}, audio graph sizes=${AUDIO_GRAPH_SIZES}"
   log "Cache policy: prefix cache disabled, multimodal processor cache disabled"
   # Process substitution keeps SERVER_PID attached to the setsid process while
@@ -323,6 +334,7 @@ run_benchmark() {
     --dataset-path "${DATASET}" \
     --disable-shuffle \
     --output-len "${OUTPUT_LEN}" \
+    --temperature 0 \
     --num-warmups 0 \
     --num-prompts "${NUM_PROMPTS}" \
     --request-rate inf \
@@ -339,6 +351,8 @@ run_benchmark() {
       "server_max_num_seqs=${MAX_NUM_SEQS}" \
       "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}" \
       "decode_attention_backend=${DECODE_ATTENTION_BACKEND}" \
+      "prefill_attention_backend=${PREFILL_ATTENTION_BACKEND}" \
+      "temperature=0" \
       "matmul_backend=${MATMUL_BACKEND}" \
       "matmul_optimization=${MATMUL_OPTIMIZATION}" \
       "matmul_policy=${MATMUL_POLICY:-default12288}" \
