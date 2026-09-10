@@ -7,17 +7,15 @@ def validate_paged_decode_build(backend, build_info, runtime_type):
                     "cache_layout": "BSHD", "direct_decode_attention": True,
                     "native_decode_cache_layout": "NZ_5D",
                     "direct_atb_task_queue_independent": True,
-                    "direct_atb_runtime_version": 6,
-                    "direct_atb_operation_scope": "per_layer_signature",
+                    "direct_atb_runtime_version": 7,
+                    "direct_atb_operation_scope": "per_layer_batch",
                     "direct_atb_setup_cache": True,
                     "direct_atb_fused_rope_staging": True,
                     "direct_atb_mixed_batch_decode": True,
                     "direct_atb_batched_compact_scatter": True,
-                    "direct_atb_plan_cache": "layer_tensor_signature",
-                    "direct_atb_reshape_signatures_per_layer": 16,
-                    "direct_atb_paged_signatures_per_batch": 4,
+                    "direct_atb_plan_cache": "layer_batch",
                     "direct_atb_metadata_upload": "once_per_forward",
-                    "direct_atb_pure_decode_direct_output": True,
+                    "direct_atb_pure_decode_direct_output": False,
                     "direct_atb_metadata_single_h2d": True}
         supported = tuple(build_info.get("decode_attention_backends", ()))
         if (any(build_info.get(key) != value for key, value in expected.items())
