@@ -131,10 +131,11 @@ class PagedDecodeConfigTest(unittest.TestCase):
                   "cache_layout": "BSHD", "direct_decode_attention": True,
                   "native_decode_cache_layout": "NZ_5D",
                   "direct_atb_task_queue_independent": True,
-                  "direct_atb_runtime_version": 3,
+                  "direct_atb_runtime_version": 4,
                   "direct_atb_operation_scope": "per_layer",
                   "direct_atb_setup_cache": True,
                   "direct_atb_fused_rope_staging": True,
+                  "direct_atb_mixed_batch_decode": True,
                   "decode_attention_backends": ("direct_atb", "legacy")}
         module.validate_paged_decode_build("direct_atb", direct, runtime)
         with self.assertRaises(RuntimeError):
