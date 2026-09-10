@@ -151,8 +151,9 @@ log() {
 }
 
 if [[ "${DECODE_ATTENTION_BACKEND}" == "direct_atb" ]]; then
-  # Direct ATB keeps one Operation per Decoder layer.  The official Setup
-  # cache can therefore reuse the steady-state tensor plan for that layer.
+  # Direct ATB keeps one PagedAttention operation per Decoder layer and batch
+  # size. The official Setup cache can therefore reuse steady-state plans
+  # without continuous-batching shapes invalidating one another.
   export ATB_OPSRUNNER_SETUP_CACHE_ENABLE=1
   log "Direct ATB per-layer Setup cache enabled"
 fi
