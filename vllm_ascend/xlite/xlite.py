@@ -639,6 +639,7 @@ class XliteWrapper:
             "batch_distribution": Counter(),
             "fallback_reasons": Counter(),
         }
+        self._final_runtime_stats_logged = False
 
         rank = torch.distributed.get_rank()
         local_rank = get_world_group().local_rank
@@ -818,6 +819,16 @@ class XliteWrapper:
         if audio_pool is not None:
             stats["audio_encoder"] = audio_pool.get_runtime_stats()
         return stats
+
+    def log_final_runtime_stats(self) -> None:
+        """Log one complete snapshot before the worker releases the runtime."""
+        if self._final_runtime_stats_logged:
+            return
+        self._final_runtime_stats_logged = True
+        logger.info(
+            "Xlite final optimization runtime stats: %s",
+            self.get_xlite_runtime_stats(),
+        )
 
     def __call__(
         self,

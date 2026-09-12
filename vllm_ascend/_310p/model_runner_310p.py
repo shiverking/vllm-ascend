@@ -180,6 +180,15 @@ class NPUModelRunner310(NPUModelRunner):
                 return self.model.unwrap()
         return super().get_model()
 
+    def shutdown(self) -> None:
+        model = getattr(self, "model", None)
+        log_final_stats = getattr(model, "log_final_runtime_stats", None)
+        if callable(log_final_stats):
+            log_final_stats()
+        parent_shutdown = getattr(super(), "shutdown", None)
+        if callable(parent_shutdown):
+            parent_shutdown()
+
     def initialize_kv_cache(
         self,
         kv_cache_config: KVCacheConfig,
