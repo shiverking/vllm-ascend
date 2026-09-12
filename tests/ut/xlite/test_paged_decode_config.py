@@ -70,6 +70,19 @@ class PagedDecodeConfigTest(unittest.TestCase):
             self.config({"enabled": True, "full_mode": True,
                          "decode_attention_backend": "direct_atb"}).decode_attention_backend,
             "direct_atb")
+        self.assertTrue(
+            self.config({"enabled": True, "full_mode": True,
+                         "decode_attention_backend": "direct_atb",
+                         "direct_atb_setup_reuse": True}).direct_atb_setup_reuse)
+        for values in ({"direct_atb_setup_reuse": True},
+                       {"enabled": True, "full_mode": True,
+                        "decode_attention_backend": "legacy",
+                        "direct_atb_setup_reuse": True},
+                       {"enabled": True, "full_mode": True,
+                        "decode_attention_backend": "direct_atb",
+                        "direct_atb_setup_reuse": "yes"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
 
     def test_batched_prefill_probe_requires_direct_atb_full_mode(self):
         config = self.config({
@@ -131,7 +144,7 @@ class PagedDecodeConfigTest(unittest.TestCase):
                   "cache_layout": "BSHD", "direct_decode_attention": True,
                   "native_decode_cache_layout": "NZ_5D",
                   "direct_atb_task_queue_independent": True,
-                  "direct_atb_runtime_version": 8,
+                  "direct_atb_runtime_version": 9,
                   "direct_atb_operation_scope": "per_layer_batch",
                   "direct_atb_setup_cache": True,
                   "direct_atb_fused_rope_staging": True,
@@ -142,6 +155,7 @@ class PagedDecodeConfigTest(unittest.TestCase):
                   "direct_atb_pure_decode_direct_output": False,
                   "direct_atb_metadata_single_h2d": False,
                   "direct_atb_metadata_actual_batch": True,
+                  "direct_atb_setup_reuse_probe": True,
                   "decode_attention_backends": ("direct_atb", "legacy")}
         module.validate_paged_decode_build("direct_atb", direct, runtime)
         with self.assertRaises(RuntimeError):

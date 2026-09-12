@@ -604,6 +604,13 @@ class XliteGraphConfig:
         self.enabled = xlite_graph_config.get("enabled", False)
         self.full_mode = xlite_graph_config.get("full_mode", False)
         self.decode_attention_backend = xlite_graph_config.get("decode_attention_backend", "legacy")
+        self.direct_atb_setup_reuse = xlite_graph_config.get(
+            "direct_atb_setup_reuse", False)
+        if not isinstance(self.direct_atb_setup_reuse, bool):
+            raise ValueError("direct_atb_setup_reuse must be a boolean")
+        if self.direct_atb_setup_reuse and self.decode_attention_backend != "direct_atb":
+            raise ValueError(
+                "direct_atb_setup_reuse requires decode_attention_backend=direct_atb")
         self.prefill_attention_backend = xlite_graph_config.get("prefill_attention_backend", "legacy")
         if self.prefill_attention_backend not in ("legacy", "batched_aclnn_probe"):
             raise ValueError(

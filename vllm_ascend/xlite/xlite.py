@@ -613,6 +613,7 @@ class XliteWrapper:
         self.runnable = runnable
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
         self.decode_attention_backend = get_ascend_config().xlite_graph_config.decode_attention_backend
+        self.direct_atb_setup_reuse = get_ascend_config().xlite_graph_config.direct_atb_setup_reuse
         self.prefill_attention_backend = get_ascend_config().xlite_graph_config.prefill_attention_backend
         self.matmul_backend = get_ascend_config().xlite_graph_config.matmul_backend
         self.matmul_optimization = get_ascend_config().xlite_graph_config.matmul_optimization
@@ -647,6 +648,11 @@ class XliteWrapper:
             self.xlite_rt.set_matmul_backend_310p(self.matmul_backend)
         if hasattr(self.xlite_rt, "set_decode_attention_backend"):
             self.xlite_rt.set_decode_attention_backend(self.decode_attention_backend)
+        if self.direct_atb_setup_reuse:
+            if not hasattr(self.xlite_rt, "set_direct_atb_setup_reuse_310p"):
+                raise RuntimeError(
+                    "Xlite build does not expose the direct ATB Setup reuse probe")
+            self.xlite_rt.set_direct_atb_setup_reuse_310p(True)
         if self.prefill_attention_backend == "batched_aclnn_probe":
             if (self.build_info.get("batched_prefill_attention") is not True
                     or not hasattr(self.xlite_rt, "set_batched_prefill_attention_310p")):
@@ -673,8 +679,9 @@ class XliteWrapper:
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB")
         logger.info(
-            "Xlite decode backend=%s; Prefill backend=%s; MatMul backend=%s; runtime policy=%s",
+            "Xlite decode backend=%s; direct ATB Setup reuse=%s; Prefill backend=%s; MatMul backend=%s; runtime policy=%s",
             self.decode_attention_backend,
+            self.direct_atb_setup_reuse,
             self.prefill_attention_backend,
             self.matmul_backend,
             _get_native_runtime_stats(self.xlite_rt),
