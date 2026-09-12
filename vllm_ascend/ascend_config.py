@@ -628,8 +628,9 @@ class XliteGraphConfig:
             raise ValueError(
                 "batched_aclnn_probe requires enabled Xlite full_mode with direct_atb Decode")
         self.matmul_backend = xlite_graph_config.get("matmul_backend", "m200_asr")
-        if self.matmul_backend not in ("m200_asr", "aclnn"):
-            raise ValueError("matmul_backend must be m200_asr or aclnn")
+        if self.matmul_backend not in ("m200_asr_prefill", "m200_asr", "aclnn"):
+            raise ValueError(
+                "matmul_backend must be m200_asr_prefill, m200_asr or aclnn")
         self.matmul_optimization = xlite_graph_config.get("matmul_optimization", "legacy")
         self.matmul_policy = xlite_graph_config.get("matmul_policy")
         if self.matmul_optimization not in ("legacy", "p3_aclnn"):

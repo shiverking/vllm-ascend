@@ -31,6 +31,9 @@ class PagedDecodeConfigTest(unittest.TestCase):
 
     def test_matmul_backend(self):
         self.assertEqual(self.config({"matmul_backend": "aclnn"}).matmul_backend, "aclnn")
+        self.assertEqual(
+            self.config({"matmul_backend": "m200_asr_prefill"}).matmul_backend,
+            "m200_asr_prefill")
         with self.assertRaises(ValueError):
             self.config({"matmul_backend": "unknown"})
 

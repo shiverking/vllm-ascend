@@ -54,7 +54,8 @@ Options:
   --prefill-attention-backend BACKEND
                          Xlite Prefill: legacy or batched_aclnn_probe (default: legacy)
   --matmul-backend BACKEND
-                         Xlite MatMul: m200_asr or aclnn (default: m200_asr)
+                         Xlite MatMul: m200_asr_prefill, m200_asr or aclnn
+                         (default: m200_asr)
   --direct-atb-setup-reuse
                          Experimental: reuse Setup for identical direct ATB signatures
   --aclnn-matmul-async  Event-retire Decoder ACLNN MatMul; sync LM Head once
@@ -123,7 +124,7 @@ if [[ "${DIRECT_ATB_SETUP_REUSE}" == true && "${DECODE_ATTENTION_BACKEND}" != di
   echo "--direct-atb-setup-reuse requires --decode-attention-backend direct_atb" >&2; exit 2
 fi
 case "${MATMUL_BACKEND}" in
-  m200_asr|aclnn) ;;
+  m200_asr_prefill|m200_asr|aclnn) ;;
   *) echo "Invalid MatMul backend: ${MATMUL_BACKEND}" >&2; exit 2 ;;
 esac
 case "${MATMUL_OPTIMIZATION}" in

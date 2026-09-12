@@ -969,7 +969,7 @@ class XliteWrapper:
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
         if (self.decode_attention_backend in ("paged_310p", "native_atb", "direct_atb")
                 or self.matmul_optimization == "p3_aclnn"
-                or self.matmul_backend in ("m200_asr", "aclnn")):
+                or self.matmul_backend in ("m200_asr_prefill", "m200_asr", "aclnn")):
             forwards = sum(self.runtime_stats["batch_distribution"].values())
             if forwards == 1 or forwards % 128 == 0:
                 logger.info("Xlite optimization runtime stats: %s", self.get_xlite_runtime_stats())
