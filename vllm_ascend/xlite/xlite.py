@@ -634,6 +634,8 @@ class XliteWrapper:
                     f"{self.matmul_backend!r}: {self.build_info}")
             if self.aclnn_matmul_async and (
                     self.build_info.get("aclnn_matmul_event_lease") is not True
+                    or self.build_info.get("aclnn_matmul_event_lease_scope")
+                    != "decoder_non_lm_head"
                     or not hasattr(Runtime, "set_aclnn_matmul_async_310p")):
                 raise RuntimeError(
                     "Xlite build does not support ACLNN MatMul event leases: "

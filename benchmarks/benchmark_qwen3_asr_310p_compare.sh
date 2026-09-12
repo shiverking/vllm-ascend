@@ -57,7 +57,7 @@ Options:
                          Xlite MatMul: m200_asr or aclnn (default: m200_asr)
   --direct-atb-setup-reuse
                          Experimental: reuse Setup for identical direct ATB signatures
-  --aclnn-matmul-async  Retire ACLNN MatMul workspace/descriptors with events
+  --aclnn-matmul-async  Event-retire Decoder ACLNN MatMul; sync LM Head once
   --matmul-optimization MODE
                          legacy or p3_aclnn (default: legacy)
   --matmul-policy PATH    Offline P3 policy JSON on the serving host
