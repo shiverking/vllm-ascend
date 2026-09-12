@@ -25,6 +25,7 @@ DECODE_ATTENTION_BACKEND=legacy
 PREFILL_ATTENTION_BACKEND=legacy
 MATMUL_BACKEND=m200_asr
 DIRECT_ATB_SETUP_REUSE=false
+XLITE_DECODE_GRAPH=false
 ACLNN_MATMUL_ASYNC=false
 MATMUL_OPTIMIZATION=legacy
 MATMUL_POLICY=""
@@ -58,6 +59,7 @@ Options:
                          (default: m200_asr)
   --direct-atb-setup-reuse
                          Experimental: reuse Setup for identical direct ATB signatures
+  --xlite-decode-graph  Experimental: capture/replay pure Decode in Xlite Runtime
   --aclnn-matmul-async  Event-retire Decoder ACLNN MatMul; sync LM Head once
   --matmul-optimization MODE
                          legacy or p3_aclnn (default: legacy)
@@ -91,6 +93,7 @@ while (( $# > 0 )); do
     --prefill-attention-backend) PREFILL_ATTENTION_BACKEND="${2:?backend required}"; shift 2 ;;
     --matmul-backend) MATMUL_BACKEND="${2:?backend required}"; shift 2 ;;
     --direct-atb-setup-reuse) DIRECT_ATB_SETUP_REUSE=true; shift ;;
+    --xlite-decode-graph) XLITE_DECODE_GRAPH=true; shift ;;
     --aclnn-matmul-async) ACLNN_MATMUL_ASYNC=true; shift ;;
     --matmul-optimization) MATMUL_OPTIMIZATION="${2:?mode required}"; shift 2 ;;
     --matmul-policy) MATMUL_POLICY="${2:?policy required}"; shift 2 ;;
@@ -127,6 +130,11 @@ case "${MATMUL_BACKEND}" in
   m200_asr_prefill|m200_asr|aclnn) ;;
   *) echo "Invalid MatMul backend: ${MATMUL_BACKEND}" >&2; exit 2 ;;
 esac
+if [[ "${XLITE_DECODE_GRAPH}" == true ]]; then
+  if [[ "${DECODE_ATTENTION_BACKEND}" != direct_atb || "${DIRECT_ATB_SETUP_REUSE}" != true || "${MATMUL_BACKEND}" != m200_asr ]]; then
+    echo "--xlite-decode-graph requires direct_atb, --direct-atb-setup-reuse and --matmul-backend m200_asr" >&2; exit 2
+  fi
+fi
 case "${MATMUL_OPTIMIZATION}" in
   legacy|p3_aclnn) ;;
   *) echo "Invalid MatMul optimization: ${MATMUL_OPTIMIZATION}" >&2; exit 2 ;;
@@ -286,7 +294,7 @@ start_server() {
     xlite_full)
       additional_config="{\"audio_encoder_aclgraph_sizes\":${AUDIO_GRAPH_SIZES},\
 \"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\",\"prefill_attention_backend\":\"${PREFILL_ATTENTION_BACKEND}\",\"matmul_backend\":\"${MATMUL_BACKEND}\"}}"
-      additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None,direct_atb_setup_reuse=sys.argv[4] == "true",aclnn_matmul_async=sys.argv[5] == "true"); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}" "${DIRECT_ATB_SETUP_REUSE}" "${ACLNN_MATMUL_ASYNC}")"
+      additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None,direct_atb_setup_reuse=sys.argv[4] == "true",aclnn_matmul_async=sys.argv[5] == "true",decode_graph=sys.argv[6] == "true"); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}" "${DIRECT_ATB_SETUP_REUSE}" "${ACLNN_MATMUL_ASYNC}" "${XLITE_DECODE_GRAPH}")"
       ;;
     *)
       echo "Unknown configuration: ${config}" >&2
@@ -298,7 +306,7 @@ start_server() {
   log "Server log=${log_file}"
   log "GPU memory utilization=${GPU_MEMORY_UTILIZATION}"
   log "MatMul backend=${MATMUL_BACKEND}; optimization=${MATMUL_OPTIMIZATION}; policy=${MATMUL_POLICY:-default12288}"
-  log "Xlite Decode backend=${DECODE_ATTENTION_BACKEND}; direct ATB Setup reuse=${DIRECT_ATB_SETUP_REUSE}; Prefill backend=${PREFILL_ATTENTION_BACKEND}; async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}; force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}; force_sync_aclnn=${XLITE_310P_FORCE_SYNC_ACLNN:-unset}"
+  log "Xlite Decode backend=${DECODE_ATTENTION_BACKEND}; direct ATB Setup reuse=${DIRECT_ATB_SETUP_REUSE}; Xlite Decode Graph=${XLITE_DECODE_GRAPH}; Prefill backend=${PREFILL_ATTENTION_BACKEND}; async_matmul=${XLITE_310P_ASYNC_MATMUL:-unset}; force_sync_matmul=${XLITE_310P_FORCE_SYNC_MATMUL:-unset}; force_sync_aclnn=${XLITE_310P_FORCE_SYNC_ACLNN:-unset}"
   log "Decoder slots=${MAX_NUM_SEQS}, batched tokens=${MAX_NUM_BATCHED_TOKENS}, audio graph sizes=${AUDIO_GRAPH_SIZES}"
   log "Cache policy: prefix cache disabled, multimodal processor cache disabled"
   # Process substitution keeps SERVER_PID attached to the setsid process while
@@ -368,6 +376,7 @@ run_benchmark() {
       "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}" \
       "decode_attention_backend=${DECODE_ATTENTION_BACKEND}" \
       "direct_atb_setup_reuse=${DIRECT_ATB_SETUP_REUSE}" \
+      "xlite_decode_graph=${XLITE_DECODE_GRAPH}" \
       "aclnn_matmul_async=${ACLNN_MATMUL_ASYNC}" \
       "prefill_attention_backend=${PREFILL_ATTENTION_BACKEND}" \
       "temperature=0" \

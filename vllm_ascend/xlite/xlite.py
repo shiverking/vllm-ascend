@@ -614,6 +614,7 @@ class XliteWrapper:
         self.full_mode = get_ascend_config().xlite_graph_config.full_mode
         self.decode_attention_backend = get_ascend_config().xlite_graph_config.decode_attention_backend
         self.direct_atb_setup_reuse = get_ascend_config().xlite_graph_config.direct_atb_setup_reuse
+        self.decode_graph = get_ascend_config().xlite_graph_config.decode_graph
         self.aclnn_matmul_async = get_ascend_config().xlite_graph_config.aclnn_matmul_async
         self.prefill_attention_backend = get_ascend_config().xlite_graph_config.prefill_attention_backend
         self.matmul_backend = get_ascend_config().xlite_graph_config.matmul_backend
@@ -640,6 +641,12 @@ class XliteWrapper:
                 raise RuntimeError(
                     "Xlite build does not support ACLNN MatMul event leases: "
                     f"{self.build_info}")
+            if self.decode_graph and (
+                    self.build_info.get("decode_graph_310p") is not True
+                    or not hasattr(Runtime, "set_decode_graph_310p")):
+                raise RuntimeError(
+                    "Xlite build does not support the requested 310P Decode Graph: "
+                    f"{self.build_info}")
         validate_paged_decode_build(self.decode_attention_backend, self.build_info, Runtime)
         self._validate_build_contract(vllm_config)
         self.runtime_stats: dict[str, Any] = {
@@ -665,6 +672,8 @@ class XliteWrapper:
                 raise RuntimeError(
                     "Xlite build does not expose the direct ATB Setup reuse probe")
             self.xlite_rt.set_direct_atb_setup_reuse_310p(True)
+        if self.decode_graph:
+            self.xlite_rt.set_decode_graph_310p(True)
         if self.prefill_attention_backend == "batched_aclnn_probe":
             if (self.build_info.get("batched_prefill_attention") is not True
                     or not hasattr(self.xlite_rt, "set_batched_prefill_attention_310p")):
@@ -691,9 +700,10 @@ class XliteWrapper:
         if self.xlite_rt.init_tensor_pool(rt_pool_size) != 0:
             raise ValueError(f"xlite wrapper init failed! runtime pool size: {rt_pool_size} MB")
         logger.info(
-            "Xlite decode backend=%s; direct ATB Setup reuse=%s; Prefill backend=%s; MatMul backend=%s; ACLNN MatMul async=%s; runtime policy=%s",
+            "Xlite decode backend=%s; direct ATB Setup reuse=%s; Decode Graph=%s; Prefill backend=%s; MatMul backend=%s; ACLNN MatMul async=%s; runtime policy=%s",
             self.decode_attention_backend,
             self.direct_atb_setup_reuse,
+            self.decode_graph,
             self.prefill_attention_backend,
             self.matmul_backend,
             self.aclnn_matmul_async,

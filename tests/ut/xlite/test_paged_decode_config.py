@@ -37,6 +37,30 @@ class PagedDecodeConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.config({"matmul_backend": "unknown"})
 
+    def test_decode_graph_is_explicit_and_strict(self):
+        self.assertFalse(self.config({}).decode_graph)
+        config = self.config({
+            "enabled": True,
+            "full_mode": True,
+            "decode_attention_backend": "direct_atb",
+            "direct_atb_setup_reuse": True,
+            "matmul_backend": "m200_asr",
+            "decode_graph": True,
+        })
+        self.assertTrue(config.decode_graph)
+        for values in (
+            {"decode_graph": True},
+            {"enabled": True, "full_mode": True, "decode_graph": True},
+            {"enabled": True, "full_mode": True,
+             "decode_attention_backend": "direct_atb", "decode_graph": True},
+            {"enabled": True, "full_mode": True,
+             "decode_attention_backend": "direct_atb",
+             "direct_atb_setup_reuse": True,
+             "matmul_backend": "m200_asr_prefill", "decode_graph": True},
+        ):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
+
     def test_aclnn_matmul_async_requires_full_mode(self):
         config = self.config({"enabled": True, "full_mode": True,
                               "aclnn_matmul_async": True})

@@ -611,6 +611,9 @@ class XliteGraphConfig:
         if self.direct_atb_setup_reuse and self.decode_attention_backend != "direct_atb":
             raise ValueError(
                 "direct_atb_setup_reuse requires decode_attention_backend=direct_atb")
+        self.decode_graph = xlite_graph_config.get("decode_graph", False)
+        if not isinstance(self.decode_graph, bool):
+            raise ValueError("decode_graph must be a boolean")
         self.aclnn_matmul_async = xlite_graph_config.get(
             "aclnn_matmul_async", False)
         if not isinstance(self.aclnn_matmul_async, bool):
@@ -631,6 +634,15 @@ class XliteGraphConfig:
         if self.matmul_backend not in ("m200_asr_prefill", "m200_asr", "aclnn"):
             raise ValueError(
                 "matmul_backend must be m200_asr_prefill, m200_asr or aclnn")
+        if self.decode_graph and not (
+            self.enabled and self.full_mode
+            and self.decode_attention_backend == "direct_atb"
+            and self.direct_atb_setup_reuse
+            and self.matmul_backend == "m200_asr"
+        ):
+            raise ValueError(
+                "decode_graph requires enabled Xlite full_mode, direct_atb, "
+                "direct_atb_setup_reuse and matmul_backend=m200_asr")
         self.matmul_optimization = xlite_graph_config.get("matmul_optimization", "legacy")
         self.matmul_policy = xlite_graph_config.get("matmul_policy")
         if self.matmul_optimization not in ("legacy", "p3_aclnn"):
