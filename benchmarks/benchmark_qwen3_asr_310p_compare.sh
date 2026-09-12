@@ -25,6 +25,7 @@ DECODE_ATTENTION_BACKEND=legacy
 PREFILL_ATTENTION_BACKEND=legacy
 MATMUL_BACKEND=m200_asr
 DIRECT_ATB_SETUP_REUSE=false
+ACLNN_MATMUL_ASYNC=false
 MATMUL_OPTIMIZATION=legacy
 MATMUL_POLICY=""
 AUDIO_GRAPH_SIZES="[26,52,78,128,256,384,512]"
@@ -56,6 +57,7 @@ Options:
                          Xlite MatMul: m200_asr or aclnn (default: m200_asr)
   --direct-atb-setup-reuse
                          Experimental: reuse Setup for identical direct ATB signatures
+  --aclnn-matmul-async  Retire ACLNN MatMul workspace/descriptors with events
   --matmul-optimization MODE
                          legacy or p3_aclnn (default: legacy)
   --matmul-policy PATH    Offline P3 policy JSON on the serving host
@@ -88,6 +90,7 @@ while (( $# > 0 )); do
     --prefill-attention-backend) PREFILL_ATTENTION_BACKEND="${2:?backend required}"; shift 2 ;;
     --matmul-backend) MATMUL_BACKEND="${2:?backend required}"; shift 2 ;;
     --direct-atb-setup-reuse) DIRECT_ATB_SETUP_REUSE=true; shift ;;
+    --aclnn-matmul-async) ACLNN_MATMUL_ASYNC=true; shift ;;
     --matmul-optimization) MATMUL_OPTIMIZATION="${2:?mode required}"; shift 2 ;;
     --matmul-policy) MATMUL_POLICY="${2:?policy required}"; shift 2 ;;
     --gpu-memory-utilization)
@@ -282,7 +285,7 @@ start_server() {
     xlite_full)
       additional_config="{\"audio_encoder_aclgraph_sizes\":${AUDIO_GRAPH_SIZES},\
 \"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\",\"prefill_attention_backend\":\"${PREFILL_ATTENTION_BACKEND}\",\"matmul_backend\":\"${MATMUL_BACKEND}\"}}"
-      additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None,direct_atb_setup_reuse=sys.argv[4] == "true"); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}" "${DIRECT_ATB_SETUP_REUSE}")"
+      additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None,direct_atb_setup_reuse=sys.argv[4] == "true",aclnn_matmul_async=sys.argv[5] == "true"); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}" "${DIRECT_ATB_SETUP_REUSE}" "${ACLNN_MATMUL_ASYNC}")"
       ;;
     *)
       echo "Unknown configuration: ${config}" >&2
@@ -364,6 +367,7 @@ run_benchmark() {
       "gpu_memory_utilization=${GPU_MEMORY_UTILIZATION}" \
       "decode_attention_backend=${DECODE_ATTENTION_BACKEND}" \
       "direct_atb_setup_reuse=${DIRECT_ATB_SETUP_REUSE}" \
+      "aclnn_matmul_async=${ACLNN_MATMUL_ASYNC}" \
       "prefill_attention_backend=${PREFILL_ATTENTION_BACKEND}" \
       "temperature=0" \
       "matmul_backend=${MATMUL_BACKEND}" \

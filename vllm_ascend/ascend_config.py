@@ -611,6 +611,13 @@ class XliteGraphConfig:
         if self.direct_atb_setup_reuse and self.decode_attention_backend != "direct_atb":
             raise ValueError(
                 "direct_atb_setup_reuse requires decode_attention_backend=direct_atb")
+        self.aclnn_matmul_async = xlite_graph_config.get(
+            "aclnn_matmul_async", False)
+        if not isinstance(self.aclnn_matmul_async, bool):
+            raise ValueError("aclnn_matmul_async must be a boolean")
+        if self.aclnn_matmul_async and not (self.enabled and self.full_mode):
+            raise ValueError(
+                "aclnn_matmul_async requires enabled Xlite full_mode")
         self.prefill_attention_backend = xlite_graph_config.get("prefill_attention_backend", "legacy")
         if self.prefill_attention_backend not in ("legacy", "batched_aclnn_probe"):
             raise ValueError(

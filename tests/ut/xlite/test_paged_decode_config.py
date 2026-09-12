@@ -34,6 +34,17 @@ class PagedDecodeConfigTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.config({"matmul_backend": "unknown"})
 
+    def test_aclnn_matmul_async_requires_full_mode(self):
+        config = self.config({"enabled": True, "full_mode": True,
+                              "aclnn_matmul_async": True})
+        self.assertTrue(config.aclnn_matmul_async)
+        for values in ({"aclnn_matmul_async": True},
+                       {"enabled": True, "aclnn_matmul_async": True},
+                       {"enabled": True, "full_mode": True,
+                        "aclnn_matmul_async": "yes"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
+
     def test_p3_config(self):
         config = self.config({"enabled": True, "full_mode": True, "matmul_optimization": "p3_aclnn"})
         self.assertEqual(config.matmul_optimization, "p3_aclnn")
