@@ -631,9 +631,12 @@ class XliteGraphConfig:
             raise ValueError(
                 "batched_aclnn_probe requires enabled Xlite full_mode with direct_atb Decode")
         self.matmul_backend = xlite_graph_config.get("matmul_backend", "m200_asr")
-        if self.matmul_backend not in ("m200_asr_prefill", "m200_asr", "aclnn"):
+        if self.matmul_backend not in (
+                "ascendc_asr_perf", "ascendc_asr", "m200_asr_prefill",
+                "m200_asr", "aclnn"):
             raise ValueError(
-                "matmul_backend must be m200_asr_prefill, m200_asr or aclnn")
+                "matmul_backend must be ascendc_asr_perf, ascendc_asr, "
+                "m200_asr_prefill, m200_asr or aclnn")
         if self.decode_graph and not (
             self.enabled and self.full_mode
             and self.decode_attention_backend == "direct_atb"
@@ -654,12 +657,14 @@ class XliteGraphConfig:
         ):
             raise ValueError("P3 requires enabled full_mode with legacy Attention")
         if self.decode_attention_backend not in (
-                "legacy", "direct_atb", "native_atb", "batched_aclnn", "paged_310p"):
+                "legacy", "ascendc_asr", "direct_atb", "native_atb",
+                "batched_aclnn", "paged_310p"):
             raise ValueError(
-                "decode_attention_backend must be legacy, direct_atb, native_atb, "
-                "batched_aclnn or paged_310p")
+                "decode_attention_backend must be legacy, ascendc_asr, direct_atb, "
+                "native_atb, batched_aclnn or paged_310p")
         if self.decode_attention_backend in (
-                "direct_atb", "native_atb", "batched_aclnn", "paged_310p") and not (
+                "ascendc_asr", "direct_atb", "native_atb", "batched_aclnn",
+                "paged_310p") and not (
             self.enabled and self.full_mode
         ):
             raise ValueError(

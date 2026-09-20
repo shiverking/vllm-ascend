@@ -32,6 +32,12 @@ class PagedDecodeConfigTest(unittest.TestCase):
     def test_matmul_backend(self):
         self.assertEqual(self.config({"matmul_backend": "aclnn"}).matmul_backend, "aclnn")
         self.assertEqual(
+            self.config({"matmul_backend": "ascendc_asr"}).matmul_backend,
+            "ascendc_asr")
+        self.assertEqual(
+            self.config({"matmul_backend": "ascendc_asr_perf"}).matmul_backend,
+            "ascendc_asr_perf")
+        self.assertEqual(
             self.config({"matmul_backend": "m200_asr_prefill"}).matmul_backend,
             "m200_asr_prefill")
         with self.assertRaises(ValueError):
@@ -86,6 +92,17 @@ class PagedDecodeConfigTest(unittest.TestCase):
         self.assertEqual(self.config({"enabled": True, "full_mode": True,
                                      "decode_attention_backend": "paged_310p"}).decode_attention_backend,
                          "paged_310p")
+
+    def test_ascendc_asr_full_mode(self):
+        self.assertEqual(
+            self.config({"enabled": True, "full_mode": True,
+                         "decode_attention_backend": "ascendc_asr"}).decode_attention_backend,
+            "ascendc_asr")
+        for values in ({"decode_attention_backend": "ascendc_asr"},
+                       {"enabled": True,
+                        "decode_attention_backend": "ascendc_asr"}):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.config(values)
 
     def test_batched_aclnn_full_mode(self):
         self.assertEqual(
@@ -165,6 +182,17 @@ class PagedDecodeConfigTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             module.validate_paged_decode_build("paged_310p", valid, SimpleNamespace())
         module.validate_paged_decode_build("legacy", {}, SimpleNamespace())
+        ascendc = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
+                   "cache_layout": "BSHD", "ascendc_asr_backend": True,
+                   "ascendc_asr_paged_decode_attention": True,
+                   "ascendc_asr_paged_decode_attention_scratch_bytes": 0,
+                   "decode_attention_backends": ("ascendc_asr", "legacy")}
+        module.validate_paged_decode_build("ascendc_asr", ascendc, runtime)
+        for key in ascendc:
+            bad = dict(ascendc)
+            del bad[key]
+            with self.subTest(ascendc_key=key), self.assertRaises(RuntimeError):
+                module.validate_paged_decode_build("ascendc_asr", bad, runtime)
         batched = {"soc": "Ascend310P3", "kernel_set": "llm_fp16", "abi": 1,
                    "cache_layout": "BSHD", "batched_decode_attention": True,
                    "decode_attention_backends": ("batched_aclnn", "legacy")}

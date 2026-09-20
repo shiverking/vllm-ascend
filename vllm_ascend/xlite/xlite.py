@@ -633,6 +633,23 @@ class XliteWrapper:
                 raise RuntimeError(
                     "Xlite build does not support requested 310P MatMul backend "
                     f"{self.matmul_backend!r}: {self.build_info}")
+            if self.matmul_backend in ("ascendc_asr", "ascendc_asr_perf"):
+                required = {"ascendc_asr_backend": True,
+                            "ascendc_asr_rmsnorm": True,
+                            "ascendc_asr_add_rmsnorm": True,
+                            "ascendc_asr_qk_norm_mrope_cache": True,
+                            "ascendc_asr_silu_mul": True,
+                            "ascendc_asr_lm_head": True}
+                if any(self.build_info.get(key) != value
+                       for key, value in required.items()):
+                    raise RuntimeError(
+                        "Xlite build does not satisfy the AscendC ASR kernel contract: "
+                        f"{self.build_info}")
+                if (self.matmul_backend == "ascendc_asr_perf"
+                        and self.build_info.get("ascendc_asr_perf_backend") is not True):
+                    raise RuntimeError(
+                        "Xlite build does not expose the AscendC ASR performance backend: "
+                        f"{self.build_info}")
             if self.aclnn_matmul_async and (
                     self.build_info.get("aclnn_matmul_event_lease") is not True
                     or self.build_info.get("aclnn_matmul_event_lease_scope")
@@ -977,9 +994,12 @@ class XliteWrapper:
             )
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
-        if (self.decode_attention_backend in ("paged_310p", "native_atb", "direct_atb")
+        if (self.decode_attention_backend in (
+                "ascendc_asr", "paged_310p", "native_atb", "direct_atb")
                 or self.matmul_optimization == "p3_aclnn"
-                or self.matmul_backend in ("m200_asr_prefill", "m200_asr", "aclnn")):
+                or self.matmul_backend in (
+                    "ascendc_asr_perf", "ascendc_asr", "m200_asr_prefill",
+                    "m200_asr", "aclnn")):
             forwards = sum(self.runtime_stats["batch_distribution"].values())
             if forwards == 1 or forwards % 128 == 0:
                 logger.info("Xlite optimization runtime stats: %s", self.get_xlite_runtime_stats())

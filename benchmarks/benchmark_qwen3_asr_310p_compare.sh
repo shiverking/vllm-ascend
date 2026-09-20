@@ -51,11 +51,13 @@ Options:
   --num-prompts N         Measured requests per run
   --output-len N          Maximum generated tokens, including startup warmups
   --decode-attention-backend BACKEND
-                         Xlite Decode: legacy, direct_atb, native_atb, batched_aclnn or paged_310p (default: legacy)
+                         Xlite Decode: legacy, ascendc_asr, direct_atb, native_atb,
+                         batched_aclnn or paged_310p (default: legacy)
   --prefill-attention-backend BACKEND
                          Xlite Prefill: legacy or batched_aclnn_probe (default: legacy)
   --matmul-backend BACKEND
-                         Xlite MatMul: m200_asr_prefill, m200_asr or aclnn
+                         Xlite MatMul: ascendc_asr_perf, ascendc_asr,
+                         m200_asr_prefill, m200_asr or aclnn
                          (default: m200_asr)
   --direct-atb-setup-reuse
                          Experimental: reuse Setup for identical direct ATB signatures
@@ -112,8 +114,13 @@ while (( $# > 0 )); do
   esac
 done
 
+# Accept both the documented space-separated form and the convenient comma-
+# separated form used by one-shot benchmark commands.
+CONCURRENCIES="${CONCURRENCIES//,/ }"
+CONFIGS="${CONFIGS//,/ }"
+
 case "${DECODE_ATTENTION_BACKEND}" in
-  legacy|direct_atb|native_atb|batched_aclnn|paged_310p) ;;
+  legacy|ascendc_asr|direct_atb|native_atb|batched_aclnn|paged_310p) ;;
   *) echo "Invalid decode attention backend: ${DECODE_ATTENTION_BACKEND}" >&2; exit 2 ;;
 esac
 case "${PREFILL_ATTENTION_BACKEND}" in
@@ -127,7 +134,7 @@ if [[ "${DIRECT_ATB_SETUP_REUSE}" == true && "${DECODE_ATTENTION_BACKEND}" != di
   echo "--direct-atb-setup-reuse requires --decode-attention-backend direct_atb" >&2; exit 2
 fi
 case "${MATMUL_BACKEND}" in
-  m200_asr_prefill|m200_asr|aclnn) ;;
+  ascendc_asr_perf|ascendc_asr|m200_asr_prefill|m200_asr|aclnn) ;;
   *) echo "Invalid MatMul backend: ${MATMUL_BACKEND}" >&2; exit 2 ;;
 esac
 if [[ "${XLITE_DECODE_GRAPH}" == true ]]; then
