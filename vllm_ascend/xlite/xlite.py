@@ -442,9 +442,12 @@ class Qwen3ASRXliteModel(LlamaXliteModel):
 
     def _build_model_config(self) -> None:
         super()._build_model_config()
-        # The 310P correctness backend delegates matmul to ACLNN and consumes
-        # ordinary ND [N, K] weights. Audio-tower parameters are not mapped.
-        self.xlite_config.weight_nz = False
+        # The strict AscendC backend consumes the same FRACTAL_NZ weights as
+        # Native eager. Other experimental backends retain their ND contract.
+        self.xlite_config.weight_nz = (
+            get_ascend_config().xlite_graph_config.matmul_backend
+            == "ascendc_asr_nz"
+        )
 
 
 class QwenMoeXliteModel(LlamaXliteModel):
@@ -633,7 +636,7 @@ class XliteWrapper:
                 raise RuntimeError(
                     "Xlite build does not support requested 310P MatMul backend "
                     f"{self.matmul_backend!r}: {self.build_info}")
-            if self.matmul_backend in ("ascendc_asr", "ascendc_asr_perf"):
+            if self.matmul_backend in ("ascendc_asr_nz", "ascendc_asr", "ascendc_asr_perf"):
                 required = {"ascendc_asr_backend": True,
                             "ascendc_asr_rmsnorm": True,
                             "ascendc_asr_add_rmsnorm": True,
@@ -649,6 +652,13 @@ class XliteWrapper:
                         and self.build_info.get("ascendc_asr_perf_backend") is not True):
                     raise RuntimeError(
                         "Xlite build does not expose the AscendC ASR performance backend: "
+                        f"{self.build_info}")
+                if self.matmul_backend == "ascendc_asr_nz" and (
+                        self.build_info.get("ascendc_asr_nz_backend") is not True
+                        or self.build_info.get("ascendc_asr_nz_weight_format") != 29
+                        or self.build_info.get("ascendc_asr_nz_fallback") is not False):
+                    raise RuntimeError(
+                        "Xlite build does not satisfy the strict NZ MatMul contract: "
                         f"{self.build_info}")
             if self.aclnn_matmul_async and (
                     self.build_info.get("aclnn_matmul_event_lease") is not True
@@ -736,6 +746,11 @@ class XliteWrapper:
             device=f"npu:{local_rank}",
             dtype=dtype,
         )
+        self.sample_indices = torch.arange(
+            vllm_config.scheduler_config.max_num_seqs,
+            dtype=torch.int32,
+            device=f"npu:{local_rank}",
+        )
 
     def _validate_build_contract(self, vllm_config: VllmConfig) -> None:
         architecture = vllm_config.model_config.architectures[0]
@@ -746,7 +761,6 @@ class XliteWrapper:
             "soc": "Ascend310P3",
             "kernel_set": "llm_fp16",
             "abi": 1,
-            "cache_layout": "BSHD",
         }
         mismatches = {
             key: (self.build_info.get(key), value)
@@ -757,6 +771,11 @@ class XliteWrapper:
             raise RuntimeError(
                 "Incompatible Xlite 310P build contract: "
                 f"expected={expected}, actual={self.build_info}, mismatches={mismatches}"
+            )
+        if self.build_info.get("cache_layout") not in ("BSHD", "runtime_selectable"):
+            raise RuntimeError(
+                "Incompatible Xlite 310P cache layout contract: "
+                f"{self.build_info.get('cache_layout')!r}"
             )
 
     def __getattr__(self, key: str) -> Any:
@@ -794,7 +813,8 @@ class XliteWrapper:
             kv_caches (Any): Runtime KV cache handles or tensors.
         """
         self.kv_caches = kv_caches
-        if self.decode_attention_backend not in ("native_atb", "direct_atb"):
+        if self.decode_attention_backend not in (
+                "ascendc_asr_nz", "native_atb", "direct_atb"):
             return
         if not hasattr(self.xlite_model, "set_native_kv_cache_310p"):
             raise RuntimeError(
@@ -802,13 +822,13 @@ class XliteWrapper:
         native_caches = []
         for layer, cache_pair in enumerate(kv_caches):
             if len(cache_pair) != 2:
-                raise RuntimeError(f"native_atb layer {layer} does not contain a K/V pair")
+                raise RuntimeError(f"native NZ layer {layer} does not contain a K/V pair")
             k_cache, v_cache = cache_pair
             expected_tail = (128, 8, 128)
             if (k_cache.dtype != torch.float16 or tuple(k_cache.shape[1:]) != expected_tail
                     or tuple(v_cache.shape) != tuple(k_cache.shape)):
                 raise RuntimeError(
-                    f"native_atb requires FP16 BSHD [blocks,128,8,128], got {tuple(k_cache.shape)}"
+                    f"native NZ cache source requires FP16 BSHD [blocks,128,8,128], got {tuple(k_cache.shape)}"
                 )
             native_shape = (k_cache.shape[0], 64, 128, 16)
             kwargs = {
@@ -835,7 +855,7 @@ class XliteWrapper:
             )
         hidden_states = hidden_states.contiguous()
         sample_count = hidden_states.shape[0]
-        indices = torch.arange(sample_count, dtype=torch.int32, device=hidden_states.device)
+        indices = self.sample_indices[:sample_count]
         output = self.logits[:, :sample_count]
         stream = torch.npu.current_stream().npu_stream
         self.xlite_model.forward_get_logits(self.xlite_rt, hidden_states, indices, output, stream)
@@ -995,10 +1015,10 @@ class XliteWrapper:
             if xlite_deepstack_input_embeds and hasattr(self.runnable, "_clear_deepstack_input_embeds"):
                 self.runnable._clear_deepstack_input_embeds(inputs_embeds.size(0))
         if (self.decode_attention_backend in (
-                "ascendc_asr", "paged_310p", "native_atb", "direct_atb")
+                "ascendc_asr_nz", "ascendc_asr", "paged_310p", "native_atb", "direct_atb")
                 or self.matmul_optimization == "p3_aclnn"
                 or self.matmul_backend in (
-                    "ascendc_asr_perf", "ascendc_asr", "m200_asr_prefill",
+                    "ascendc_asr_nz", "ascendc_asr_perf", "ascendc_asr", "m200_asr_prefill",
                     "m200_asr", "aclnn")):
             forwards = sum(self.runtime_stats["batch_distribution"].values())
             if forwards == 1 or forwards % 128 == 0:

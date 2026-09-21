@@ -120,7 +120,7 @@ CONCURRENCIES="${CONCURRENCIES//,/ }"
 CONFIGS="${CONFIGS//,/ }"
 
 case "${DECODE_ATTENTION_BACKEND}" in
-  legacy|ascendc_asr|direct_atb|native_atb|batched_aclnn|paged_310p) ;;
+  legacy|ascendc_asr_nz|ascendc_asr|direct_atb|native_atb|batched_aclnn|paged_310p) ;;
   *) echo "Invalid decode attention backend: ${DECODE_ATTENTION_BACKEND}" >&2; exit 2 ;;
 esac
 case "${PREFILL_ATTENTION_BACKEND}" in
@@ -134,7 +134,7 @@ if [[ "${DIRECT_ATB_SETUP_REUSE}" == true && "${DECODE_ATTENTION_BACKEND}" != di
   echo "--direct-atb-setup-reuse requires --decode-attention-backend direct_atb" >&2; exit 2
 fi
 case "${MATMUL_BACKEND}" in
-  ascendc_asr_perf|ascendc_asr|m200_asr_prefill|m200_asr|aclnn) ;;
+  ascendc_asr_nz|ascendc_asr_perf|ascendc_asr|m200_asr_prefill|m200_asr|aclnn) ;;
   *) echo "Invalid MatMul backend: ${MATMUL_BACKEND}" >&2; exit 2 ;;
 esac
 if [[ "${XLITE_DECODE_GRAPH}" == true ]]; then
@@ -302,6 +302,9 @@ start_server() {
       additional_config="{\"audio_encoder_aclgraph_sizes\":${AUDIO_GRAPH_SIZES},\
 \"xlite_graph_config\":{\"enabled\":true,\"full_mode\":true,\"decode_attention_backend\":\"${DECODE_ATTENTION_BACKEND}\",\"prefill_attention_backend\":\"${PREFILL_ATTENTION_BACKEND}\",\"matmul_backend\":\"${MATMUL_BACKEND}\"}}"
       additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["xlite_graph_config"].update(matmul_optimization=sys.argv[2],matmul_policy=sys.argv[3] or None,direct_atb_setup_reuse=sys.argv[4] == "true",aclnn_matmul_async=sys.argv[5] == "true",decode_graph=sys.argv[6] == "true"); print(json.dumps(d))' "${additional_config}" "${MATMUL_OPTIMIZATION}" "${MATMUL_POLICY}" "${DIRECT_ATB_SETUP_REUSE}" "${ACLNN_MATMUL_ASYNC}" "${XLITE_DECODE_GRAPH}")"
+      if [[ "${MATMUL_BACKEND}" == ascendc_asr_nz ]]; then
+        additional_config="$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d["weight_nz_mode"]=2; print(json.dumps(d))' "${additional_config}")"
+      fi
       ;;
     *)
       echo "Unknown configuration: ${config}" >&2
