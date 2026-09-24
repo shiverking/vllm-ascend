@@ -174,6 +174,35 @@ def maybe_compute_actual_seq_lengths(
     return actual, [end * ratio for end in actual]
 
 
+def prepare_padded_sequence_lengths(
+    sequence_lengths: torch.Tensor,
+    actual_tokens: int,
+    token_budget: int,
+) -> torch.Tensor:
+    sequence_lengths = sequence_lengths.to(
+        device="cpu", dtype=torch.int32
+    ).contiguous()
+    if int(sequence_lengths.sum()) != actual_tokens:
+        raise ValueError(
+            "Encoder graph sequence lengths do not match its input: "
+            f"tokens={actual_tokens}, seq_lens={sequence_lengths.tolist()}"
+        )
+    padding = token_budget - actual_tokens
+    if padding < 0:
+        raise ValueError(
+            "Encoder graph input exceeds its token budget: "
+            f"actual={actual_tokens}, budget={token_budget}"
+        )
+    if padding:
+        sequence_lengths = torch.cat(
+            (
+                sequence_lengths,
+                torch.tensor([padding], dtype=torch.int32),
+            )
+        )
+    return sequence_lengths
+
+
 def update_encoder_graph_params(
     update_stream: torch.npu.Stream,
     token_budget: int,
@@ -255,6 +284,8 @@ def update_encoder_graph_params(
 # ---------------------------------------------------------------------------
 class EncoderAclGraphManager(EncoderCudaGraphManager):
     """Hooks encoder capture/replay into Ascend FIA graph-task infrastructure."""
+
+    supports_runtime_sequence_lengths = True
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -376,8 +407,41 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                 padding_logic = self.config.padding_logics.get(key, self._copy_padded_buffer)
                 padding_logic(buf, src)
 
-        cu_seqlens = graph_meta.input_buffers.get("cu_seqlens")
-        cu_seqlens_cpu = None if cu_seqlens is None else cu_seqlens.cpu()
+        sequence_lengths = replay.values.get("sequence_lengths")
+        if sequence_lengths is not None:
+            modality = self.model.get_input_modality(mm_kwargs)
+            input_key = self.config.input_key_by_modality[modality]
+            graph_input = replay.values.get(input_key)
+            actual_tokens = (
+                int(graph_input.shape[0])
+                if graph_input is not None
+                else int(sequence_lengths.sum())
+            )
+            padded_sequence_lengths = prepare_padded_sequence_lengths(
+                sequence_lengths,
+                actual_tokens,
+                token_budget,
+            )
+            cu_seqlens_cpu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32),
+                    padded_sequence_lengths.cumsum(
+                        0, dtype=torch.int32
+                    ),
+                )
+            )
+            logger.debug(
+                "Audio encoder ACLGraph replay: actual_tokens=%d, "
+                "budget=%d, padding_tokens=%d",
+                actual_tokens,
+                token_budget,
+                token_budget - actual_tokens,
+            )
+        else:
+            cu_seqlens = graph_meta.input_buffers.get("cu_seqlens")
+            cu_seqlens_cpu = (
+                None if cu_seqlens is None else cu_seqlens.cpu()
+            )
 
         update_stream = self.update_stream
         if update_stream is None:

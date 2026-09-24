@@ -12,6 +12,7 @@ from vllm_ascend.worker.encoder_acl_graph import (
     get_encoder_forward_context,
     get_encoder_graph_params,
     maybe_compute_actual_seq_lengths,
+    prepare_padded_sequence_lengths,
     set_encoder_graph_params,
     update_encoder_graph_params,
 )
@@ -188,3 +189,34 @@ def test_capture_budget_graph_npu():
         graph_meta = mgr._get_graph_set("default")[2048]
     assert graph_meta.graph is fake_graph
     assert graph_meta.input_buffers is capture_values
+
+
+def test_prepare_padded_sequence_lengths_isolates_padding():
+    result = prepare_padded_sequence_lengths(
+        torch.tensor([50, 12], dtype=torch.int32),
+        actual_tokens=62,
+        token_budget=64,
+    )
+
+    assert result.tolist() == [50, 12, 2]
+    assert result.device.type == "cpu"
+    assert result.dtype == torch.int32
+
+
+def test_prepare_padded_sequence_lengths_exact_budget():
+    result = prepare_padded_sequence_lengths(
+        torch.tensor([64], dtype=torch.int32),
+        actual_tokens=64,
+        token_budget=64,
+    )
+
+    assert result.tolist() == [64]
+
+
+def test_prepare_padded_sequence_lengths_rejects_invalid_topology():
+    with pytest.raises(ValueError, match="do not match"):
+        prepare_padded_sequence_lengths(
+            torch.tensor([60], dtype=torch.int32),
+            actual_tokens=62,
+            token_budget=64,
+        )
