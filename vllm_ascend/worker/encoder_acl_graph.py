@@ -409,14 +409,7 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
 
         sequence_lengths = replay.values.get("sequence_lengths")
         if sequence_lengths is not None:
-            modality = self.model.get_input_modality(mm_kwargs)
-            input_key = self.config.input_key_by_modality[modality]
-            graph_input = replay.values.get(input_key)
-            actual_tokens = (
-                int(graph_input.shape[0])
-                if graph_input is not None
-                else int(sequence_lengths.sum())
-            )
+            actual_tokens = int(sequence_lengths.sum())
             padded_sequence_lengths = prepare_padded_sequence_lengths(
                 sequence_lengths,
                 actual_tokens,

@@ -220,3 +220,41 @@ def test_prepare_padded_sequence_lengths_rejects_invalid_topology():
             actual_tokens=62,
             token_budget=64,
         )
+
+
+@pytest.mark.skipif(not vllm_version_is("0.23.0"), reason="vLLM v0.23 API")
+def test_replay_uses_v023_values_and_cpu_sequence_lengths():
+    manager, model = _make_manager()
+    manager.config = SimpleNamespace(
+        buffer_keys=["_audio_encoder_hidden_states"], padding_logics={}
+    )
+    manager.update_stream = MagicMock()
+    static_input = torch.full((64, 2), -1.0)
+    graph = MagicMock()
+    manager.budget_graphs[64] = SimpleNamespace(
+        input_buffers={"_audio_encoder_hidden_states": static_input},
+        graph=graph,
+        output_buffer=torch.zeros(64, 2),
+    )
+    model.get_encoder_cudagraph_item_specs.return_value = [MagicMock()]
+    model.prepare_encoder_cudagraph_replay_buffers.return_value = SimpleNamespace(
+        values={
+            "_audio_encoder_hidden_states": torch.ones(62, 2),
+            "sequence_lengths": torch.tensor([50, 12], dtype=torch.int32),
+        }
+    )
+    captured = {}
+
+    def record_host_topology(*args):
+        captured["cu_seqlens"] = get_encoder_forward_context().cu_seqlens_cpu.tolist()
+
+    with patch(
+        "vllm_ascend.worker.encoder_acl_graph.update_encoder_graph_params",
+        side_effect=record_host_topology,
+    ):
+        manager._run_budget_graph({"audio_feature_lengths": torch.tensor([62])}, 64)
+
+    assert captured["cu_seqlens"] == [0, 50, 62, 64]
+    torch.testing.assert_close(static_input[:62], torch.ones(62, 2))
+    torch.testing.assert_close(static_input[62:], torch.zeros(2, 2))
+    graph.replay.assert_called_once()
