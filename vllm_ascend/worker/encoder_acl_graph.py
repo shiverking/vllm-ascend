@@ -334,6 +334,42 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         self.update_stream: torch.npu.Stream | None = None
         self.short_audio_attention_masks: dict[int, torch.Tensor] = {}
         self.short_audio_host_masks: dict[int, torch.Tensor] = {}
+        self.diagnostic_sync_stage = (self.vllm_config.additional_config or {}).get(
+            "audio_encoder_graph_diag_sync", "off"
+        )
+        if self.diagnostic_sync_stage not in {"off", "capture", "inputs", "replay"}:
+            raise ValueError(
+                "audio_encoder_graph_diag_sync must be one of off, capture, "
+                "inputs, replay"
+            )
+        if self.diagnostic_sync_stage != "off":
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] enabled: sync_stage=%s; diagnostic run only",
+                self.diagnostic_sync_stage,
+            )
+
+    def _diagnostic_sync(self, stage: str, token_budget: int) -> None:
+        if self.diagnostic_sync_stage != stage:
+            return
+        logger.warning(
+            "[ENCODER_GRAPH_DIAG] sync begin: stage=%s, budget=%d",
+            stage,
+            token_budget,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception(
+                "[ENCODER_GRAPH_DIAG] sync failed: stage=%s, budget=%d",
+                stage,
+                token_budget,
+            )
+            raise
+        logger.warning(
+            "[ENCODER_GRAPH_DIAG] sync complete: stage=%s, budget=%d",
+            stage,
+            token_budget,
+        )
 
     def _uses_short_audio_mask(self, token_budget: int) -> bool:
         return (
@@ -431,6 +467,29 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         else:
             graph_set = self._get_graph_set(path)
             graph_set[token_budget] = graph_meta
+        if self.diagnostic_sync_stage != "off":
+            params = get_encoder_graph_params()
+            workspace = None if params is None else params.workspaces.get(token_budget)
+            workspace_bytes = (
+                workspace.numel() * workspace.element_size()
+                if isinstance(workspace, torch.Tensor)
+                else 0
+            )
+            task_count = 0 if params is None else len(params.handles[token_budget])
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] capture stored: budget=%d, attention=%s, "
+                "sequence_lengths=%s, fia_tasks=%d, workspace_bytes=%d",
+                token_budget,
+                "masked_prompt" if attention_mask is not None else "fia",
+                (
+                    None
+                    if values.get("sequence_lengths") is None
+                    else values["sequence_lengths"].tolist()
+                ),
+                task_count,
+                workspace_bytes,
+            )
+            self._diagnostic_sync("capture", token_budget)
 
     def _run_budget_graph(
         self,
@@ -513,19 +572,46 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                 None if cu_seqlens is None else cu_seqlens.cpu()
             )
 
+        if self.diagnostic_sync_stage != "off":
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] inputs updated: budget=%d, "
+                "sequence_lengths=%s, cu_seqlens=%s, attention=%s",
+                token_budget,
+                None if sequence_lengths is None else sequence_lengths.tolist(),
+                None if cu_seqlens_cpu is None else cu_seqlens_cpu.tolist(),
+                "masked_prompt" if self._uses_short_audio_mask(token_budget) else "fia",
+            )
+            self._diagnostic_sync("inputs", token_budget)
+
         update_stream = self.update_stream
         if update_stream is None:
             update_stream = torch.npu.Stream()
 
+        if self.diagnostic_sync_stage != "off":
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] replay begin: budget=%d", token_budget
+            )
         graph_meta.graph.replay()
 
         if not self._uses_short_audio_mask(token_budget):
+            if self.diagnostic_sync_stage != "off":
+                logger.warning(
+                    "[ENCODER_GRAPH_DIAG] FIA update begin: budget=%d", token_budget
+                )
             with set_encoder_forward_context(
                 token_budget,
                 False,
                 cu_seqlens_cpu=cu_seqlens_cpu,
             ):
                 update_encoder_graph_params(update_stream, token_budget)
+            if self.diagnostic_sync_stage != "off":
+                logger.warning(
+                    "[ENCODER_GRAPH_DIAG] FIA update submitted: budget=%d",
+                    token_budget,
+                )
+
+        if self.diagnostic_sync_stage != "off":
+            self._diagnostic_sync("replay", token_budget)
 
         self.graph_hits += num_items
         logger.debug(

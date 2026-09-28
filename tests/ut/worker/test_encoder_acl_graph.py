@@ -127,7 +127,7 @@ def test_update_encoder_graph_params_cu_seqlens():
     assert captured["actual_seq_lengths"] == [4, 8]
 
 
-def _make_manager():
+def _make_manager(diagnostic_sync_stage=None):
     vllm_config = MagicMock(spec=VllmConfig)
     vllm_config.compilation_config = CompilationConfig()
     mm_config = MagicMock()
@@ -137,6 +137,11 @@ def _make_manager():
     vllm_config.model_config.multimodal_config = mm_config
     vllm_config.parallel_config = MagicMock()
     vllm_config.parallel_config.tensor_parallel_size = 1
+    vllm_config.additional_config = (
+        {"audio_encoder_graph_diag_sync": diagnostic_sync_stage}
+        if diagnostic_sync_stage is not None
+        else {}
+    )
 
     model = MagicMock()
     model.get_encoder_cudagraph_config.return_value = MagicMock(
@@ -161,6 +166,27 @@ def test_capture_graph_params():
     params = get_encoder_graph_params()
     assert params is not None
     assert 2048 in params.events
+
+
+def test_diagnostic_sync_selects_only_configured_stage():
+    manager, _ = _make_manager("inputs")
+    with patch("vllm_ascend.worker.encoder_acl_graph.torch.npu.synchronize") as sync:
+        manager._diagnostic_sync("capture", 25)
+        manager._diagnostic_sync("inputs", 25)
+        manager._diagnostic_sync("replay", 25)
+    sync.assert_called_once_with()
+
+
+def test_diagnostic_sync_is_disabled_by_default():
+    manager, _ = _make_manager()
+    with patch("vllm_ascend.worker.encoder_acl_graph.torch.npu.synchronize") as sync:
+        manager._diagnostic_sync("replay", 25)
+    sync.assert_not_called()
+
+
+def test_diagnostic_sync_rejects_invalid_stage():
+    with pytest.raises(ValueError, match="off, capture, inputs, replay"):
+        _make_manager("all")
 
 
 def test_capture_budget_graph_npu():
