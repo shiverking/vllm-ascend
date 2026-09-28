@@ -17,9 +17,8 @@
 
 """Ascend implementation of upstream :class:`MMEncoderAttention`.
 
-Eager and ACL-graph capture both use Fused Infer Attention (``npu_fused_infer_attention_score``)
-with ``graph_task_group_begin/end`` so replay-time host metadata can be rebound from the update stream,
-matching the LLM full-graph pattern in :mod:`vllm_ascend.attention.attention_v1`.
+Eager and large encoder graphs use Fused Infer Attention. Short Qwen3-ASR graphs
+use device-masked Prompt Flash Attention to keep replay metadata on device.
 """
 
 from __future__ import annotations
@@ -32,6 +31,7 @@ from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderA
 
 from vllm_ascend.utils import weak_ref_tensors
 from vllm_ascend.worker.encoder_acl_graph import (
+    SHORT_AUDIO_MASK_ALIGNMENT,
     get_encoder_forward_context,
     get_encoder_graph_params,
     maybe_compute_actual_seq_lengths,
@@ -220,6 +220,65 @@ class AscendMMEncoderAttention(MMEncoderAttention):
             is_reshaped=is_reshaped,
         )
 
+    def _forward_masked_audio_graph(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        attention_mask: torch.Tensor,
+        *,
+        is_reshaped: bool,
+        bsz: int,
+        q_len: int,
+    ) -> torch.Tensor:
+        """Use a device mask so short graph replay has no host FIA task updates."""
+        if bsz != 1 or key.shape[0] != query.shape[0]:
+            raise ValueError(
+                "Masked audio encoder graph requires self-attention with batch size 1"
+            )
+        attention_tokens = attention_mask.shape[0]
+        if (
+            attention_mask.ndim != 2
+            or attention_mask.shape[1] != attention_tokens
+            or attention_tokens < q_len
+            or attention_tokens % SHORT_AUDIO_MASK_ALIGNMENT
+        ):
+            raise ValueError("Invalid masked audio encoder graph attention shape")
+
+        q, k, v, origin_head_dim = self._maybe_pad_qkv(query, key, value)
+        if attention_tokens > q_len:
+            padding = (0, 0, 0, 0, 0, attention_tokens - q_len)
+            q, k, v = F.pad(q, padding), F.pad(k, padding), F.pad(v, padding)
+        head_dim = q.shape[-1]
+
+        def to_bnsd(tensor: torch.Tensor) -> torch.Tensor:
+            return (
+                tensor.reshape(1, attention_tokens, self.num_heads, head_dim)
+                .transpose(1, 2)
+                .contiguous()
+            )
+
+        output = torch_npu.npu_prompt_flash_attention(
+            to_bnsd(q),
+            to_bnsd(k),
+            to_bnsd(v),
+            atten_mask=attention_mask,
+            num_heads=self.num_heads,
+            num_key_value_heads=self.num_heads,
+            scale_value=self.scale,
+            pre_tokens=SWA_INT_MAX,
+            next_tokens=SWA_INT_MAX,
+            input_layout="BNSD",
+            sparse_mode=0,
+        )
+        output = output.transpose(1, 2).contiguous().view(
+            attention_tokens, self.num_heads, head_dim
+        )[:q_len]
+        output = self._maybe_unpad_output(output, origin_head_dim)
+        return self._restore_batch_layout(
+            output, bsz=bsz, q_len=q_len, is_reshaped=is_reshaped
+        )
+
     def _forward_capture_fia(
         self,
         query: torch.Tensor,
@@ -327,6 +386,18 @@ class AscendMMEncoderAttention(MMEncoderAttention):
         is_reshaped = query.dim() == 4
 
         q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
+
+        attention_mask = get_encoder_forward_context().attention_mask
+        if attention_mask is not None:
+            return self._forward_masked_audio_graph(
+                q,
+                k,
+                v,
+                attention_mask,
+                is_reshaped=is_reshaped,
+                bsz=bsz,
+                q_len=q_len,
+            )
 
         if get_encoder_forward_context().capturing:
             return self._forward_capture_fia(

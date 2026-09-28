@@ -168,6 +168,32 @@ class TestAscendMMEncoderAttentionCapture(FIAMockMixin):
         self.mock_graph_begin.assert_called_once()
         self.mock_graph_end.assert_called_once()
 
+    def test_short_audio_graph_uses_device_mask_without_fia_tasks(self):
+        layer = self._make_layer(num_heads=4, num_kv_heads=4, head_size=72)
+        qkv = torch.randn(1, 25, 4 * 72)
+        mask = torch.zeros((128, 128), dtype=torch.bool)
+        captured = {}
+
+        def fake_prompt_attention(query, key, value, **kwargs):
+            captured["query_shape"] = query.shape
+            captured["mask"] = kwargs["atten_mask"]
+            return torch.zeros_like(query)
+
+        with (
+            patch(
+                "vllm_ascend.ops.mm_encoder_attention.torch_npu.npu_prompt_flash_attention",
+                side_effect=fake_prompt_attention,
+            ),
+            set_encoder_forward_context(25, True, attention_mask=mask),
+        ):
+            output = layer.forward_oot(qkv, qkv, qkv)
+
+        self.assertEqual(output.shape, qkv.shape)
+        self.assertEqual(captured["query_shape"], (1, 4, 128, 128))
+        self.assertIs(captured["mask"], mask)
+        self.mock_graph_begin.assert_not_called()
+        self.mock_graph_end.assert_not_called()
+
     def test_forward_oot_seqlens(self):
         layer = self._make_layer(num_heads=4, num_kv_heads=4, head_size=72)
         seq_lens = [3, 7, 2]

@@ -9,6 +9,7 @@ from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker import encoder_acl_graph
 from vllm_ascend.worker.encoder_acl_graph import (
     EncoderAclGraphManager,
+    build_short_audio_attention_mask,
     get_encoder_forward_context,
     get_encoder_graph_params,
     maybe_compute_actual_seq_lengths,
@@ -211,6 +212,76 @@ def test_prepare_padded_sequence_lengths_exact_budget():
     )
 
     assert result.tolist() == [64]
+
+
+@pytest.mark.parametrize(
+    "token_budget, expected_real, expected_dummy",
+    [(25, 25, 0), (26, 25, 1)],
+)
+def test_short_audio_mask_isolates_padding(
+    token_budget, expected_real, expected_dummy
+):
+    mask = build_short_audio_attention_mask(
+        torch.tensor([25], dtype=torch.int32), token_budget
+    )
+    assert mask.shape == (128, 128)
+    assert not mask[:expected_real, :expected_real].any()
+    assert mask[:expected_real, expected_real:].all()
+    if expected_dummy:
+        assert not mask[25:26, 25:26].any()
+        assert mask[25:26, 26:].all()
+    assert not mask[token_budget:, token_budget:].any()
+
+
+def test_short_audio_mask_keeps_real_sequences_separate():
+    mask = build_short_audio_attention_mask(
+        torch.tensor([20, 5], dtype=torch.int32), 26
+    )
+    assert not mask[:20, :20].any()
+    assert not mask[20:25, 20:25].any()
+    assert mask[:20, 20:25].all()
+    assert mask[:25, 25:].all()
+
+
+@pytest.mark.skipif(not vllm_version_is("0.23.0"), reason="vLLM v0.23 API")
+def test_short_audio_mask_replay_updates_a_b_a_without_fia_tasks():
+    manager, model = _make_manager()
+    manager.config = SimpleNamespace(
+        buffer_keys=["_audio_encoder_hidden_states"], padding_logics={}
+    )
+    manager.update_stream = MagicMock()
+    manager.budget_graphs[26] = SimpleNamespace(
+        input_buffers={"_audio_encoder_hidden_states": torch.zeros(26, 2)},
+        graph=MagicMock(),
+        output_buffer=torch.zeros(26, 2),
+    )
+    manager.short_audio_attention_masks[26] = torch.empty(128, 128, dtype=torch.bool)
+    manager.short_audio_host_masks[26] = torch.empty(128, 128, dtype=torch.bool)
+    model.get_encoder_cudagraph_item_specs.return_value = [MagicMock()]
+
+    with (
+        patch.object(manager, "_uses_short_audio_mask", return_value=True),
+        patch(
+            "vllm_ascend.worker.encoder_acl_graph.update_encoder_graph_params"
+        ) as update_fia,
+    ):
+        for topology in ([25], [20, 4], [25]):
+            model.prepare_encoder_cudagraph_replay_buffers.return_value = (
+                SimpleNamespace(
+                    values={
+                        "_audio_encoder_hidden_states": torch.ones(sum(topology), 2),
+                        "sequence_lengths": torch.tensor(topology, dtype=torch.int32),
+                    }
+                )
+            )
+            manager._run_budget_graph({}, 26)
+            expected = build_short_audio_attention_mask(
+                torch.tensor(topology, dtype=torch.int32), 26
+            )
+            torch.testing.assert_close(manager.short_audio_attention_masks[26], expected)
+
+    update_fia.assert_not_called()
+    assert manager.budget_graphs[26].graph.replay.call_count == 3
 
 
 def test_prepare_padded_sequence_lengths_rejects_invalid_topology():
