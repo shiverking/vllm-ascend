@@ -177,6 +177,36 @@ def test_diagnostic_sync_selects_only_configured_stage():
     sync.assert_called_once_with()
 
 
+def test_replay_diagnostic_syncs_inputs_and_replay():
+    manager, _ = _make_manager("replay")
+    with patch("vllm_ascend.worker.encoder_acl_graph.torch.npu.synchronize") as sync:
+        manager._diagnostic_sync("capture", 26)
+        manager._diagnostic_sync("inputs", 26)
+        manager._diagnostic_sync("replay", 26)
+    assert sync.call_count == 2
+
+
+def test_diagnostic_graph_buffers_logs_static_addresses():
+    manager, _ = _make_manager("replay")
+    input_buffer = torch.zeros(26, 2)
+    output_buffer = torch.zeros(26, 2)
+    mask = torch.zeros(128, 128, dtype=torch.bool)
+    manager.short_audio_attention_masks[26] = mask
+    graph_meta = SimpleNamespace(
+        graph=object(),
+        input_buffers={"hidden_states": input_buffer},
+        output_buffer=output_buffer,
+    )
+    with patch("vllm_ascend.worker.encoder_acl_graph.logger.warning") as warning:
+        manager._diagnostic_graph_buffers(graph_meta, 26, "capture")
+    assert warning.call_args.args[2] == 26
+    assert warning.call_args.args[5] == {
+        "hidden_states": ((26, 2), hex(input_buffer.data_ptr()))
+    }
+    assert warning.call_args.args[6] == hex(output_buffer.data_ptr())
+    assert warning.call_args.args[7] == hex(mask.data_ptr())
+
+
 def test_diagnostic_sync_is_disabled_by_default():
     manager, _ = _make_manager()
     with patch("vllm_ascend.worker.encoder_acl_graph.torch.npu.synchronize") as sync:

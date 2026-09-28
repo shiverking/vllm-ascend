@@ -349,7 +349,9 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             )
 
     def _diagnostic_sync(self, stage: str, token_budget: int) -> None:
-        if self.diagnostic_sync_stage != stage:
+        if self.diagnostic_sync_stage != stage and not (
+            self.diagnostic_sync_stage == "replay" and stage == "inputs"
+        ):
             return
         logger.warning(
             "[ENCODER_GRAPH_DIAG] sync begin: stage=%s, budget=%d",
@@ -369,6 +371,30 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             "[ENCODER_GRAPH_DIAG] sync complete: stage=%s, budget=%d",
             stage,
             token_budget,
+        )
+
+    def _diagnostic_graph_buffers(
+        self, graph_meta: BudgetGraphMetadata, token_budget: int, phase: str
+    ) -> None:
+        if self.diagnostic_sync_stage == "off":
+            return
+        inputs = {
+            key: (tuple(buf.shape), hex(buf.data_ptr()))
+            for key, buf in graph_meta.input_buffers.items()
+            if isinstance(buf, torch.Tensor)
+        }
+        output = graph_meta.output_buffer
+        mask = self.short_audio_attention_masks.get(token_budget)
+        logger.warning(
+            "[ENCODER_GRAPH_DIAG] graph buffers: phase=%s, budget=%d, "
+            "graph_id=%#x, pool_id=%#x, inputs=%s, output=%s, mask=%s",
+            phase,
+            token_budget,
+            id(graph_meta.graph),
+            id(self.graph_pool),
+            inputs,
+            None if not isinstance(output, torch.Tensor) else hex(output.data_ptr()),
+            None if mask is None else hex(mask.data_ptr()),
         )
 
     def _uses_short_audio_mask(self, token_budget: int) -> bool:
@@ -467,6 +493,7 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         else:
             graph_set = self._get_graph_set(path)
             graph_set[token_budget] = graph_meta
+        self._diagnostic_graph_buffers(graph_meta, token_budget, "capture")
         if self.diagnostic_sync_stage != "off":
             params = get_encoder_graph_params()
             workspace = None if params is None else params.workspaces.get(token_budget)
@@ -588,6 +615,7 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             update_stream = torch.npu.Stream()
 
         if self.diagnostic_sync_stage != "off":
+            self._diagnostic_graph_buffers(graph_meta, token_budget, "replay")
             logger.warning(
                 "[ENCODER_GRAPH_DIAG] replay begin: budget=%d", token_budget
             )
