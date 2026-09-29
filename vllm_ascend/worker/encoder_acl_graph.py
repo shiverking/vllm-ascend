@@ -217,13 +217,24 @@ def build_short_audio_attention_mask(
     """Keep each real sequence and all padding in separate attention blocks."""
     if token_budget <= 0 or token_budget > SHORT_AUDIO_MASK_GRAPH_MAX_TOKENS:
         raise ValueError(f"Unsupported short audio graph budget: {token_budget}")
+    return build_audio_attention_mask(sequence_lengths, token_budget)
+
+
+def build_audio_attention_mask(
+    sequence_lengths: torch.Tensor | tuple[int, ...], token_budget: int
+) -> torch.Tensor:
+    """Block-mask real sequences and both body and alignment padding."""
+    if token_budget <= 0:
+        raise ValueError("Audio graph budget must be positive")
+    if not isinstance(sequence_lengths, torch.Tensor):
+        sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.int32)
     if (
         sequence_lengths.ndim != 1
         or sequence_lengths.numel() == 0
         or sequence_lengths.device.type != "cpu"
         or bool((sequence_lengths <= 0).any())
     ):
-        raise ValueError("Short audio graph requires positive CPU sequence lengths")
+        raise ValueError("Audio graph requires positive CPU sequence lengths")
     actual_tokens = int(sequence_lengths.sum())
     topology = prepare_padded_sequence_lengths(
         sequence_lengths, actual_tokens, token_budget
@@ -334,6 +345,32 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         self.update_stream: torch.npu.Stream | None = None
         self.short_audio_attention_masks: dict[int, torch.Tensor] = {}
         self.short_audio_host_masks: dict[int, torch.Tensor] = {}
+        self._is_qwen3_asr = (
+            self.model.__class__.__name__ == "Qwen3ASRForConditionalGeneration"
+        )
+        self._qwen_audio_pool = None
+        if self._is_qwen3_asr and self.config.modalities:
+            from vllm_ascend.worker.qwen3_audio_encoder_graph import (
+                Qwen3AudioEncoderGraphPool,
+            )
+
+            tower = self.model.audio_tower
+            if (
+                self.vllm_config.parallel_config.tensor_parallel_size == 1
+                and tower.dtype == torch.float16
+                and tower.device.type == "npu"
+                and not self.vllm_config.model_config.enforce_eager
+            ):
+                window = tower.get_attention_window_tokens()
+                budgets = (
+                    self.vllm_config.compilation_config.encoder_cudagraph_token_budgets
+                    or [window // 4, window, 2 * window, 4 * window]
+                )
+                self._qwen_audio_pool = Qwen3AudioEncoderGraphPool(
+                    self.model, self.device, budgets
+                )
+                # The generic manager must not also capture or replay this model.
+                self.token_budgets = list(self._qwen_audio_pool.budgets)
         self.diagnostic_sync_stage = (self.vllm_config.additional_config or {}).get(
             "audio_encoder_graph_diag_sync", "off"
         )
@@ -407,11 +444,27 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         encoder_graph_pool = graph_pool if graph_pool is not None else self.graph_pool
         self.graph_pool = encoder_graph_pool
 
+        if self._qwen_audio_pool is not None:
+            self._qwen_audio_pool.capture(encoder_graph_pool)
+            return
+        if self._is_qwen3_asr:
+            return
+
         set_encoder_graph_params(self.token_budgets)
 
         super().capture(graph_pool=encoder_graph_pool)
 
         weak_ref_workspaces()
+
+    def supports_modality(self, modality: str) -> bool:
+        if self._is_qwen3_asr:
+            return modality == "audio" and self._qwen_audio_pool is not None
+        return super().supports_modality(modality)
+
+    def execute(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        if self._qwen_audio_pool is not None:
+            return self._qwen_audio_pool.execute(mm_kwargs)
+        return super().execute(mm_kwargs)
 
     def _capture_budget_graph(self, token_budget: int, path: str = "default"):
         logger.debug(
