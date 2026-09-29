@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import VllmConfig, set_current_vllm_config
 
 pytest.importorskip("torch_npu")
 
@@ -26,6 +27,12 @@ WINDOW = 104
 BUDGETS = (26, 104, 208, 416)
 HIDDEN_SIZE = 256
 TOKEN_COUNTS = (25, 26, 27, 52, 78, 104, 105, 128, 208, 256, 384, 416, 512)
+
+
+@pytest.fixture(autouse=True)
+def _default_vllm_config():
+    with set_current_vllm_config(VllmConfig()):
+        yield
 
 
 class _AudioTower(torch.nn.Module):
