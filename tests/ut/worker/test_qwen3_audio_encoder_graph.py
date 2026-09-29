@@ -1,4 +1,5 @@
 from contextlib import nullcontext
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -146,6 +147,50 @@ def test_audio_graph_replay_clones_output_and_clears_padding():
     assert torch.all(second == 2)
     assert torch.all(runner.hidden_states[20:] == 0)
     assert first.data_ptr() != runner.output.data_ptr()
+
+
+@pytest.mark.parametrize(
+    "graph_chunks,padding,eager_tokens,expected_hit",
+    [
+        ([104, 26], 2, 0, True),
+        ([104], 0, 24, False),
+        ([], 0, 128, False),
+    ],
+)
+def test_audio_graph_call_log_exposes_capture_size_inputs(
+    graph_chunks, padding, eager_tokens, expected_hit
+):
+    model = MagicMock()
+    model.audio_tower.get_attention_window_tokens.return_value = 104
+    hidden_states = MagicMock()
+    hidden_states.dtype = torch.float16
+    hidden_states.device = torch.device("npu")
+    hidden_states.shape = (128, 8)
+    hidden_states.is_contiguous.return_value = True
+    model._prepare_audio_encoder_graph_inputs.return_value = (
+        hidden_states, None, None, torch.tensor([104, 24], dtype=torch.int32)
+    )
+    model.get_encoder_cudagraph_item_specs.return_value = [
+        SimpleNamespace(output_tokens=128)
+    ]
+    pool = Qwen3AudioEncoderGraphPool(model, torch.device("cpu"), BUDGETS)
+
+    with (
+        patch.object(pool, "_ordered_stream", return_value=nullcontext()),
+        patch.object(
+            pool,
+            "_execute_plan",
+            return_value=(torch.zeros(128, 8), graph_chunks, padding, eager_tokens),
+        ),
+        patch("vllm_ascend.worker.qwen3_audio_encoder_graph.logger.info") as log_info,
+    ):
+        pool.execute({})
+
+    message = log_info.call_args.args[0] % log_info.call_args.args[1:]
+    assert "items=1 item_tokens=[128] actual=128 seq_lens=[104, 24]" in message
+    assert f"graphs={graph_chunks} replays={len(graph_chunks)}" in message
+    assert f"padding={padding} eager={eager_tokens}" in message
+    assert f"graph_used={bool(graph_chunks)} graph_hit={expected_hit}" in message
 
 
 def test_qwen_audio_uses_dedicated_manager_not_generic_capture():

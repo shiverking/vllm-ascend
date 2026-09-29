@@ -310,13 +310,19 @@ class Qwen3AudioEncoderGraphPool:
                 f"items={item_lengths}, output={output.shape[0]}"
             )
         logger.info(
-            "[AUDIO_ENCODER_GRAPH] call=%d actual=%d graphs=%s "
-            "padding=%d eager=%d graph_hit=%s state=submitted",
+            "[AUDIO_ENCODER_GRAPH] call=%d items=%d item_tokens=%s "
+            "actual=%d seq_lens=%s graphs=%s replays=%d "
+            "padding=%d eager=%d graph_used=%s graph_hit=%s state=submitted",
             self._calls,
+            len(item_lengths),
+            item_lengths,
             hidden_states.shape[0],
+            list(topology),
             graph_chunks,
+            len(graph_chunks),
             padding,
             eager_tokens,
+            bool(graph_chunks),
             bool(graph_chunks) and eager_tokens == 0,
         )
         return list(output.split(item_lengths, dim=0))
