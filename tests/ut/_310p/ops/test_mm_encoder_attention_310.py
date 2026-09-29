@@ -79,3 +79,65 @@ def test_mm_encoder_attention_310_forward_oot_with_padding():
 
     assert out.shape == query.shape
     torch.testing.assert_close(out, query + 1.0)
+
+
+def test_mm_encoder_attention_310_reuses_cpu_sequence_lengths():
+    layer = AscendMMEncoderAttention310.__new__(AscendMMEncoderAttention310)
+    layer.num_heads = layer.num_kv_heads = 2
+    layer.head_size = 64
+    layer.enable_pad = False
+    layer.scale_value = layer.head_size**-0.5
+    layer.support_approximate_calculation = False
+    query = torch.randn(1, 4, 2, 64)
+    lengths = torch.tensor([2, 2], dtype=torch.int32)
+    seen = []
+
+    def fake_unpad(*, query, out, seq_len, **_kwargs):
+        seen.append(seq_len)
+        out.copy_(query)
+
+    with (
+        mock.patch("vllm_ascend._310p.ops.mm_encoder_attention.torch.diff") as diff,
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.torch_npu._npu_flash_attention_unpad",
+            side_effect=fake_unpad,
+            create=True,
+        ),
+    ):
+        layer.forward_oot(query, query, query, sequence_lengths=lengths)
+
+    diff.assert_not_called()
+    assert seen[0] is lengths
+
+
+def test_mm_encoder_attention_310_masked_graph_avoids_host_lengths():
+    layer = AscendMMEncoderAttention310.__new__(AscendMMEncoderAttention310)
+    layer.num_heads = layer.num_kv_heads = 2
+    layer.head_size = 64
+    layer.enable_pad = False
+    layer.scale_value = layer.head_size**-0.5
+    layer.support_approximate_calculation = False
+    query = torch.randn(1, 25, 2, 64)
+    mask = torch.zeros((128, 128), dtype=torch.bool)
+    seen = []
+
+    def fake_prompt(q, k, v, **kwargs):
+        seen.append(kwargs["atten_mask"])
+        return q
+
+    with (
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.get_audio_encoder_prompt_attention_mask",
+            return_value=mask,
+        ),
+        mock.patch("vllm_ascend._310p.ops.mm_encoder_attention.torch.diff") as diff,
+        mock.patch(
+            "vllm_ascend._310p.ops.mm_encoder_attention.torch_npu.npu_prompt_flash_attention",
+            side_effect=fake_prompt,
+        ),
+    ):
+        result = layer.forward_oot(query, query, query)
+
+    diff.assert_not_called()
+    assert seen[0] is mask
+    torch.testing.assert_close(result, query.reshape(1, 25, -1))

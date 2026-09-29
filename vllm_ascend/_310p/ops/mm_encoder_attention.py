@@ -21,19 +21,13 @@ import torch.nn.functional as F
 import torch_npu
 from vllm.model_executor.layers.attention.mm_encoder_attention import MMEncoderAttention  # type: ignore
 
+from vllm_ascend._310p.audio_encoder_acl_graph import (
+    AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT,
+    get_audio_encoder_prompt_attention_mask,
+)
+
 MIN_PAD_SIZE: int = 64  # min_size to pad weight
 MAX_PAD_SIZE: int = 128  # max_size to pad weight
-
-# Use seq_lens CPU cache to avoid frequent d2h copy.
-# AscendMMEncoderAttention310 will copy the cu_seqlens from NPU to CPU in every
-# forward, since the op _npu_flash_attention_unpad() requires CPU cu_seqlens
-# (otherwise it will break down).
-# Thus, we use seq_lens_cpu_cache to cache this tensor, since it's shared
-# between all layers, but may change in different forward step. When the
-# current layer_index is 0, we update the cache, otherwise we directly use the
-# cache to avoid frequent diff and copy operations, which are costful.
-seq_lens_cpu_cache: torch.Tensor = None
-
 
 def is_approximate_calculation_supported() -> bool:
     return hasattr(torch_npu, "_npu_flash_attention_unpad_v2")
@@ -106,11 +100,7 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
         bsz, q_len = query.size()[:2]
         kv_len = key.size(1)
         is_reshaped = query.dim() == 4
-
-        # Directly use seq_lens cpu cache to avoid d2h copy.
-        if cu_seqlens is None:
-            cu_seqlens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device="cpu")
-        seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
+        prompt_mask = get_audio_encoder_prompt_attention_mask()
 
         # q, k, v: [b, s, head, head_dim] -> [b * s, head, head_dim]
         q, k, v = self._reshape_qkv_to_3d(query, key, value, bsz, q_len, kv_len)
@@ -123,33 +113,94 @@ class AscendMMEncoderAttention310(MMEncoderAttention):
             k = F.pad(k, (0, pad_len), mode="constant", value=0)
             v = F.pad(v, (0, pad_len), mode="constant", value=0)
 
-        context_layer = torch.empty_like(q)
-        # TODO: The current torch_npu version 2.10.0 does not support
-        # _npu_flash_attention_unpad_v2. Once it is supported, drop the
-        # else branch below and always use the v2 op.
-        if self.support_approximate_calculation:
-            torch_npu._npu_flash_attention_unpad_v2(
-                query=q,
-                key=k,
-                value=v,
-                seq_len=seq_lens_cpu,
-                scale_value=self.scale_value,
+        if prompt_mask is not None:
+            if bsz != 1 or q_len != kv_len:
+                raise ValueError("Audio graph requires batch-1 self-attention")
+            attention_tokens = prompt_mask.shape[0]
+            if (
+                prompt_mask.ndim != 2
+                or prompt_mask.shape[1] != attention_tokens
+                or attention_tokens < q_len
+                or attention_tokens % AUDIO_ENCODER_PROMPT_ATTENTION_ALIGNMENT
+            ):
+                raise ValueError("Invalid audio graph attention mask shape")
+            if attention_tokens > q_len:
+                padding = (0, 0, 0, 0, 0, attention_tokens - q_len)
+                q, k, v = F.pad(q, padding), F.pad(k, padding), F.pad(v, padding)
+            head_dim = q.shape[-1]
+
+            def to_bnsd(tensor: torch.Tensor) -> torch.Tensor:
+                return (
+                    tensor.reshape(bsz, attention_tokens, self.num_heads, head_dim)
+                    .transpose(1, 2)
+                    .contiguous()
+                )
+
+            context_layer = torch_npu.npu_prompt_flash_attention(
+                to_bnsd(q),
+                to_bnsd(k),
+                to_bnsd(v),
+                atten_mask=prompt_mask,
                 num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                out=context_layer,
-                kernel_type=2,
+                num_key_value_heads=self.num_heads,
+                scale_value=self.scale_value,
+                pre_tokens=2147483647,
+                next_tokens=2147483647,
+                input_layout="BNSD",
+                sparse_mode=0,
+            )
+            context_layer = (
+                context_layer.transpose(1, 2)
+                .contiguous()
+                .view(bsz * attention_tokens, self.num_heads, head_dim)[: bsz * q_len]
             )
         else:
-            torch_npu._npu_flash_attention_unpad(
-                query=q,
-                key=k,
-                value=v,
-                seq_len=seq_lens_cpu,
-                scale_value=self.scale_value,
-                num_heads=self.num_heads,
-                num_kv_heads=self.num_kv_heads,
-                out=context_layer,
-            )
+            if sequence_lengths is not None:
+                if (
+                    sequence_lengths.device.type == "cpu"
+                    and sequence_lengths.dtype == torch.int32
+                    and sequence_lengths.is_contiguous()
+                ):
+                    seq_lens_cpu = sequence_lengths
+                else:
+                    seq_lens_cpu = sequence_lengths.to(
+                        device="cpu", dtype=torch.int32
+                    ).contiguous()
+            else:
+                if cu_seqlens is None:
+                    cu_seqlens = torch.arange(
+                        0,
+                        (bsz + 1) * q_len,
+                        step=q_len,
+                        dtype=torch.int32,
+                        device="cpu",
+                    )
+                seq_lens_cpu = torch.diff(cu_seqlens).to("cpu")
+
+            context_layer = torch.empty_like(q)
+            if self.support_approximate_calculation:
+                torch_npu._npu_flash_attention_unpad_v2(
+                    query=q,
+                    key=k,
+                    value=v,
+                    seq_len=seq_lens_cpu,
+                    scale_value=self.scale_value,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    out=context_layer,
+                    kernel_type=2,
+                )
+            else:
+                torch_npu._npu_flash_attention_unpad(
+                    query=q,
+                    key=k,
+                    value=v,
+                    seq_len=seq_lens_cpu,
+                    scale_value=self.scale_value,
+                    num_heads=self.num_heads,
+                    num_kv_heads=self.num_kv_heads,
+                    out=context_layer,
+                )
 
         if self.enable_pad:
             context_layer = context_layer[..., :origin_shape]

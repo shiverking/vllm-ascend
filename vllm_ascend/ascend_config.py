@@ -23,6 +23,35 @@ from vllm.utils.math_utils import cdiv
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
+MAX_AUDIO_ENCODER_ACLGRAPHS_310P = 7
+
+
+def _parse_audio_encoder_aclgraph_sizes(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)):
+        raise TypeError(
+            "additional_config.audio_encoder_aclgraph_sizes must be "
+            "an array of positive integers"
+        )
+    if any(isinstance(size, bool) or not isinstance(size, int) for size in value):
+        raise TypeError(
+            "additional_config.audio_encoder_aclgraph_sizes must contain "
+            "only positive integers"
+        )
+    if any(size <= 0 for size in value):
+        raise ValueError(
+            "additional_config.audio_encoder_aclgraph_sizes must contain "
+            "only positive integers"
+        )
+    sizes = tuple(sorted(set(value)))
+    if len(sizes) > MAX_AUDIO_ENCODER_ACLGRAPHS_310P:
+        raise ValueError(
+            "additional_config.audio_encoder_aclgraph_sizes supports at most "
+            f"{MAX_AUDIO_ENCODER_ACLGRAPHS_310P} graph sizes; got {len(sizes)}"
+        )
+    return sizes
+
 
 class AscendConfig:
     """
@@ -32,6 +61,9 @@ class AscendConfig:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
+        self.audio_encoder_aclgraph_sizes = _parse_audio_encoder_aclgraph_sizes(
+            additional_config.get("audio_encoder_aclgraph_sizes")
+        )
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
