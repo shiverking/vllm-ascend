@@ -96,3 +96,40 @@ def test_router_preserves_prefill_and_resets_after_failure():
             with pytest.raises(RuntimeError, match="test"):
                 wrapper()
             assert not wrapper.workspace.enabled
+
+
+def test_reference_control_keeps_decode_routing_counts_without_native_execution():
+    from collections import Counter
+
+    from vllm_ascend.xlite.qwen35_decode import AscendAttentionState, Qwen35DecodeMLPWrapper
+
+    wrapper = object.__new__(Qwen35DecodeMLPWrapper)
+    wrapper.workspace = NS(enabled=False)
+    wrapper._routing_logged = set()
+    wrapper.reference = True
+    wrapper.diagnostics = True
+    wrapper.route_counts = Counter()
+    wrapper.decode_tokens = Counter()
+    wrapper.diagnostic_steps = 0
+    seen = []
+    wrapper.runnable = lambda: seen.append(wrapper.workspace.enabled)
+
+    class Metadata:
+        attn_state = AscendAttentionState.DecodeOnly
+        num_decode_tokens = 17
+
+    context = NS(
+        attn_metadata={"mha": Metadata()},
+        capturing=False,
+        batch_descriptor=NS(num_tokens=32),
+        cudagraph_runtime_mode=NS(name="FULL"),
+    )
+    module = "vllm_ascend.xlite.qwen35_decode"
+    with patch(module + ".AscendMetadata", Metadata), patch(module + ".get_forward_context", return_value=context):
+        wrapper()
+        assert seen == [False]
+        assert wrapper.decode_tokens["DecodeOnly"] == 17
+        assert wrapper.route_counts["DecodeOnly:padded=32:graph=FULL"] == 1
+        context.capturing = True
+        wrapper()
+        assert wrapper.diagnostic_steps == 1

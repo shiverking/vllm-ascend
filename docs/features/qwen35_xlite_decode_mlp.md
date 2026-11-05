@@ -71,3 +71,16 @@ is insufficient. BF16 kernels can change rounding and greedy generation near
 close logits; neither bitwise equality nor QA quality is established by these
 tests. Keep the feature opt-in and compare the actual image workload before
 choosing a deployment default.
+
+## Attribution controls
+
+Two optional keys inside `xlite_graph_config` support controlled experiments:
+`qwen35_decode_mlp_reference=true` keeps the adapter's buffers and custom-op
+boundary but executes the original MLP, and
+`qwen35_decode_mlp_diagnostics=true` counts host-side forward routes and Decode
+tokens by attention state and padded graph size. Both default to false.
+Diagnostics run outside the graph wrapper, count replays rather than just Python
+kernel launches, exclude capture calls, and never synchronize device tensors.
+Take counter differences around a workload to exclude startup warmups. The
+reference control deliberately retains native-runtime memory allocations; use
+an explicit equal KV budget to compare it with the unwrapped model.

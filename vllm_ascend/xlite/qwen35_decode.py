@@ -2,6 +2,8 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Decode MLP-only xLite integration with no recurrent-state staging."""
 
+import json
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -16,6 +18,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionState, AscendMetad
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 
 RUNTIME_POOL_MB = 32
+DIAGNOSTIC_INTERVAL = 128
 
 
 @dataclass
@@ -73,6 +76,12 @@ class Qwen35DecodeMLPWrapper:
                 "Qwen3.5 xLite MLP requires BF16 TP=PP=DP=1, decode-only, no quantization/speculation/LoRA"
             )
         self.runnable = runnable
+        options = config.additional_config.get("xlite_graph_config", {})
+        self.reference = bool(options.get("qwen35_decode_mlp_reference", False))
+        self.diagnostics = bool(options.get("qwen35_decode_mlp_diagnostics", False))
+        self.route_counts = Counter()
+        self.decode_tokens = Counter()
+        self.diagnostic_steps = 0
         self._routing_logged = set()
         text = config.model_config.hf_text_config
         maximum = config.scheduler_config.max_num_seqs
@@ -96,6 +105,13 @@ class Qwen35DecodeMLPWrapper:
             layer.mlp = XliteDecodeMLP(mlp, self.workspace, maximum, name)
             context[name] = layer.mlp
         logger.info(
+            "Qwen3.5 xLite MLP weights: up_format=%s down_format=%s reference=%s diagnostics=%s",
+            torch_npu.get_npu_format(layers[0].mlp.original.gate_up_proj.weight),
+            torch_npu.get_npu_format(layers[0].mlp.original.down_proj.weight),
+            self.reference,
+            self.diagnostics,
+        )
+        logger.info(
             "Qwen3.5 xLite Decode MLP enabled for %d layers; KV/GDN state staging=0 bytes; "
             "native calls during graph capture are not replay counts",
             len(layers),
@@ -113,11 +129,32 @@ class Qwen35DecodeMLPWrapper:
         pass
 
     def __call__(self, *args, **kwargs):
-        metadata = get_forward_context().attn_metadata
+        context = get_forward_context()
+        metadata = context.attn_metadata
         metadata = metadata[0] if isinstance(metadata, list) else metadata
         values = metadata.values() if isinstance(metadata, dict) else ()
         mha = next((m for m in values if isinstance(m, AscendMetadata)), None)
-        self.workspace.enabled = mha is not None and mha.attn_state == AscendAttentionState.DecodeOnly
+        decode_only = mha is not None and mha.attn_state == AscendAttentionState.DecodeOnly
+        self.workspace.enabled = decode_only and not getattr(self, "reference", False)
+        if getattr(self, "diagnostics", False) and mha is not None and not context.capturing:
+            descriptor = context.batch_descriptor
+            padded = descriptor.num_tokens if descriptor is not None else 0
+            key = f"{mha.attn_state.name}:padded={padded}:graph={context.cudagraph_runtime_mode.name}"
+            self.route_counts[key] += 1
+            self.decode_tokens[mha.attn_state.name] += mha.num_decode_tokens
+            self.diagnostic_steps += 1
+            if self.diagnostic_steps % DIAGNOSTIC_INTERVAL == 0:
+                logger.info(
+                    "Qwen3.5 xLite route totals: %s",
+                    json.dumps(
+                        {
+                            "steps": self.diagnostic_steps,
+                            "routes": self.route_counts,
+                            "decode_tokens": self.decode_tokens,
+                        },
+                        sort_keys=True,
+                    ),
+                )
         route = (type(mha).__name__, str(getattr(mha, "attn_state", None)))
         if route not in self._routing_logged:
             self._routing_logged.add(route)
