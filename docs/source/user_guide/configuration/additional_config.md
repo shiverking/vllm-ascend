@@ -214,3 +214,15 @@ An example of additional configuration is as follows:
     "refresh": False
 }
 ```
+
+### Experimental dense C8 ND cache
+
+`c8_kv_cache_layout` selects `NZ` (default) or `ND`. Opt-in `ND` uses native
+paged INT8 attention for head dimensions unsupported by the NZ GQA kernel.
+It requires a C8-calibrated checkpoint and local serving without speculative
+decoding or KV transfer. Hybrid models require C8 on every full-attention layer;
+GDN state precision stays unchanged. The local quantization description is read
+during early page sizing. Qwen3.5 uses 2048-token logical INT8 pages and the
+existing runner's 128-token physical blocks. Decode views the existing cache
+without conversion; continuing Prefill still uses the C8 gather/dequant path.
+This experimental layout does not imply a throughput gain.

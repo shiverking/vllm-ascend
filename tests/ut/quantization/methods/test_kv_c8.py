@@ -574,6 +574,7 @@ class TestAscendC8AttentionBackendImplScales(TestBase):
         impl.num_kv_heads = num_kv_heads
         impl.head_size = head_size
         impl.scale = 1.0
+        impl.c8_kv_cache_layout = "NZ"
         impl.key_cache = None
         impl.value_cache = None
         return impl
@@ -690,3 +691,58 @@ class TestAscendC8AttentionBackendImplScales(TestBase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestC8NDLayout(TestBase):
+    def setUp(self):
+        self.original_dtype = torch.get_default_dtype()
+
+    _make_layer = TestAscendC8AttentionBackendImplScales._make_layer
+
+    def _make_impl(self, num_kv_heads=4, head_size=8):
+        impl = TestAscendC8AttentionBackendImplScales._make_impl(self, num_kv_heads, head_size)
+        impl.c8_kv_cache_layout = "ND"
+        return impl
+
+    @patch("vllm_ascend.attention.attention_v1.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.attention.attention_v1.get_tensor_model_parallel_world_size", return_value=1)
+    def test_prepare_c8_scales_creates_bnsd_shape(self, *_):
+        impl = self._make_impl()
+        layer = self._make_layer()
+        impl._prepare_c8_scales(layer, torch.device("cpu"))
+        self.assertEqual(layer._c8_k_aq_scale_nz_bnsd.shape, (1, 4, 1, 8))
+
+    def test_nd_cache_view_shares_storage(self):
+        impl = self._make_impl(head_size=256)
+        cache = torch.zeros(5, 128, 4, 256, dtype=torch.int8)
+        view = impl._c8_cache_view(cache, 128)
+        self.assertEqual(view.shape, (5, 128, 1024))
+        self.assertEqual(view.data_ptr(), cache.data_ptr())
+        self.assertTrue(view.is_contiguous())
+
+    def test_decode_retains_runner_physical_block_table(self):
+        from types import SimpleNamespace
+
+        impl = self._make_impl(head_size=256)
+        impl.key_cache = torch.zeros(5, 128, 4, 256, dtype=torch.int8)
+        impl.value_cache = torch.zeros_like(impl.key_cache)
+        table = torch.tensor([[3, 1]], dtype=torch.int32)
+        size, _, _, result = impl._c8_decode_cache_params(SimpleNamespace(block_tables=table))
+        self.assertEqual(size, 128)
+        self.assertIs(result, table)
+
+    @patch("vllm_ascend.attention.attention_v1.get_tensor_model_parallel_rank", return_value=0)
+    @patch("vllm_ascend.attention.attention_v1.get_tensor_model_parallel_world_size", return_value=1)
+    def test_nd_prefix_gather_respects_order_and_lengths(self, *_):
+        impl = self._make_impl(num_kv_heads=1, head_size=4)
+        layer = self._make_layer(num_kv_heads=1, head_size=4)
+        impl._prepare_c8_scales(layer, torch.device("cpu"))
+        impl.key_cache = torch.arange(48, dtype=torch.int8).view(3, 4, 1, 4)
+        impl.value_cache = impl.key_cache + 1
+        table = torch.tensor([[2, 0], [1, 2]], dtype=torch.int32)
+        key, value = impl._dequant_paged_kv_to_dense(
+            impl.key_cache, impl.value_cache, table, [5, 3], torch.float32, layer
+        )
+        expected = torch.cat([impl.key_cache[2], impl.key_cache[0][:1], impl.key_cache[1][:3]])
+        torch.testing.assert_close(key, expected.float())
+        torch.testing.assert_close(value, expected.float() + 1)

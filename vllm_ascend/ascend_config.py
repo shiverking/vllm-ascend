@@ -33,6 +33,14 @@ class AscendConfig:
         self.vllm_config = vllm_config
         additional_config = vllm_config.additional_config if vllm_config.additional_config is not None else {}
         self._check_mooncake_c8_kv_cache_quant(vllm_config)
+        # Opt-in ND C8 storage for head dimensions unsupported by the NZ kernel.
+        self.c8_kv_cache_layout = additional_config.get("c8_kv_cache_layout", "NZ")
+        if self.c8_kv_cache_layout not in ("NZ", "ND"):
+            raise ValueError("c8_kv_cache_layout must be NZ or ND")
+        if self.c8_kv_cache_layout == "ND" and (
+            vllm_config.kv_transfer_config is not None or vllm_config.speculative_config is not None
+        ):
+            raise ValueError("ND C8 currently requires local serving without speculative decoding")
 
         xlite_graph_config = additional_config.get("xlite_graph_config", {})
         self.xlite_graph_config = XliteGraphConfig(xlite_graph_config, vllm_config)

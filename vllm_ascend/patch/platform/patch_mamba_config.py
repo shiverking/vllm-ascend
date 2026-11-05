@@ -1,6 +1,9 @@
 # mypy: ignore-errors
+import json
 import math
+from pathlib import Path
 
+import torch
 import vllm.model_executor.models.config
 from vllm.logger import logger
 from vllm.model_executor.models import ModelRegistry
@@ -54,6 +57,25 @@ def verify_and_update_config(cls, vllm_config) -> None:
         kv_cache_dtype = model_config.dtype
     else:
         kv_cache_dtype = STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]
+
+    if (vllm_config.additional_config or {}).get("c8_kv_cache_layout") == "ND":
+        # Platform validation precedes lazy quant_config construction. Read the
+        # local description once; the ND experiment intentionally uses a local overlay.
+        path = Path(model_config.model) / "quant_model_description.json"
+        description = json.loads(path.read_text())
+        full_layers = {
+            index for index, kind in enumerate(model_config.hf_text_config.layer_types) if kind == "full_attention"
+        }
+        covered = {
+            index
+            for index in full_layers
+            if any(f".layers.{index}." in key and key.endswith("k_proj.kv_cache_scale") for key in description)
+        }
+        if description.get("kv_cache_type") != "C8" or covered != full_layers:
+            raise ValueError("ND C8 hybrid cache requires C8 on every full-attention layer")
+        # ModelSlim changes the per-layer cache dtype while cache_dtype remains auto.
+        # Align using actual INT8 pages, otherwise padding hides the memory savings.
+        kv_cache_dtype = torch.int8
 
     kernel_block_size = 128
     model_cls, _ = ModelRegistry.resolve_model_cls(
