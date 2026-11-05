@@ -18,6 +18,8 @@
 # isort: skip_file
 import torch.nn as nn
 from vllm.config import CUDAGraphMode
+from vllm.logger import logger
+from vllm.utils.mem_utils import DeviceMemoryProfiler
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
@@ -33,7 +35,35 @@ class XliteModelRunner(NPUModelRunner):
         from vllm_ascend.xlite.xlite import XliteWrapper
 
         super().load_model()
-        self.model = self.xlite_model = XliteWrapper(self.model, self.vllm_config, device=self.device)
+        options = self.vllm_config.additional_config
+        options = options if isinstance(options, dict) else {}
+        if options.get("xlite_graph_config", {}).get("qwen35_decode_mlp_only", False):
+            if self.vllm_config.model_config.architectures != ["Qwen3_5ForConditionalGeneration"]:
+                raise ValueError("qwen35_decode_mlp_only requires Qwen3.5 dense multimodal architecture")
+            from vllm_ascend.xlite.qwen35_decode import Qwen35DecodeMLPWrapper
+
+            with DeviceMemoryProfiler() as memory:
+                self.model = self.xlite_model = Qwen35DecodeMLPWrapper(self.model, self.vllm_config, self.device)
+            self.model_memory_usage += memory.consumed_memory
+            logger.info(
+                "Qwen3.5 xLite persistent buffer memory added to model accounting: %.2f MiB",
+                memory.consumed_memory / 2**20,
+            )
+        else:
+            self.model = self.xlite_model = XliteWrapper(self.model, self.vllm_config, device=self.device)
+
+    def get_supported_tasks(self):
+        tasks = super().get_supported_tasks()
+        workspace = getattr(getattr(self, "xlite_model", None), "workspace", None)
+        if workspace is not None:
+            logger.info(
+                "Qwen3.5 xLite MLP startup diagnostics: tasks=%s, underlying=%s, "
+                "native MLP Python invocations including captures=%d",
+                tasks,
+                type(self.get_model()).__name__,
+                workspace.native_python_calls,
+            )
+        return tasks
 
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         super().initialize_kv_cache(kv_cache_config)

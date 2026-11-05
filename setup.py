@@ -535,6 +535,7 @@ setup(
         "Topic :: Scientific/Engineering :: Information Analysis",
     ],
     packages=find_packages(exclude=("docs", "examples", "tests*", "csrc")),
+    package_data={"vllm_ascend.xlite": ["stream_bridge.cpp"]},
     python_requires=">=3.10",
     install_requires=get_requirements(),
     ext_modules=ext_modules,
