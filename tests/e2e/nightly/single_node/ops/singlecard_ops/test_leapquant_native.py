@@ -12,8 +12,8 @@ import torch_npu  # noqa: F401
 from vllm_ascend.ops.leapquant_native import PACKET_BYTES, NativeLeapQuant
 
 
-@pytest.fixture(scope="module", params=[8])
-def native(tmp_path_factory, request):
+@pytest.fixture(scope="module")
+def native_library(tmp_path_factory):
     source = Path(__file__).resolve().parents[6] / "csrc/experimental/leapquant"
     build = tmp_path_factory.mktemp("leapquant_native")
     subprocess.run(
@@ -24,15 +24,20 @@ def native(tmp_path_factory, request):
             "-B",
             str(build),
             f"-DASCEND_PYTHON_EXECUTABLE={sys.executable}",
-            f"-DLEAPQUANT_POWER_ITERS={request.param}",
+            "-DLEAPQUANT_POWER_ITERS=8",
         ],
         check=True,
         capture_output=True,
     )
     subprocess.run(["cmake", "--build", str(build), "-j4"], check=True, capture_output=True)
+    return build / "lib/libleapquant_native.so"
+
+
+@pytest.fixture(scope="module", params=[(128, False), (64, False), (32, False), (128, True)])
+def native(native_library, request):
     torch.npu.set_device(0)
-    backend = NativeLeapQuant(str(build / "lib/libleapquant_native.so"))
-    assert backend.power_iterations == request.param
+    backend = NativeLeapQuant(str(native_library), value_tile=request.param[0], streaming=request.param[1])
+    assert backend.power_iterations == 8
     return backend
 
 
@@ -128,6 +133,8 @@ def test_native_rejects_invalid_metadata(native):
     indices = torch.zeros(1, dtype=torch.int32)
     with pytest.raises(ValueError, match="FP32"):
         native.encode_state(torch.zeros(1, 32, 128, 128, dtype=torch.bfloat16), packet, indices)
+    with pytest.raises(ValueError, match="value_tile"):
+        NativeLeapQuant("not-loaded", value_tile=16)
     with pytest.raises(ValueError, match="cores"):
         NativeLeapQuant("not-loaded", cores=0)
 
@@ -257,3 +264,71 @@ def test_native_clamps_only_buffered_update(native):
     next_output = native.decode(q, q, v, beta, g, packet, indices)
     expected = torch.full_like(v, 65504 * 128**-0.5)
     torch.testing.assert_close(next_output, expected, rtol=0, atol=0)
+
+
+def test_native_sparse_batch_matches_independent_slots(native):
+    # Many jobs per core exercise asynchronous prefetch and tile ownership;
+    # independent slots must match even though they run in a different order.
+    torch.manual_seed(414)
+    batch = 64
+    rows = [0, 39, 40, 63]
+    packet = torch.zeros(batch + len(rows), 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = (torch.arange(batch, dtype=torch.int32, device="npu") * 5) % batch
+    native.encode_state(torch.zeros(batch, 32, 128, 128, device="npu"), packet, indices)
+    shadows = torch.arange(batch, batch + len(rows), dtype=torch.int32, device="npu")
+    for i, row in enumerate(rows):
+        packet[batch + i].copy_(packet[indices[row]])
+    inputs = _inputs(batch)
+    for _ in range(17):
+        actual = native.decode(*inputs, packet, indices)
+        for i, row in enumerate(rows):
+            expected = native.decode(*(t[row : row + 1] for t in inputs), packet, shadows[i : i + 1])
+            torch.testing.assert_close(actual[row : row + 1], expected, rtol=0, atol=0)
+    for i, row in enumerate(rows):
+        torch.testing.assert_close(packet[indices[row]], packet[batch + i], rtol=0, atol=0)
+
+
+def test_native_four_digit_residual_contraction(native_library):
+    torch.npu.set_device(0)
+    backend = NativeLeapQuant(str(native_library))
+    torch.manual_seed(416)
+    query = torch.randn(5, 2, 128) * 0.1
+    query[0].zero_()
+    query[1] *= 1e-20
+    state = torch.randint(-127, 128, (5, 128, 128), dtype=torch.int8)
+    query_device = query.npu()
+    packed, scales = backend.pack_query_digits(query_device)
+    assert (packed[:, 8:] == 0).all()
+    assert (packed[0] == 0).all()
+    products = (packed.cpu().double() @ state.double().transpose(-1, -2)).to(torch.int32).npu()
+    actual = backend.unpack_query_products(products, scales)
+    expected = query @ state.float().transpose(-1, -2)
+    relative = ((actual.cpu() - expected).square().mean() / expected.square().mean()).sqrt()
+    assert torch.isfinite(actual).all() and relative < 1e-5
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        packed_out, scales_out = backend.pack_query_digits(query_device)
+        output = backend.unpack_query_products(products, scales_out)
+    graph.replay()
+    torch.testing.assert_close(output, actual, rtol=0, atol=0)
+    with pytest.raises(ValueError, match="FP32"):
+        backend.pack_query_digits(query.half().npu())
+    with pytest.raises(ValueError, match="matching"):
+        backend.unpack_query_products(products, scales[:, :2])
+
+
+def test_native_lossless_residual_transpose(native_library):
+    torch.npu.set_device(0)
+    backend = NativeLeapQuant(str(native_library))
+    torch.manual_seed(417)
+    packets = torch.randint(-128, 128, (7, PACKET_BYTES), dtype=torch.int8, device="npu")
+    source = packets[:, : 128 * 128].view(7, 128, 128)
+    expected = source.transpose(-1, -2).contiguous()
+    actual = backend.transpose_residual(source)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        out = backend.transpose_residual(source)
+    source.copy_(source.flip(-1))
+    graph.replay()
+    torch.testing.assert_close(out, source.transpose(-1, -2).contiguous(), rtol=0, atol=0)

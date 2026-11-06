@@ -9,6 +9,7 @@ import ctypes
 from pathlib import Path
 
 import torch
+import torch_npu
 
 PACKET_BYTES = 27744
 FORMAT_TAG = 0x4C513034
@@ -17,9 +18,15 @@ FORMAT_TAG = 0x4C513034
 class NativeLeapQuant:
     """Load a separately built kernel library on the current NPU stream."""
 
-    def __init__(self, library: str, cores: int = 40):
+    def __init__(self, library: str, cores: int = 40, value_tile: int = 128, streaming: bool = False):
         if not 1 <= cores <= 48:
             raise ValueError("cores must be in [1, 48] for the 910B exploration")
+        if value_tile not in (32, 64, 128):
+            raise ValueError("value_tile must be 32, 64 or 128")
+        if streaming and value_tile != 128:
+            raise ValueError("streaming requires value_tile=128")
+        self.streaming = streaming
+        self.value_tile = value_tile
         self.cores = cores
         self.library = ctypes.CDLL(str(Path(library).resolve(strict=True)))
         pointer, integer = ctypes.c_void_p, ctypes.c_uint32
@@ -37,9 +44,26 @@ class NativeLeapQuant:
         self._encode = self.library.leapquant_encode_launch
         self._encode.argtypes = [integer] + [pointer] * 4 + [integer] * 3
         self._encode.restype = None
-        self._decode = self.library.leapquant_decode_launch
-        self._decode.argtypes = [integer] + [pointer] * 9 + [integer] * 4
+        self._decode = (
+            self.library.leapquant_decode_launch if value_tile == 128 else self.library.leapquant_tiled_launch
+        )
+        if streaming:
+            self._decode = self.library.leapquant_stream_launch
+        self._decode.argtypes = [integer] + [pointer] * 9 + [integer] * (4 if value_tile == 128 else 5)
         self._decode.restype = None
+        for attribute, symbol in (
+            ("_pack_digits", "leapquant_digit_pack_launch"),
+            ("_unpack_digits", "leapquant_digit_unpack_launch"),
+        ):
+            launch = getattr(self.library, symbol, None)
+            if launch is not None:
+                launch.argtypes = [integer] + [pointer] * 4 + [integer]
+                launch.restype = None
+            setattr(self, attribute, launch)
+        self._transpose_residual = getattr(self.library, "leapquant_residual_transpose_launch", None)
+        if self._transpose_residual is not None:
+            self._transpose_residual.argtypes = [integer] + [pointer] * 3 + [integer] * 2
+            self._transpose_residual.restype = None
 
     @staticmethod
     def _packet(packet, indices, batch, heads):
@@ -113,5 +137,76 @@ class NativeLeapQuant:
             heads,
             q.shape[1],
             packet.shape[0],
+            *(() if self.value_tile == 128 else (self.value_tile,)),
+        )
+        return output
+
+    def pack_query_digits(self, query):
+        """Prepare four signed radix-128 digits for each of two FP32 vectors."""
+        if query.ndim != 3 or query.shape[1:] != (2, 128) or query.shape[0] < 1:
+            raise ValueError("digit queries require [heads, 2, 128]")
+        if query.dtype != torch.float32 or query.device.type != "npu" or not query.is_contiguous():
+            raise ValueError("digit queries must be contiguous FP32 NPU tensors")
+        if torch_npu.get_npu_format(query) != 2:
+            raise ValueError("digit queries require ND layout")
+        if self._pack_digits is None:
+            raise ValueError("rebuild the native library for digit helpers")
+        packed = torch.empty((query.shape[0], 16, 128), dtype=torch.int8, device=query.device)
+        scales = torch.empty((query.shape[0], 8), dtype=torch.float32, device=query.device)
+        launch = self._pack_digits
+        launch(
+            self.cores,
+            self._stream(query.device),
+            query.data_ptr(),
+            packed.data_ptr(),
+            scales.data_ptr(),
+            query.shape[0],
+        )
+        return packed, scales
+
+    def unpack_query_products(self, products, scales):
+        """Reconstruct FP32 residual contractions from exact Cube INT32 sums."""
+        if products.ndim != 3 or products.shape[1:] != (16, 128) or products.shape[0] < 1:
+            raise ValueError("digit products require [heads, 16, 128]")
+        if products.dtype != torch.int32 or scales.dtype != torch.float32 or scales.shape != (products.shape[0], 8):
+            raise ValueError("digit products/scales require INT32 and FP32 types with matching heads")
+        if (
+            products.device.type != "npu"
+            or scales.device != products.device
+            or not products.is_contiguous()
+            or not scales.is_contiguous()
+        ):
+            raise ValueError("digit products/scales must be contiguous on the same NPU")
+        if torch_npu.get_npu_format(products) != 2 or torch_npu.get_npu_format(scales) != 2:
+            raise ValueError("digit products/scales require ND layout")
+        if self._unpack_digits is None:
+            raise ValueError("rebuild the native library for digit helpers")
+        output = torch.empty((products.shape[0], 2, 128), dtype=torch.float32, device=products.device)
+        launch = self._unpack_digits
+        launch(
+            self.cores,
+            self._stream(products.device),
+            products.data_ptr(),
+            scales.data_ptr(),
+            output.data_ptr(),
+            products.shape[0],
+        )
+        return output
+
+    def transpose_residual(self, state):
+        """Lossless INT8 transpose; supports ND residual views inside AoS packets."""
+        if state.ndim != 3 or state.shape[1:] != (128, 128) or state.shape[0] < 1:
+            raise ValueError("residual transpose requires [heads, 128, 128]")
+        if state.dtype != torch.int8 or state.device.type != "npu":
+            raise ValueError("residual transpose requires an INT8 NPU tensor")
+        if state.stride(1) != 128 or state.stride(2) != 1 or not 0 <= state.stride(0) < 2**32:
+            raise ValueError("residual transpose requires contiguous matrix rows")
+        if torch_npu.get_npu_format(state) != 2:
+            raise ValueError("residual transpose requires ND layout")
+        if self._transpose_residual is None:
+            raise ValueError("rebuild the native library for residual transpose")
+        output = torch.empty(state.shape, dtype=state.dtype, device=state.device)
+        self._transpose_residual(
+            self.cores, self._stream(state.device), state.data_ptr(), output.data_ptr(), state.shape[0], state.stride(0)
         )
         return output

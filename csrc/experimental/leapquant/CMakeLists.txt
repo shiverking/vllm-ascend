@@ -9,6 +9,7 @@ set(RUN_MODE npu CACHE STRING "Kernel execution mode")
 set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann-9.1.0 CACHE PATH "CANN installation")
 include(${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
 set(LEAPQUANT_POWER_ITERS 8 CACHE STRING "Cold-start power iterations per rank (warm starts use zero extra iterations)")
+set(LEAPQUANT_STREAM_PREFETCH 1 CACHE STRING "Prefetch next head in the opt-in streaming kernel")
 # CANN builds host and device objects in separate projects. A generated header
 # beside a private source snapshot gives both halves exactly the same setting.
 file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
