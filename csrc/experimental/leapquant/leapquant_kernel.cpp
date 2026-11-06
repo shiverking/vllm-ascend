@@ -22,7 +22,7 @@ constexpr uint32_t CURSOR = 27652;
 constexpr uint32_t TAG = 27656;
 constexpr uint32_t LOG_TIMES = 27680;
 constexpr uint32_t MAGIC = 0x4c513034;  // LQ04: prevents mixing with Triton v1 packets.
-constexpr uint32_t VEC_BYTES = 32768;
+constexpr uint32_t VEC_BYTES = 36864;
 #ifndef LEAPQUANT_POWER_ITERS
   #define LEAPQUANT_POWER_ITERS 8
 #endif
@@ -84,7 +84,7 @@ class LeapQuant {
     counter_ = packetBuf_.GetWithOffset<int32_t>(1, CURSOR);
     tag_ = packetBuf_.GetWithOffset<uint32_t>(6, TAG);
     logTimes_ = packetBuf_.GetWithOffset<float>(W, LOG_TIMES);
-    coefficients_ = vec_[51 * D];
+    coefficients_ = vec_[65 * D];
     Duplicate(vec_, 0.0f, VEC_BYTES / sizeof(float));
     VSync();
   }
@@ -143,6 +143,17 @@ class LeapQuant {
       }
       uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * PACKET;
       DataCopy(packet_, packetGm_[offset], PACKET);
+      uint64_t qOff = (static_cast<uint64_t>(b) * keyHeads + h / (heads_ / keyHeads)) * D;
+      auto ioK = vecBuf_.GetWithOffset<bfloat16_t>(D, 14 * D * sizeof(float) + D * sizeof(bfloat16_t));
+      auto ioV = vecBuf_.GetWithOffset<bfloat16_t>(D, 15 * D * sizeof(float));
+      auto ioBeta = vecBuf_.GetWithOffset<bfloat16_t>(16, 15 * D * sizeof(float) + D * sizeof(bfloat16_t));
+      auto gateBlock = vec_[9 * D], gateVec = vec_[10 * D];
+      DataCopy(io, qGm[qOff], D);
+      DataCopy(ioK, kGm[qOff], D);
+      DataCopy(ioV, vGm[static_cast<uint64_t>(job) * D], D);
+      // Aligned gate blocks are safe because each request has 32 heads.
+      DataCopy(gateBlock, gGm[job / 8 * 8], 8);
+      DataCopy(ioBeta, bGm[job / 16 * 16], 16);
       LoadSync();
       if (tag_.GetValue(0) != MAGIC || counter_.GetValue(0) < 0 || counter_.GetValue(0) >= W) {
         // An invalid/foreign packet is visible as a nonfinite result.
@@ -156,62 +167,50 @@ class LeapQuant {
         continue;
       }
       uint32_t count = counter_.GetValue(0);
-      uint64_t qOff = (static_cast<uint64_t>(b) * keyHeads + h / (heads_ / keyHeads)) * D;
-      DataCopy(io, qGm[qOff], D);
-      LoadSync();
+
       Cast(qv, io, RoundMode::CAST_NONE, D);
+      Cast(kv, ioK, RoundMode::CAST_NONE, D);
+      Cast(vv, ioV, RoundMode::CAST_NONE, D);
+      Cast(gateVec, ioBeta, RoundMode::CAST_NONE, 16);
       VSync();
       Muls(qv, qv, Q_SCALE, D);
       VSync();
-      DataCopy(io, kGm[qOff], D);
-      LoadSync();
-      Cast(kv, io, RoundMode::CAST_NONE, D);
-      VSync();
-      DataCopy(io, vGm[static_cast<uint64_t>(job) * D], D);
-      LoadSync();
-      Cast(vv, io, RoundMode::CAST_NONE, D);
-      VSync();
-      // Scalar gates stay on device; no host synchronization is required.
-      float gate = gGm.GetValue(job);
-      auto gateVec = vec_[10 * D];
+      VS();
+      float gate = gateBlock.GetValue(job % 8);
+      float betaValue = gateVec.GetValue(job % 16);
       float currentLog = decay_.GetValue(0) + gate;
-      gateVec.SetValue(0, currentLog);
-      SV();
+      Duplicate(gateVec, currentLog, 8);
+      VSync();
       Exp(gateVec, gateVec, 8);
       VSync();
       VS();
       float decay = gateVec.GetValue(0);
-      bfloat16_t bfBeta = bGm.GetValue(job);
-      io.SetValue(0, bfBeta);
-      SV();
-      Cast(gateVec, io, RoundMode::CAST_NONE, 8);
-      VSync();
-      VS();
-      float betaValue = gateVec.GetValue(0);
 
       MaterializeResidual();
       // Retain rank-major factors in vector storage for both Q and K readouts.
-      Cast(vec_[52 * D], left_, RoundMode::CAST_NONE, RANK * D);
+      Cast(vec_[40 * D], left_, RoundMode::CAST_NONE, RANK * D);
       VSync();
-      Cast(vec_[56 * D], right_, RoundMode::CAST_NONE, RANK * D);
+      Cast(vec_[16 * D], right_, RoundMode::CAST_NONE, RANK * D);
       VSync();
-      auto keyRecords = vec_[16 * D], valRecords = vec_[32 * D], weights = vec_[48 * D];
+      auto keyRecords = vec_[24 * D], valRecords = vec_[48 * D], weights = vec_[64 * D];
       Cast(keyRecords, keys_, RoundMode::CAST_NONE, W * D);
       VSync();
       Cast(valRecords, values_, RoundMode::CAST_NONE, W * D);
       VSync();
       // Preserve FP16 updates exactly as inserted. All intervening decay is
       // represented in FP32 log coefficients, avoiding per-token FP16 rounding.
-      Muls(coefficients_, logTimes_, -1.f, W);
+      Muls(coefficients_[8], logTimes_, -1.f, W);
       VSync();
-      Adds(coefficients_, coefficients_, currentLog, W);
+      Adds(coefficients_[8], coefficients_[8], currentLog, W);
       VSync();
-      Exp(coefficients_, coefficients_, W);
+      Exp(coefficients_[8], coefficients_[8], W);
+      VSync();
+      Duplicate(coefficients_, decay, 8);
       VSync();
       ReadBase(pred, kv);
       Muls(pred, pred, decay, D);
       VSync();
-      RecordRead(out, keyRecords, valRecords, weights, kv, count);
+      JointRead(out, weights, kv, count);
       Add(pred, pred, out, D);
       VSync();
       Sub(vv, vv, pred, D);
@@ -234,12 +233,12 @@ class LeapQuant {
       DataCopy(keyRecords[count * D], kv, D);
       VSync();
       logTimes_.SetValue(count, currentLog);
-      coefficients_.SetValue(count, 1.f);
+      coefficients_.SetValue(8 + count, 1.f);
       SV();
       ReadBase(pred, qv);
       Muls(pred, pred, decay, D);
       VSync();
-      RecordRead(out, keyRecords, valRecords, weights, qv, count + 1);
+      JointRead(out, weights, qv, count + 1);
       Add(out, out, pred, D);
       VSync();
       Cast(io, out, RoundMode::CAST_RINT, D);
@@ -306,7 +305,19 @@ class LeapQuant {
     RowsReduce(dst, rows);
   }
   __aicore__ inline void ColsReduce(LocalTensor<float> dst, uint32_t rows, bool maximum = false) {
-    for (uint32_t stride = rows / 2; stride; stride /= 2) {
+    uint32_t power = 1;
+    while (power * 2 <= rows) {
+      power *= 2;
+    }
+    if (rows > power) {
+      if (maximum) {
+        Max(work_, work_, work_[power * D], (rows - power) * D);
+      } else {
+        Add(work_, work_, work_[power * D], (rows - power) * D);
+      }
+      VSync();
+    }
+    for (uint32_t stride = power / 2; stride; stride /= 2) {
       if (maximum) {
         Max(work_, work_, work_[stride * D], stride * D);
       } else {
@@ -319,7 +330,7 @@ class LeapQuant {
   }
   __aicore__ inline void ScaleRows(LocalTensor<float> dst, LocalTensor<float> matrix, LocalTensor<float> vector,
                                    uint32_t rows, bool divide = false) {
-    auto repeated = vec_[60 * D];
+    auto repeated = vec_[68 * D];
     for (uint32_t row = 0; row < rows; row += 64) {
       uint32_t count = rows - row < 64 ? rows - row : 64;
       Brcb(repeated, vector[row], (count + 7) / 8, {1, 8});
@@ -346,7 +357,7 @@ class LeapQuant {
       Muls(factor, u, -1.f, D);
       VSync();
     }
-    auto repeated = vec_[60 * D];
+    auto repeated = vec_[68 * D];
     // A 32-byte block per row is sufficient for hardware-strided broadcast.
     // Avoid materializing a 64-KiB broadcast matrix for each rank-one update.
     for (uint32_t row = 0; row < D; row += 64) {
@@ -369,8 +380,10 @@ class LeapQuant {
     VS();
     return tmp.GetValue(0);
   }
-  __aicore__ inline void Normalize(LocalTensor<float> value) {
-    float maximum = MaximumMagnitude(value);
+  __aicore__ inline void Normalize(LocalTensor<float> value, float maximum = -1.f) {
+    if (maximum < 0.f) {
+      maximum = MaximumMagnitude(value);
+    }
     float inverse = maximum > 1.e-30f ? 1.f / maximum : 0.f;
     Muls(value, value, inverse, D);
     VSync();
@@ -398,28 +411,23 @@ class LeapQuant {
     VSync();
   }
   __aicore__ inline void ReadBase(LocalTensor<float> dst, LocalTensor<float> vector) {
-    auto scaled = vec_[49 * D];
+    auto scaled = vec_[66 * D];
     Mul(scaled, vector, smooth_, D);
     VSync();
     MatRows(dst, s_, scaled, D);
     Mul(dst, dst, scale_, D);
     VSync();
-    auto dots = vec_[50 * D], tmp = vec_[5 * D];
-    MatRows(dots, vec_[56 * D], vector, RANK);
-    MatCols(tmp, vec_[52 * D], dots, RANK);
-    Add(dst, dst, tmp, D);
-    VSync();
   }
-  __aicore__ inline void RecordRead(LocalTensor<float> dst, LocalTensor<float> kr, LocalTensor<float> vr,
-                                    LocalTensor<float> weights, LocalTensor<float> vector, uint32_t count) {
+  __aicore__ inline void JointRead(LocalTensor<float> dst, LocalTensor<float> weights, LocalTensor<float> vector,
+                                   uint32_t count) {
+    // Four compensators and four zero padding rows precede the 16 real
+    // records. Shared contraction removes two pairs of small matrix ops.
     Duplicate(weights, 0.f, D);
     VSync();
-    if (count) {
-      MatRows(weights, kr, vector, count);
-    }
-    Mul(weights, weights, coefficients_, W);
+    MatRows(weights, vec_[16 * D], vector, 8 + count);
+    Mul(weights, weights, coefficients_, 24);
     VSync();
-    MatCols(dst, vr, weights, W);
+    MatCols(dst, vec_[40 * D], weights, 24);
   }
   __aicore__ inline void Reconstruct(float decay, LocalTensor<float> kr, LocalTensor<float> vr) {
     ScaleRows(s_, s_, scale_, D);
@@ -434,7 +442,7 @@ class LeapQuant {
     }
     Muls(s_, s_, decay, N);
     VSync();
-    ScaleRows(vr, vr, coefficients_, W);
+    ScaleRows(vr, vr, coefficients_[8], W);
     for (uint32_t w = 0; w < W; ++w) {
       Outer(vr[w * D], kr[w * D], false);
     }
@@ -444,21 +452,24 @@ class LeapQuant {
     uint32_t coldRestarts = 0;
     for (uint32_t r = 0; r < RANK; ++r) {
       bool restart = !warm;
+      float maximum = -1.f;
       if (warm) {
         Cast(u, left_[r * D], RoundMode::CAST_NONE, D);
         VSync();
         MatCols(direction, s_, u, D);
-        restart = MaximumMagnitude(direction) <= 1.e-30f;
+        maximum = MaximumMagnitude(direction);
+        restart = maximum <= 1.e-30f;
       }
       if (restart) {
         ++coldRestarts;
+        maximum = -1.f;
         Mul(work_, s_, s_, N);
         VSync();
         ColsReduce(direction, D);
         Sqrt(direction, direction, D);
         VSync();
       }
-      Normalize(direction);
+      Normalize(direction, maximum);
       if (restart) {
         for (uint32_t it = 0; it < LEAPQUANT_POWER_ITERS; ++it) {
           MatRows(u, s_, direction, D);
