@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Explicit opt-in loader for the isolated AscendC LeapQuant experiment.
 
-The native v2 packet is distinct from the Triton v1 representation. No library
+The native v4 packet is distinct from the Triton v1 representation. No library
 is built or loaded by importing this module. It is not dispatched by models.
 """
 
@@ -10,8 +10,8 @@ from pathlib import Path
 
 import torch
 
-PACKET_BYTES = 27680
-FORMAT_TAG = 0x4C513032
+PACKET_BYTES = 27744
+FORMAT_TAG = 0x4C513034
 
 
 class NativeLeapQuant:
@@ -23,6 +23,17 @@ class NativeLeapQuant:
         self.cores = cores
         self.library = ctypes.CDLL(str(Path(library).resolve(strict=True)))
         pointer, integer = ctypes.c_void_p, ctypes.c_uint32
+        metadata = []
+        for symbol in ("leapquant_packet_bytes", "leapquant_format_tag", "leapquant_power_iterations"):
+            try:
+                function = getattr(self.library, symbol)
+            except AttributeError as error:
+                raise ValueError("native LeapQuant library ABI is obsolete; rebuild it") from error
+            function.argtypes, function.restype = [], integer
+            metadata.append(function())
+        if metadata[:2] != [PACKET_BYTES, FORMAT_TAG]:
+            raise ValueError("native LeapQuant library packet format does not match this loader")
+        self.power_iterations = metadata[2]
         self._encode = self.library.leapquant_encode_launch
         self._encode.argtypes = [integer] + [pointer] * 4 + [integer] * 3
         self._encode.restype = None
@@ -33,7 +44,7 @@ class NativeLeapQuant:
     @staticmethod
     def _packet(packet, indices, batch, heads):
         if packet.dtype != torch.uint8 or packet.ndim != 3 or packet.shape[1:] != (heads, PACKET_BYTES):
-            raise ValueError("native LeapQuant requires uint8 [blocks, heads, 27680] packets")
+            raise ValueError("native LeapQuant requires uint8 [blocks, heads, 27744] packets")
         if indices.dtype != torch.int32 or indices.shape != (batch,):
             raise ValueError("native LeapQuant requires int32 [requests] indices")
         if not packet.is_contiguous() or not indices.is_contiguous():

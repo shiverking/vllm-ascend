@@ -12,18 +12,28 @@ import torch_npu  # noqa: F401
 from vllm_ascend.ops.leapquant_native import PACKET_BYTES, NativeLeapQuant
 
 
-@pytest.fixture(scope="module")
-def native(tmp_path_factory):
+@pytest.fixture(scope="module", params=[8])
+def native(tmp_path_factory, request):
     source = Path(__file__).resolve().parents[6] / "csrc/experimental/leapquant"
     build = tmp_path_factory.mktemp("leapquant_native")
     subprocess.run(
-        ["cmake", "-S", str(source), "-B", str(build), f"-DASCEND_PYTHON_EXECUTABLE={sys.executable}"],
+        [
+            "cmake",
+            "-S",
+            str(source),
+            "-B",
+            str(build),
+            f"-DASCEND_PYTHON_EXECUTABLE={sys.executable}",
+            f"-DLEAPQUANT_POWER_ITERS={request.param}",
+        ],
         check=True,
         capture_output=True,
     )
     subprocess.run(["cmake", "--build", str(build), "-j4"], check=True, capture_output=True)
     torch.npu.set_device(0)
-    return NativeLeapQuant(str(build / "lib/libleapquant_native.so"))
+    backend = NativeLeapQuant(str(build / "lib/libleapquant_native.so"))
+    assert backend.power_iterations == request.param
+    return backend
 
 
 def _inputs(batch=2):
@@ -107,7 +117,7 @@ def test_native_zero_low_rank_and_foreign_packet(native):
         native.encode_state(torch.full((1, 32, 128, 128), value, device="npu"), packet, indices)
         actual = native.decode(q, q, v, beta, g, packet, indices).float()
         torch.testing.assert_close(actual, torch.full_like(actual, value), rtol=0, atol=2e-4)
-    packet.zero_()  # Missing LQ02 tag: no cache mutation, nonfinite output.
+    packet.zero_()  # Missing LQ04 tag: no cache mutation, nonfinite output.
     actual = native.decode(q, q, v, beta, g, packet, indices)
     assert torch.isnan(actual).all()
     torch.testing.assert_close(packet, torch.zeros_like(packet), rtol=0, atol=0)
@@ -120,3 +130,130 @@ def test_native_rejects_invalid_metadata(native):
         native.encode_state(torch.zeros(1, 32, 128, 128, dtype=torch.bfloat16), packet, indices)
     with pytest.raises(ValueError, match="cores"):
         NativeLeapQuant("not-loaded", cores=0)
+
+
+def test_native_keeps_window_updates_immutable(native):
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    native.encode_state(torch.zeros(1, 32, 128, 128, device="npu"), packet, indices)
+    inputs = _inputs(1)
+    native.decode(*inputs, packet, indices)
+    # The first raw FP16 update occupies 128 values at the v3 VALUES offset.
+    saved = packet[:, :, 23552:23808].clone()
+    inputs[-1].fill_(-0.2)
+    native.decode(*inputs, packet, indices)
+    torch.testing.assert_close(packet[:, :, 23552:23808], saved, rtol=0, atol=0)
+
+
+def test_native_rejects_obsolete_library(tmp_path, monkeypatch):
+    import vllm_ascend.ops.leapquant_native as module
+
+    path = tmp_path / "obsolete.so"
+    path.touch()
+    monkeypatch.setattr(module.ctypes, "CDLL", lambda _: object())
+    with pytest.raises(ValueError, match="obsolete"):
+        NativeLeapQuant(str(path))
+
+
+def test_native_quantizer_matches_paper_smoothing(native):
+    torch.manual_seed(409)
+    state = torch.randn(1, 32, 128, 128) * torch.linspace(0.01, 0.2, 128)
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    native.encode_state(state.npu(), packet, indices)
+    stored = packet.cpu()
+    left = stored[..., 17408:18432].contiguous().view(torch.float16).float().view(1, 32, 4, 128)
+    right = stored[..., 18432:19456].contiguous().view(torch.float16).float().view(1, 32, 4, 128)
+    residual = state - left.transpose(-1, -2) @ right
+    expected_smooth = residual.abs().mean(-2).sqrt().clamp_min(1e-6)
+    smooth = stored[..., 16896:17408].contiguous().view(torch.float32)
+    scale = stored[..., 16384:16896].contiguous().view(torch.float32)
+    torch.testing.assert_close(smooth, expected_smooth, rtol=2e-5, atol=1e-7)
+    normalized = residual / smooth.unsqueeze(-2)
+    maximum = normalized.abs().amax(-1)
+    expected_scale = torch.where(maximum > 1e-30, maximum / 127, 1.0)
+    torch.testing.assert_close(scale, expected_scale, rtol=2e-5, atol=1e-7)
+    unrounded = normalized / scale.unsqueeze(-1)
+    quant = stored[..., :16384].contiguous().view(torch.int8).view_as(state)
+    # Avoid half-integer ties sensitive to FP32 reduction order. All other
+    # entries must match direct FP32 RNE, including values near FP16 ties.
+    stable = (unrounded.frac().abs() - 0.5).abs() > 1e-3
+    torch.testing.assert_close(quant[stable], unrounded.round().to(torch.int8)[stable], rtol=0, atol=0)
+
+
+def test_native_warm_fit_reuses_previous_value_factor(native):
+    torch.manual_seed(411)
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    native.encode_state(torch.randn(1, 32, 128, 128, device="npu") * 0.02, packet, indices)
+    stored = packet.cpu()
+    left = stored[..., 17408:18432].contiguous().view(torch.float16).float().view(1, 32, 4, 128)
+    right = stored[..., 18432:19456].contiguous().view(torch.float16).float().view(1, 32, 4, 128)
+    smooth = stored[..., 16896:17408].contiguous().view(torch.float32)
+    scale = stored[..., 16384:16896].contiguous().view(torch.float32)
+    state = stored[..., :16384].contiguous().view(torch.int8).float().view(1, 32, 128, 128)
+    state = state * smooth.unsqueeze(-2) * scale.unsqueeze(-1) + left.transpose(-1, -2) @ right
+    direction = state.transpose(-1, -2) @ left[..., 0, :].unsqueeze(-1)
+    direction /= direction.square().sum(-2, keepdim=True).sqrt()
+    q, k, v, beta, g = _inputs(1)
+    beta.zero_()
+    g.zero_()
+    for _ in range(16):
+        native.decode(q, k, v, beta, g, packet, indices)
+    actual = packet[..., 18432:18688].contiguous().view(torch.float16).float().cpu()
+    torch.testing.assert_close(actual, direction.squeeze(-1).half().float(), rtol=0.003, atol=2e-4)
+
+
+def test_native_mixed_window_cursors(native):
+    torch.manual_seed(412)
+    packet = torch.zeros(3, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.arange(3, dtype=torch.int32, device="npu")
+    native.encode_state(torch.randn(3, 32, 128, 128, device="npu") * 0.02, packet, indices)
+    inputs = _inputs(3)
+    for row, count in enumerate((0, 7, 15)):
+        for _ in range(count):
+            native.decode(*(t[row : row + 1] for t in inputs), packet, indices[row : row + 1])
+    separate = packet.clone()
+    for _ in range(19):
+        actual = native.decode(*inputs, packet, indices)
+        expected = torch.cat(
+            [native.decode(*(t[row : row + 1] for t in inputs), separate, indices[row : row + 1]) for row in range(3)]
+        )
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    torch.testing.assert_close(packet, separate, rtol=0, atol=0)
+
+
+def test_native_current_update_is_not_rounded_to_fp16(native):
+    torch.manual_seed(413)
+    q = torch.zeros(1, 16, 128, dtype=torch.bfloat16, device="npu")
+    q[..., 0] = 1
+    v = torch.randn(1, 32, 128).bfloat16()
+    beta = torch.rand(1, 32).bfloat16()
+    delta = v.float() * beta.float().unsqueeze(-1)
+    expected = (delta * 128**-0.5).bfloat16()
+    rounded_first = (delta.half().float() * 128**-0.5).bfloat16()
+    assert (expected != rounded_first).any()
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    native.encode_state(torch.zeros(1, 32, 128, 128, device="npu"), packet, indices)
+    actual = native.decode(q, q, v.npu(), beta.npu(), torch.zeros(1, 32, device="npu"), packet, indices)
+    torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def test_native_clamps_only_buffered_update(native):
+    q = torch.zeros(1, 16, 128, dtype=torch.bfloat16, device="npu")
+    q[..., 0] = 1
+    v = torch.full((1, 32, 128), 70000, dtype=torch.bfloat16, device="npu")
+    beta = torch.ones(1, 32, dtype=torch.bfloat16, device="npu")
+    g = torch.zeros(1, 32, device="npu")
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    native.encode_state(torch.zeros(1, 32, 128, 128, device="npu"), packet, indices)
+    actual = native.decode(q, q, v, beta, g, packet, indices)
+    torch.testing.assert_close(actual, (v.float() * 128**-0.5).bfloat16(), rtol=0, atol=0)
+    buffered = packet[..., 23552:23808].contiguous().view(torch.float16).cpu()
+    torch.testing.assert_close(buffered, torch.full_like(buffered, 65504), rtol=0, atol=0)
+    beta.zero_()
+    next_output = native.decode(q, q, v, beta, g, packet, indices)
+    expected = torch.full_like(v, 65504 * 128**-0.5)
+    torch.testing.assert_close(next_output, expected, rtol=0, atol=0)

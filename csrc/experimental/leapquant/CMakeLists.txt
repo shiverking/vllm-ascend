@@ -8,7 +8,10 @@ set(SOC_VERSION Ascend910B3 CACHE STRING "Target Ascend device")
 set(RUN_MODE npu CACHE STRING "Kernel execution mode")
 set(ASCEND_CANN_PACKAGE_PATH /usr/local/Ascend/cann-9.1.0 CACHE PATH "CANN installation")
 include(${ASCEND_CANN_PACKAGE_PATH}/aarch64-linux/tikcpp/ascendc_kernel_cmake/ascendc.cmake)
-ascendc_library(leapquant_native SHARED leapquant_kernel.cpp)
-
-set(LEAPQUANT_POWER_ITERS 6 CACHE STRING "Power iterations per rank (experimental)")
-ascendc_compile_definitions(leapquant_native PRIVATE LEAPQUANT_POWER_ITERS=${LEAPQUANT_POWER_ITERS})
+set(LEAPQUANT_POWER_ITERS 8 CACHE STRING "Cold-start power iterations per rank (warm starts use zero extra iterations)")
+# CANN builds host and device objects in separate projects. A generated header
+# beside a private source snapshot gives both halves exactly the same setting.
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/generated)
+configure_file(leapquant_build_config.h.in generated/leapquant_build_config.h @ONLY)
+configure_file(leapquant_kernel.cpp generated/leapquant_kernel.cpp COPYONLY)
+ascendc_library(leapquant_native SHARED ${CMAKE_CURRENT_BINARY_DIR}/generated/leapquant_kernel.cpp)
