@@ -116,7 +116,9 @@ class LeapQuant {
   }
 
   __aicore__ inline void Decode(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g, GM_ADDR output,
-                                uint32_t keyHeads, bool streaming = false) {
+                                uint32_t keyHeads, bool streaming = false, GM_ADDR products = nullptr,
+                                GM_ADDR digitScales = nullptr, GM_ADDR weightCache = nullptr,
+                                bool refreshLayout = true) {
     GlobalTensor<bfloat16_t> qGm, kGm, vGm, bGm, outGm;
     GlobalTensor<float> gGm;
     qGm.SetGlobalBuffer((__gm__ bfloat16_t*)q);
@@ -125,6 +127,12 @@ class LeapQuant {
     bGm.SetGlobalBuffer((__gm__ bfloat16_t*)beta);
     gGm.SetGlobalBuffer((__gm__ float*)g);
     outGm.SetGlobalBuffer((__gm__ bfloat16_t*)output);
+    GlobalTensor<int32_t> productGm;
+    GlobalTensor<float> digitScaleGm;
+    if (products != nullptr) {
+      productGm.SetGlobalBuffer((__gm__ int32_t*)products);
+      digitScaleGm.SetGlobalBuffer((__gm__ float*)digitScales);
+    }
     auto io = vecBuf_.GetWithOffset<bfloat16_t>(D, 14 * D * sizeof(float));
     auto qv = vec_[0 * D], kv = vec_[1 * D], vv = vec_[2 * D];
     auto pred = vec_[6 * D], out = vec_[7 * D];
@@ -151,6 +159,10 @@ class LeapQuant {
         VSync();
         VS();
         prefetched = false;
+      } else if (products != nullptr) {
+        DataCopy(packet_[SCALE], packetGm_[offset + SCALE], PACKET - SCALE);
+        DataCopy(workBuf_.Get<int32_t>(), productGm[static_cast<uint64_t>(job) * 16 * D], 8 * D);
+        DataCopy(vec_[67 * D], digitScaleGm[static_cast<uint64_t>(job) * 8], 8);
       } else {
         DataCopy(packet_, packetGm_[offset], PACKET);
       }
@@ -197,7 +209,9 @@ class LeapQuant {
       VS();
       float decay = gateVec.GetValue(0);
 
-      if (streaming) {
+      if (products != nullptr) {
+        ReconstructProducts(pred, baseQ);
+      } else if (streaming) {
         if (LEAPQUANT_STREAM_PREFETCH && count + 1 != W && job + GetBlockNum() < batch_ * heads_) {
           uint32_t nextJob = job + GetBlockNum(), nextHead = nextJob % heads_;
           int32_t nextSlot = indexGm_.GetValue(nextJob / heads_);
@@ -236,7 +250,7 @@ class LeapQuant {
       VSync();
       Duplicate(coefficients_, decay, 8);
       VSync();
-      if (!streaming) {
+      if (!streaming && products == nullptr) {
         ReadBase(pred, kv);
       }
       Muls(pred, pred, decay, D);
@@ -266,7 +280,7 @@ class LeapQuant {
       logTimes_.SetValue(count, currentLog);
       coefficients_.SetValue(8 + count, 1.f);
       SV();
-      if (streaming) {
+      if (streaming || products != nullptr) {
         DataCopy(pred, baseQ, D);
         VSync();
       } else {
@@ -287,11 +301,18 @@ class LeapQuant {
         // Fold the FP16 buffer, while this token's output used FP32 delta.
         Cast(valRecords[count * D], values_[count * D], RoundMode::CAST_NONE, D);
         VSync();
-        if (streaming) {
+        if (products != nullptr) {
+          DataCopy(packet_, packetGm_[offset], N);
+          LoadSync();
+        }
+        if (streaming || products != nullptr) {
           MaterializeResidual();
         }
         Reconstruct(decay, keyRecords, valRecords);
         Fold(true);
+        if (products != nullptr && refreshLayout) {
+          RefreshCubeWeight(weightCache, (static_cast<uint64_t>(slot) * heads_ + h) * N);
+        }
       } else {
         decay_.SetValue(0, currentLog);
         counter_.SetValue(0, count + 1);
@@ -643,6 +664,52 @@ class LeapQuant {
     Cast(s_, halfTmp, RoundMode::CAST_NONE, N);
     VSync();
   }
+  __aicore__ inline void ReconstructProducts(LocalTensor<float> pred, LocalTensor<float> output) {
+    auto values = s_, temp = vec_[3 * D], digitScale = vec_[67 * D];
+    Cast(values, workBuf_.Get<int32_t>(), RoundMode::CAST_NONE, 8 * D);
+    VSync();
+    for (uint32_t q = 0; q < 2; ++q) {
+      auto result = q == 0 ? pred : output;
+      DataCopy(result, values[q * 4 * D], D);
+      VSync();
+      float multiplier = 1.f / 128.f;
+      for (uint32_t digit = 1; digit < 4; ++digit) {
+        Muls(temp, values[(q * 4 + digit) * D], multiplier, D);
+        VSync();
+        Add(result, result, temp, D);
+        VSync();
+        multiplier /= 128.f;
+      }
+      VS();
+      Muls(result, result, digitScale.GetValue(q), D);
+      VSync();
+      Mul(result, result, scale_, D);
+      VSync();
+    }
+  }
+  __aicore__ inline void RefreshCubeWeight(GM_ADDR weightCache, uint64_t offset) {
+    // Fold leaves its exact rounded INT8 values in the FP16 bridge. Reuse
+    // that bridge and the other half of stateBuf_: no additional GM read.
+    auto input = stateBuf_.Get<half>();
+    auto result = stateBuf_.GetWithOffset<half>(N, N * sizeof(half));
+    for (uint32_t row = 0; row < D; row += 16) {
+      LocalTensor<half> srcList[16], dstList[16];
+      for (uint32_t i = 0; i < 16; ++i) {
+        srcList[i] = input[(row + i) * D];
+        dstList[i] = result[i * D + row];
+      }
+      TransDataTo5HD<half>(dstList, srcList, {false, false, 8, 128, 1});
+      VSync();
+    }
+    auto bytes = workBuf_.Get<int8_t>();
+    Cast(bytes, result, RoundMode::CAST_TRUNC, N);
+    VSync();
+    GlobalTensor<int8_t> weights;
+    weights.SetGlobalBuffer((__gm__ int8_t*)weightCache);
+    StoreSync();
+    DataCopy(weights[offset], bytes, N);
+    StoreDone();
+  }
   __aicore__ inline void ReadResidualPair(LocalTensor<float> pred, LocalTensor<float> output, LocalTensor<float> key,
                                           LocalTensor<float> query) {
     auto scaledK = vec_[66 * D], scaledQ = vec_[67 * D];
@@ -927,9 +994,9 @@ extern "C" void leapquant_stream_launch(uint32_t cores, void* stream, void* q, v
 }
 
 // Standalone residual-contraction helpers. They do not update recurrent state.
-extern "C" __global__ __aicore__ void leapquant_digit_pack(GM_ADDR query, GM_ADDR packed, GM_ADDR scales,
-                                                           uint32_t heads) {
-  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+__aicore__ inline void PackDigitImpl(GM_ADDR query, GM_ADDR packed, GM_ADDR scales, uint32_t heads, GM_ADDR key,
+                                     GM_ADDR packet, GM_ADDR indices, uint32_t keyHeads, uint32_t blocks,
+                                     bool fromGdn) {
   TPipe pipe;
   TBuf<QuePosition::VECCALC> dataBuf, packedBuf;
   pipe.InitBuffer(dataBuf, 8192);
@@ -939,17 +1006,52 @@ extern "C" __global__ __aicore__ void leapquant_digit_pack(GM_ADDR query, GM_ADD
   auto intTmp = dataBuf.GetWithOffset<int32_t>(D, 5 * D * sizeof(float));
   auto halfTmp = dataBuf.GetWithOffset<half>(D, 6 * D * sizeof(float));
   auto scale = data[7 * D];
+  GlobalTensor<bfloat16_t> qGm, kGm;
+  GlobalTensor<uint8_t> packetGm;
+  GlobalTensor<int32_t> indexGm;
+  qGm.SetGlobalBuffer((__gm__ bfloat16_t*)query);
+  kGm.SetGlobalBuffer((__gm__ bfloat16_t*)key);
+  packetGm.SetGlobalBuffer((__gm__ uint8_t*)packet);
+  indexGm.SetGlobalBuffer((__gm__ int32_t*)indices);
   GlobalTensor<float> queryGm, scaleGm;
   GlobalTensor<int8_t> packedGm;
   queryGm.SetGlobalBuffer((__gm__ float*)query);
   scaleGm.SetGlobalBuffer((__gm__ float*)scales);
   packedGm.SetGlobalBuffer((__gm__ int8_t*)packed);
   for (uint32_t head = GetBlockIdx(); head < heads; head += GetBlockNum()) {
-    DataCopy(data, queryGm[static_cast<uint64_t>(head) * 2 * D], 2 * D);
     Duplicate(packedBuf.Get<int32_t>(), 0, 16 * D / 4);
     Duplicate(scale, 0.f, 8);
-    LoadSync();
     VSync();
+    if (fromGdn) {
+      uint32_t batchRow = head / 32, h = head % 32;
+      int32_t slot = indexGm.GetValue(batchRow);
+      if (slot < 0 || static_cast<uint32_t>(slot) >= blocks) {
+        StoreSync();
+        DataCopy(packedGm[static_cast<uint64_t>(head) * 16 * D], packedBuf.Get<int8_t>(), 16 * D);
+        DataCopy(scaleGm[static_cast<uint64_t>(head) * 8], scale, 8);
+        StoreDone();
+        continue;
+      }
+      auto io = dataBuf.GetWithOffset<bfloat16_t>(2 * D, 8 * D * sizeof(float));
+      auto smooth = data[9 * D];
+      uint64_t inputOffset = (static_cast<uint64_t>(batchRow) * keyHeads + h / (32 / keyHeads)) * D;
+      DataCopy(io, kGm[inputOffset], D);
+      DataCopy(io[D], qGm[inputOffset], D);
+      auto smoothBytes = dataBuf.GetWithOffset<uint8_t>(D * sizeof(float), 9 * D * sizeof(float));
+      DataCopy(smoothBytes, packetGm[(static_cast<uint64_t>(slot) * 32 + h) * PACKET + SMOOTH], D * sizeof(float));
+      LoadSync();
+      Cast(data, io, RoundMode::CAST_NONE, D);
+      Cast(data[D], io[D], RoundMode::CAST_NONE, D);
+      VSync();
+      Muls(data[D], data[D], Q_SCALE, D);
+      VSync();
+      Mul(data, data, smooth, D);
+      Mul(data[D], data[D], smooth, D);
+      VSync();
+    } else {
+      DataCopy(data, queryGm[static_cast<uint64_t>(head) * 2 * D], 2 * D);
+      LoadSync();
+    }
     for (uint32_t q = 0; q < 2; ++q) {
       DataCopy(remaining, data[q * D], D);
       Abs(reduced, remaining, D);
@@ -985,6 +1087,18 @@ extern "C" __global__ __aicore__ void leapquant_digit_pack(GM_ADDR query, GM_ADD
     DataCopy(scaleGm[static_cast<uint64_t>(head) * 8], scale, 8);
     StoreDone();
   }
+}
+
+extern "C" __global__ __aicore__ void leapquant_digit_pack(GM_ADDR query, GM_ADDR packed, GM_ADDR scales,
+                                                           uint32_t heads) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  PackDigitImpl(query, packed, scales, heads, nullptr, nullptr, nullptr, 0, 0, false);
+}
+extern "C" __global__ __aicore__ void leapquant_gdn_pack(GM_ADDR q, GM_ADDR k, GM_ADDR packet, GM_ADDR indices,
+                                                         GM_ADDR packed, GM_ADDR scales, uint32_t batch,
+                                                         uint32_t keyHeads, uint32_t blocks) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  PackDigitImpl(q, packed, scales, batch * 32, k, packet, indices, keyHeads, blocks, true);
 }
 
 extern "C" __global__ __aicore__ void leapquant_digit_unpack(GM_ADDR products, GM_ADDR scales, GM_ADDR output,
@@ -1072,4 +1186,31 @@ extern "C" __global__ __aicore__ void leapquant_residual_transpose(GM_ADDR sourc
 extern "C" void leapquant_residual_transpose_launch(uint32_t cores, void* stream, void* source, void* output,
                                                     uint32_t heads, uint32_t sourceStride) {
   leapquant_residual_transpose<<<cores, nullptr, stream>>>((uint8_t*)source, (uint8_t*)output, heads, sourceStride);
+}
+
+extern "C" __global__ __aicore__ void leapquant_cube_post(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g,
+                                                          GM_ADDR packet, GM_ADDR indices, GM_ADDR output,
+                                                          GM_ADDR products, GM_ADDR scales, GM_ADDR weights,
+                                                          uint32_t batch, uint32_t heads, uint32_t keyHeads,
+                                                          uint32_t blocks, uint32_t refresh) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  LeapQuant op;
+  op.Init(&pipe, packet, indices, batch, heads, blocks);
+  op.Decode(q, k, v, beta, g, output, keyHeads, false, products, scales, weights, refresh != 0);
+}
+extern "C" void leapquant_gdn_pack_launch(uint32_t cores, void* stream, void* q, void* k, void* packet, void* indices,
+                                          void* packed, void* scales, uint32_t batch, uint32_t keyHeads,
+                                          uint32_t blocks) {
+  leapquant_gdn_pack<<<cores, nullptr, stream>>>((uint8_t*)q, (uint8_t*)k, (uint8_t*)packet, (uint8_t*)indices,
+                                                 (uint8_t*)packed, (uint8_t*)scales, batch, keyHeads, blocks);
+}
+extern "C" void leapquant_cube_post_launch(uint32_t cores, void* stream, void* q, void* k, void* v, void* beta, void* g,
+                                           void* packet, void* indices, void* output, void* products, void* scales,
+                                           void* weights, uint32_t batch, uint32_t heads, uint32_t keyHeads,
+                                           uint32_t blocks, uint32_t refresh) {
+  leapquant_cube_post<<<cores, nullptr, stream>>>((uint8_t*)q, (uint8_t*)k, (uint8_t*)v, (uint8_t*)beta, (uint8_t*)g,
+                                                  (uint8_t*)packet, (uint8_t*)indices, (uint8_t*)output,
+                                                  (uint8_t*)products, (uint8_t*)scales, (uint8_t*)weights, batch, heads,
+                                                  keyHeads, blocks, refresh);
 }

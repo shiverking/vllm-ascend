@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch_npu  # noqa: F401
 
-from vllm_ascend.ops.leapquant_native import PACKET_BYTES, NativeLeapQuant
+from vllm_ascend.ops.leapquant_native import PACKET_BYTES, NativeCubeGDN, NativeLeapQuant
 
 
 @pytest.fixture(scope="module")
@@ -332,3 +332,89 @@ def test_native_lossless_residual_transpose(native_library):
     source.copy_(source.flip(-1))
     graph.replay()
     torch.testing.assert_close(out, source.transpose(-1, -2).contiguous(), rtol=0, atol=0)
+
+
+def test_cube_gdn_matches_fused_recurrence(native_library):
+    torch.npu.set_device(0)
+    torch.manual_seed(418)
+    backend = NativeLeapQuant(str(native_library))
+    state = torch.randn(2, 32, 128, 128, device="npu") * 0.02
+    cube = NativeCubeGDN(backend, state)
+    reference = cube.packet.clone()
+    for step in range(65):
+        inputs = _inputs()
+        expected = backend.decode(*inputs, reference, cube.indices)
+        actual = cube.step(*inputs)
+        error = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
+        assert torch.isfinite(actual).all() and error < 0.02
+        if step % 16 == 15:
+            torch.testing.assert_close(cube.weights, backend.transpose_residual(cube.residual_view()), rtol=0, atol=0)
+
+
+def test_cube_gdn_graph_and_checkpoint(native_library):
+    torch.npu.set_device(0)
+    torch.manual_seed(419)
+    backend = NativeLeapQuant(str(native_library))
+    cube = NativeCubeGDN(backend, torch.zeros(2, 32, 128, 128, device="npu"))
+    inputs = _inputs()
+    for _ in range(7):
+        cube.step(*inputs)
+    packet, weights = cube.packet.clone(), cube.weights.clone()
+    expected = [cube.step(*inputs).clone() for _ in range(19)]
+    expected_packet, expected_weights = cube.packet.clone(), cube.weights.clone()
+    cube.packet.copy_(packet)
+    cube.weights.copy_(weights)
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = cube.step(*inputs)
+    cube.packet.copy_(packet)
+    cube.weights.copy_(weights)
+    for result in expected:
+        graph.replay()
+        torch.testing.assert_close(output, result, rtol=0, atol=0)
+    torch.testing.assert_close(cube.packet, expected_packet, rtol=0, atol=0)
+    torch.testing.assert_close(cube.weights, expected_weights, rtol=0, atol=0)
+
+
+def test_cube_gdn_free_layout_counterfactual_stays_correct(native_library):
+    torch.npu.set_device(0)
+    torch.manual_seed(420)
+    backend = NativeLeapQuant(str(native_library))
+    state = torch.randn(1, 32, 128, 128, device="npu") * 0.02
+    full = NativeCubeGDN(backend, state)
+    diagnostic = NativeCubeGDN(backend, state)
+    inputs = _inputs(1)
+    for _ in range(3):
+        for _ in range(16):
+            expected = full.step(*inputs)
+            actual = diagnostic._step(*inputs, refresh_layout=False)
+            torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        diagnostic.refresh_layout()
+        torch.testing.assert_close(diagnostic.packet, full.packet, rtol=0, atol=0)
+        torch.testing.assert_close(diagnostic.weights, full.weights, rtol=0, atol=0)
+
+
+def test_cube_gdn_window_graph_counterfactual(native_library):
+    torch.npu.set_device(0)
+    torch.manual_seed(421)
+    backend = NativeLeapQuant(str(native_library))
+    initial = torch.randn(1, 32, 128, 128, device="npu") * 0.02
+    full, diagnostic = NativeCubeGDN(backend, initial), NativeCubeGDN(backend, initial)
+    inputs = _inputs(1)
+    full_graph, diagnostic_graph = torch.npu.NPUGraph(), torch.npu.NPUGraph()
+    with torch.npu.graph(full_graph):
+        for _ in range(16):
+            expected = full.step(*inputs)
+    with torch.npu.graph(diagnostic_graph):
+        for _ in range(16):
+            actual = diagnostic._step(*inputs, refresh_layout=False)
+    torch.npu.synchronize()
+    diagnostic.refresh_layout()
+    for _ in range(3):
+        full_graph.replay()
+        diagnostic_graph.replay()
+        torch.npu.synchronize()
+        diagnostic.refresh_layout()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        torch.testing.assert_close(diagnostic.packet, full.packet, rtol=0, atol=0)
+        torch.testing.assert_close(diagnostic.weights, full.weights, rtol=0, atol=0)

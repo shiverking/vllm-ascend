@@ -64,6 +64,14 @@ class NativeLeapQuant:
         if self._transpose_residual is not None:
             self._transpose_residual.argtypes = [integer] + [pointer] * 3 + [integer] * 2
             self._transpose_residual.restype = None
+        self._gdn_pack = getattr(self.library, "leapquant_gdn_pack_launch", None)
+        if self._gdn_pack is not None:
+            self._gdn_pack.argtypes = [integer] + [pointer] * 7 + [integer] * 3
+            self._gdn_pack.restype = None
+        self._cube_post = getattr(self.library, "leapquant_cube_post_launch", None)
+        if self._cube_post is not None:
+            self._cube_post.argtypes = [integer] + [pointer] * 12 + [integer] * 5
+            self._cube_post.restype = None
 
     @staticmethod
     def _packet(packet, indices, batch, heads):
@@ -105,8 +113,7 @@ class NativeLeapQuant:
             packet.shape[0],
         )
 
-    def decode(self, q, k, v, beta, g, packet, indices):
-        """Update one BF16 token per request, including any required fold."""
+    def _validate_decode(self, q, k, v, beta, g, packet, indices):
         if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
             raise ValueError("native LeapQuant Q/K/V must have [requests, heads, dim] shape")
         batch, heads = v.shape[:2]
@@ -121,6 +128,11 @@ class NativeLeapQuant:
             raise ValueError("native LeapQuant requires BF16 Q/K/V/beta and FP32 log forget gates")
         if any(t.device != packet.device or not t.is_contiguous() for t in (q, k, v, beta, g)):
             raise ValueError("native LeapQuant inputs must be contiguous on the packet NPU")
+        return batch, heads
+
+    def decode(self, q, k, v, beta, g, packet, indices):
+        """Update one BF16 token per request, including any required fold."""
+        batch, heads = self._validate_decode(q, k, v, beta, g, packet, indices)
         output = torch.empty_like(v)
         self._decode(
             self.cores,
@@ -193,7 +205,7 @@ class NativeLeapQuant:
         )
         return output
 
-    def transpose_residual(self, state):
+    def transpose_residual(self, state, out=None):
         """Lossless INT8 transpose; supports ND residual views inside AoS packets."""
         if state.ndim != 3 or state.shape[1:] != (128, 128) or state.shape[0] < 1:
             raise ValueError("residual transpose requires [heads, 128, 128]")
@@ -205,8 +217,130 @@ class NativeLeapQuant:
             raise ValueError("residual transpose requires ND layout")
         if self._transpose_residual is None:
             raise ValueError("rebuild the native library for residual transpose")
-        output = torch.empty(state.shape, dtype=state.dtype, device=state.device)
+        if out is not None and (
+            out.shape != state.shape
+            or out.dtype != torch.int8
+            or out.device != state.device
+            or not out.is_contiguous()
+            or torch_npu.get_npu_format(out) != 2
+        ):
+            raise ValueError("residual transpose output must be matching contiguous INT8 ND")
+        output = out if out is not None else torch.empty(state.shape, dtype=state.dtype, device=state.device)
         self._transpose_residual(
             self.cores, self._stream(state.device), state.data_ptr(), output.data_ptr(), state.shape[0], state.stride(0)
         )
         return output
+
+    def prepare_gdn_queries(self, q, k, packet, indices):
+        """Read model BF16 Q/K and checkpoint smoothing directly into digits."""
+        if q.ndim != 3 or q.shape[1:] != (16, 128) or k.shape != q.shape:
+            raise ValueError("GDN preparation requires [batch,16,128] Q/K")
+        self._packet(packet, indices, q.shape[0], 32)
+        if any(t.dtype != torch.bfloat16 or t.device != packet.device or not t.is_contiguous() for t in (q, k)):
+            raise ValueError("GDN preparation requires matching contiguous BF16 Q/K")
+        if self._gdn_pack is None:
+            raise ValueError("rebuild the native library for Cube GDN")
+        packed = torch.empty((q.shape[0] * 32, 16, 128), dtype=torch.int8, device=q.device)
+        scales = torch.empty((q.shape[0] * 32, 8), dtype=torch.float32, device=q.device)
+        self._gdn_pack(
+            self.cores,
+            self._stream(q.device),
+            q.data_ptr(),
+            k.data_ptr(),
+            packet.data_ptr(),
+            indices.data_ptr(),
+            packed.data_ptr(),
+            scales.data_ptr(),
+            q.shape[0],
+            16,
+            packet.shape[0],
+        )
+        return packed, scales
+
+    def decode_cube_products(self, q, k, v, beta, g, packet, indices, products, scales, weights, refresh_layout=True):
+        """Finish the complete GDN recurrence, including any fold and cache refresh."""
+        batch, heads = self._validate_decode(q, k, v, beta, g, packet, indices)
+        if products.shape != (batch * heads, 16, 128) or products.dtype != torch.int32:
+            raise ValueError("Cube products must be INT32 [batch*heads,16,128]")
+        if scales.shape != (batch * heads, 8) or scales.dtype != torch.float32:
+            raise ValueError("Cube query scales must be FP32 [batch*heads,8]")
+        if weights.shape != (packet.shape[0] * heads, 128, 128) or weights.dtype != torch.int8:
+            raise ValueError("Cube weights must match the packet pool")
+        if any(
+            t.device != packet.device or not t.is_contiguous() or torch_npu.get_npu_format(t) != 2
+            for t in (products, scales, weights)
+        ):
+            raise ValueError("Cube intermediate tensors must be contiguous ND on the packet NPU")
+        if self._cube_post is None:
+            raise ValueError("rebuild the native library for Cube GDN")
+        output = torch.empty_like(v)
+        self._cube_post(
+            self.cores,
+            self._stream(q.device),
+            q.data_ptr(),
+            k.data_ptr(),
+            v.data_ptr(),
+            beta.data_ptr(),
+            g.data_ptr(),
+            packet.data_ptr(),
+            indices.data_ptr(),
+            output.data_ptr(),
+            products.data_ptr(),
+            scales.data_ptr(),
+            weights.data_ptr(),
+            batch,
+            heads,
+            16,
+            packet.shape[0],
+            int(refresh_layout),
+        )
+        return output
+
+
+class NativeCubeGDN:
+    """Isolated TP1 GDN recurrence with owned, identity-mapped cache slots.
+
+    Q/K/V, beta and log gates are layer inputs. This does not include the
+    model's projections, convolution, normalization or output projection.
+    Both packet and weight buffers form the checkpoint and must be restored.
+    """
+
+    def __init__(self, backend: NativeLeapQuant, state):
+        if backend.value_tile != 128 or backend.streaming:
+            raise ValueError("Cube GDN requires the fused native backend")
+        if (
+            state.ndim != 4
+            or state.shape[1:] != (32, 128, 128)
+            or state.dtype != torch.float32
+            or state.device.type != "npu"
+        ):
+            raise ValueError("Cube GDN state must be FP32 NPU [batch,32,128,128]")
+        self.backend = backend
+        self.packet = torch.empty((state.shape[0], 32, PACKET_BYTES), dtype=torch.uint8, device=state.device)
+        self.indices = torch.arange(state.shape[0], dtype=torch.int32, device=state.device)
+        self.weights = torch.empty((state.shape[0] * 32, 128, 128), dtype=torch.int8, device=state.device)
+        self.unit = torch.ones(128, dtype=torch.float32, device=state.device)
+        backend.encode_state(state, self.packet, self.indices)
+        self.refresh_layout()
+
+    def residual_view(self):
+        return self.packet.view(torch.int8)[..., :16384].reshape(-1, 128, 128)
+
+    def refresh_layout(self):
+        """Update the fixed weight buffer; used only for initialization or diagnostics."""
+        self.backend.transpose_residual(self.residual_view(), out=self.weights)
+
+    def step(self, q, k, v, beta, g):
+        return self._step(q, k, v, beta, g, True)
+
+    def _step(self, q, k, v, beta, g, refresh_layout):
+        # The false case is a counterfactual benchmark only: the caller must
+        # refresh the layout after each complete 16-token graph window.
+        if q.shape[0] != self.packet.shape[0]:
+            raise ValueError("Cube GDN batch must match its owned cache")
+        self.backend._validate_decode(q, k, v, beta, g, self.packet, self.indices)
+        packed, scales = self.backend.prepare_gdn_queries(q, k, self.packet, self.indices)
+        products = torch_npu.npu_quant_matmul(packed, self.weights, self.unit, output_dtype=torch.int32)
+        return self.backend.decode_cube_products(
+            q, k, v, beta, g, self.packet, self.indices, products, scales, self.weights, refresh_layout
+        )
