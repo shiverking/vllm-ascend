@@ -12,6 +12,7 @@ import torch
 import torch_npu
 
 PACKET_BYTES = 27744
+SERVING_PACKET_BYTES = 32768
 FORMAT_TAG = 0x4C513034
 
 
@@ -73,10 +74,31 @@ class NativeLeapQuant:
             self._cube_post.argtypes = [integer] + [pointer] * 12 + [integer] * 5
             self._cube_post.restype = None
 
+        self._export = getattr(self.library, "leapquant_export_launch", None)
+        if self._export is not None:
+            self._export.argtypes = [integer] + [pointer] * 5 + [integer] * 3
+            self._export.restype = None
+
+        for attribute, symbol, pointers, integers in (
+            ("_padded_encode", "leapquant_padded_encode_launch", 4, 4),
+            ("_padded_decode", "leapquant_padded_decode_launch", 9, 5),
+            ("_padded_export", "leapquant_padded_export_launch", 5, 4),
+        ):
+            launch = getattr(self.library, symbol, None)
+            if launch is not None:
+                launch.argtypes = [integer] + [pointer] * pointers + [integer] * integers
+                launch.restype = None
+            setattr(self, attribute, launch)
+
     @staticmethod
     def _packet(packet, indices, batch, heads):
-        if packet.dtype != torch.uint8 or packet.ndim != 3 or packet.shape[1:] != (heads, PACKET_BYTES):
-            raise ValueError("native LeapQuant requires uint8 [blocks, heads, 27744] packets")
+        if (
+            packet.dtype != torch.uint8
+            or packet.ndim != 3
+            or packet.shape[1] != heads
+            or packet.shape[2] not in (PACKET_BYTES, SERVING_PACKET_BYTES)
+        ):
+            raise ValueError("native LeapQuant requires uint8 [blocks, heads, 27744 or 32768] packets")
         if indices.dtype != torch.int32 or indices.shape != (batch,):
             raise ValueError("native LeapQuant requires int32 [requests] indices")
         if not packet.is_contiguous() or not indices.is_contiguous():
@@ -102,7 +124,11 @@ class NativeLeapQuant:
             raise ValueError("native LeapQuant state must be contiguous on the packet NPU")
         batch, heads = state.shape[:2]
         self._packet(packet, indices, batch, heads)
-        self._encode(
+        padded = packet.shape[-1] == SERVING_PACKET_BYTES
+        launch = self._padded_encode if padded else self._encode
+        if launch is None:
+            raise ValueError("rebuild the native library for padded serving packets")
+        launch(
             self.cores,
             self._stream(packet.device),
             state.data_ptr(),
@@ -111,7 +137,44 @@ class NativeLeapQuant:
             batch,
             heads,
             packet.shape[0],
+            *((packet.shape[-1],) if padded else ()),
         )
+
+    def export_state(self, packet, indices, has_state):
+        """Materialize only selected prefill states, including pending records.
+
+        False mask entries yield zero without reading the potentially reused
+        slot. Output uses native [V,K] orientation; the prefill op uses [K,V].
+        """
+        batch = indices.numel()
+        self._packet(packet, indices, batch, 32)
+        if (
+            has_state.shape != (batch,)
+            or has_state.dtype != torch.bool
+            or has_state.device != packet.device
+            or not has_state.is_contiguous()
+        ):
+            raise ValueError("export requires contiguous bool [requests] mask on the packet NPU")
+        if self._export is None:
+            raise ValueError("rebuild the native library for prefill state export")
+        output = torch.empty((batch, 32, 128, 128), dtype=torch.float32, device=packet.device)
+        padded = packet.shape[-1] == SERVING_PACKET_BYTES
+        launch = self._padded_export if padded else self._export
+        if launch is None:
+            raise ValueError("rebuild the native library for padded serving packets")
+        launch(
+            self.cores,
+            self._stream(packet.device),
+            packet.data_ptr(),
+            indices.data_ptr(),
+            has_state.data_ptr(),
+            output.data_ptr(),
+            batch,
+            32,
+            packet.shape[0],
+            *((packet.shape[-1],) if padded else ()),
+        )
+        return output
 
     def _validate_decode(self, q, k, v, beta, g, packet, indices):
         if q.ndim != 3 or k.shape != q.shape or v.ndim != 3:
@@ -134,7 +197,11 @@ class NativeLeapQuant:
         """Update one BF16 token per request, including any required fold."""
         batch, heads = self._validate_decode(q, k, v, beta, g, packet, indices)
         output = torch.empty_like(v)
-        self._decode(
+        padded = packet.shape[-1] == SERVING_PACKET_BYTES
+        if padded and (self.value_tile != 128 or self.streaming or self._padded_decode is None):
+            raise ValueError("padded serving packets require the fused serving library")
+        launch = self._padded_decode if padded else self._decode
+        launch(
             self.cores,
             self._stream(packet.device),
             q.data_ptr(),
@@ -149,7 +216,7 @@ class NativeLeapQuant:
             heads,
             q.shape[1],
             packet.shape[0],
-            *(() if self.value_tile == 128 else (self.value_tile,)),
+            *((packet.shape[-1],) if padded else (() if self.value_tile == 128 else (self.value_tile,))),
         )
         return output
 
@@ -236,6 +303,8 @@ class NativeLeapQuant:
         if q.ndim != 3 or q.shape[1:] != (16, 128) or k.shape != q.shape:
             raise ValueError("GDN preparation requires [batch,16,128] Q/K")
         self._packet(packet, indices, q.shape[0], 32)
+        if packet.shape[-1] != PACKET_BYTES:
+            raise ValueError("Cube GDN requires unpadded isolated packets")
         if any(t.dtype != torch.bfloat16 or t.device != packet.device or not t.is_contiguous() for t in (q, k)):
             raise ValueError("GDN preparation requires matching contiguous BF16 Q/K")
         if self._gdn_pack is None:
@@ -260,6 +329,8 @@ class NativeLeapQuant:
     def decode_cube_products(self, q, k, v, beta, g, packet, indices, products, scales, weights, refresh_layout=True):
         """Finish the complete GDN recurrence, including any fold and cache refresh."""
         batch, heads = self._validate_decode(q, k, v, beta, g, packet, indices)
+        if packet.shape[-1] != PACKET_BYTES:
+            raise ValueError("Cube GDN requires unpadded isolated packets")
         if products.shape != (batch * heads, 16, 128) or products.dtype != torch.int32:
             raise ValueError("Cube products must be INT32 [batch*heads,16,128]")
         if scales.shape != (batch * heads, 8) or scales.dtype != torch.float32:

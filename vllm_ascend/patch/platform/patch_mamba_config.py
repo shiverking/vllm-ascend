@@ -11,6 +11,9 @@ from vllm.model_executor.models.config import MambaModelConfig
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE, get_dtype_size
 
+from vllm_ascend.ops.leapquant_config import LeapQuantConfig
+from vllm_ascend.ops.leapquant_native import SERVING_PACKET_BYTES
+
 
 def _using_kv_store(vllm_config) -> bool:
     """
@@ -49,6 +52,7 @@ def verify_and_update_config(cls, vllm_config) -> None:
     # Enable FULL_AND_PIECEWISE by default
     MambaModelConfig.verify_and_update_config(vllm_config)
 
+    leapquant = LeapQuantConfig.from_vllm_config(vllm_config)
     cache_config = vllm_config.cache_config
     model_config = vllm_config.model_config
     parallel_config = vllm_config.parallel_config
@@ -90,6 +94,8 @@ def verify_and_update_config(cls, vllm_config) -> None:
     for shape, dtype in zip(mamba_shapes, mamba_dtypes):
         mamba_sizes.append(math.prod(shape) * get_dtype_size(dtype))
     ssm_block_page_size, conv_block_page_size = max(mamba_sizes), min(mamba_sizes)
+    if leapquant.enabled:
+        ssm_block_page_size = 32 * SERVING_PACKET_BYTES
 
     # Pure linear attention models (e.g. bailing 2.5) have only SSM state,
     # no conv block. Detected by a single 3-D mamba shape (ssm only, no conv).
@@ -117,6 +123,12 @@ def verify_and_update_config(cls, vllm_config) -> None:
     assert attn_single_token_k_page_size * attn_block_size == ssm_block_page_size, (
         "Cannot align ssm_page_size and attn_page_size."
     )
+    if leapquant.enabled:
+        logger.warning(
+            "Experimental LeapQuant: padded SSM bytes=%d; minimum attention block=%d",
+            ssm_block_page_size,
+            attn_block_size,
+        )
 
     # override attention block size if either (a) the
     # user has not set it or (b) the user has set it

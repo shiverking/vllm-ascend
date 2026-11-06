@@ -204,6 +204,9 @@ if is_310p():
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention310._forward_core
     _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention310.get_state_dtype
 else:
+    _GDN_PATCH_TARGET.get_kv_cache_spec = AscendGatedDeltaNetAttention.get_kv_cache_spec
+    _GDN_PATCH_TARGET.get_state_dtype = AscendGatedDeltaNetAttention.get_state_dtype
+    _GDN_PATCH_TARGET._run_recurrent = AscendGatedDeltaNetAttention._run_recurrent
     _GDN_PATCH_TARGET.forward = AscendGatedDeltaNetAttention.forward
     _GDN_PATCH_TARGET._forward_core = AscendGatedDeltaNetAttention._forward_core
     _GDN_PATCH_TARGET._warmup_prefill_kernels = AscendGatedDeltaNetAttention._warmup_prefill_kernels

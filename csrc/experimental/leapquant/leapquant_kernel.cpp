@@ -60,10 +60,11 @@ __aicore__ inline void StoreDone() {
 class LeapQuant {
  public:
   __aicore__ inline void Init(TPipe* pipe, GM_ADDR packet, GM_ADDR indices, uint32_t batch, uint32_t heads,
-                              uint32_t blocks, uint32_t tile = D) {
+                              uint32_t blocks, uint32_t tile = D, uint32_t packetStride = PACKET) {
     batch_ = batch;
     heads_ = heads;
     blocks_ = blocks;
+    packetStride_ = packetStride;
     packetGm_.SetGlobalBuffer((__gm__ uint8_t*)packet);
     indexGm_.SetGlobalBuffer((__gm__ int32_t*)indices);
     pipe->InitBuffer(packetBuf_, PACKET);
@@ -110,7 +111,50 @@ class LeapQuant {
       VSync();
       tag_.SetValue(0, MAGIC);
       StoreSync();
-      DataCopy(packetGm_[(static_cast<uint64_t>(slot) * heads_ + h) * PACKET], packet_, PACKET);
+      DataCopy(packetGm_[(static_cast<uint64_t>(slot) * heads_ + h) * packetStride_], packet_, PACKET);
+      StoreDone();
+    }
+  }
+
+  // Materialize selected prefix/chunk states only. Decode never allocates
+  // a persistent FP32 state pool. A false mask must not read an old slot.
+  __aicore__ inline void Export(GM_ADDR output, GM_ADDR hasState) {
+    GlobalTensor<float> outGm;
+    GlobalTensor<uint8_t> maskGm;
+    outGm.SetGlobalBuffer((__gm__ float*)output);
+    maskGm.SetGlobalBuffer((__gm__ uint8_t*)hasState);
+    for (uint32_t job = GetBlockIdx(); job < batch_ * heads_; job += GetBlockNum()) {
+      uint32_t b = job / heads_, h = job % heads_;
+      int32_t slot = indexGm_.GetValue(b);
+      Duplicate(s_, 0.f, N);
+      VSync();
+      if (maskGm.GetValue(b) && slot >= 0 && static_cast<uint32_t>(slot) < blocks_) {
+        DataCopy(packet_, packetGm_[(static_cast<uint64_t>(slot) * heads_ + h) * packetStride_], PACKET);
+        LoadSync();
+        int32_t count = counter_.GetValue(0);
+        if (tag_.GetValue(0) != MAGIC || count < 0 || count >= W) {
+          Duplicate(s_, __builtin_nanf(""), N);
+          VSync();
+        } else {
+          MaterializeResidual();
+          auto kr = vec_[24 * D], vr = vec_[48 * D];
+          Cast(kr, keys_, RoundMode::CAST_NONE, W * D);
+          Cast(vr, values_, RoundMode::CAST_NONE, W * D);
+          Muls(coefficients_[8], logTimes_, -1.f, W);
+          VSync();
+          float logDecay = decay_.GetValue(0);
+          Adds(coefficients_[8], coefficients_[8], logDecay, W);
+          Duplicate(coefficients_, logDecay, 8);
+          VSync();
+          Exp(coefficients_, coefficients_, 8 + W);
+          VSync();
+          VS();
+          float decay = coefficients_.GetValue(0);
+          Reconstruct(decay, kr, vr, count);
+        }
+      }
+      StoreSync();
+      DataCopy(outGm[static_cast<uint64_t>(job) * N], s_, N);
       StoreDone();
     }
   }
@@ -152,7 +196,7 @@ class LeapQuant {
         StoreDone();
         continue;
       }
-      uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * PACKET;
+      uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * packetStride_;
       if (prefetched) {
         LoadSync();
         DataCopy(packet_, nextPacket, PACKET);
@@ -216,7 +260,8 @@ class LeapQuant {
           uint32_t nextJob = job + GetBlockNum(), nextHead = nextJob % heads_;
           int32_t nextSlot = indexGm_.GetValue(nextJob / heads_);
           if (nextSlot >= 0 && static_cast<uint32_t>(nextSlot) < blocks_ && (nextSlot != slot || nextHead != h)) {
-            DataCopy(nextPacket, packetGm_[(static_cast<uint64_t>(nextSlot) * heads_ + nextHead) * PACKET], PACKET);
+            DataCopy(nextPacket, packetGm_[(static_cast<uint64_t>(nextSlot) * heads_ + nextHead) * packetStride_],
+                     PACKET);
             prefetched = true;
           }
         }
@@ -364,7 +409,7 @@ class LeapQuant {
         StoreDone();
         continue;
       }
-      uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * PACKET;
+      uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * packetStride_;
       // Only this value slice is read or written. Shared keys, scales and
       // metadata remain immutable until the following commit kernel.
       DataCopy(packet_, packetGm_[offset + start * D], tile * D);
@@ -473,7 +518,7 @@ class LeapQuant {
       if (slot < 0 || static_cast<uint32_t>(slot) >= blocks_) {
         continue;
       }
-      uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * PACKET;
+      uint64_t offset = (static_cast<uint64_t>(slot) * heads_ + h) * packetStride_;
       DataCopy(packet_[DECAY], packetGm_[offset + DECAY], PACKET - DECAY);
       DataCopy(gates, gGm[job / 8 * 8], 8);
       LoadSync();
@@ -796,7 +841,7 @@ class LeapQuant {
     Add(dst, dst, work_, tile);
     VSync();
   }
-  __aicore__ inline void Reconstruct(float decay, LocalTensor<float> kr, LocalTensor<float> vr) {
+  __aicore__ inline void Reconstruct(float decay, LocalTensor<float> kr, LocalTensor<float> vr, uint32_t count = W) {
     ScaleRows(s_, s_, scale_, D);
     ElemColumns(s_, s_, smooth_, D);
     auto lv = vec_[12 * D], rv = vec_[13 * D];
@@ -809,8 +854,10 @@ class LeapQuant {
     }
     Muls(s_, s_, decay, N);
     VSync();
-    ScaleRows(vr, vr, coefficients_[8], W);
-    for (uint32_t w = 0; w < W; ++w) {
+    if (count) {
+      ScaleRows(vr, vr, coefficients_[8], count);
+    }
+    for (uint32_t w = 0; w < count; ++w) {
       Outer(vr[w * D], kr[w * D], false);
     }
   }
@@ -909,7 +956,7 @@ class LeapQuant {
   LocalTensor<uint32_t> tag_;
   GlobalTensor<uint8_t> packetGm_;
   GlobalTensor<int32_t> indexGm_;
-  uint32_t batch_, heads_, blocks_;
+  uint32_t batch_, heads_, blocks_, packetStride_;
 };
 }  // namespace
 
@@ -1213,4 +1260,67 @@ extern "C" void leapquant_cube_post_launch(uint32_t cores, void* stream, void* q
                                                   (uint8_t*)packet, (uint8_t*)indices, (uint8_t*)output,
                                                   (uint8_t*)products, (uint8_t*)scales, (uint8_t*)weights, batch, heads,
                                                   keyHeads, blocks, refresh);
+}
+
+extern "C" __global__ __aicore__ void leapquant_export(GM_ADDR packet, GM_ADDR indices, GM_ADDR mask, GM_ADDR output,
+                                                       uint32_t batch, uint32_t heads, uint32_t blocks) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  LeapQuant op;
+  op.Init(&pipe, packet, indices, batch, heads, blocks);
+  op.Export(output, mask);
+}
+extern "C" void leapquant_export_launch(uint32_t cores, void* stream, void* packet, void* indices, void* mask,
+                                        void* output, uint32_t batch, uint32_t heads, uint32_t blocks) {
+  leapquant_export<<<cores, nullptr, stream>>>((uint8_t*)packet, (uint8_t*)indices, (uint8_t*)mask, (uint8_t*)output,
+                                               batch, heads, blocks);
+}
+
+// Serving pools require one MiB of SSM storage to match the K plane's
+// block stride. Content stays LQ04; each head has unused trailing padding.
+extern "C" __global__ __aicore__ void leapquant_padded_encode(GM_ADDR state, GM_ADDR packet, GM_ADDR indices,
+                                                              uint32_t batch, uint32_t heads, uint32_t blocks,
+                                                              uint32_t stride) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  LeapQuant op;
+  op.Init(&pipe, packet, indices, batch, heads, blocks, D, stride);
+  op.Encode(state);
+}
+extern "C" void leapquant_padded_encode_launch(uint32_t cores, void* stream, void* state, void* packet, void* indices,
+                                               uint32_t batch, uint32_t heads, uint32_t blocks, uint32_t stride) {
+  leapquant_padded_encode<<<cores, nullptr, stream>>>((uint8_t*)state, (uint8_t*)packet, (uint8_t*)indices, batch,
+                                                      heads, blocks, stride);
+}
+extern "C" __global__ __aicore__ void leapquant_padded_decode(GM_ADDR q, GM_ADDR k, GM_ADDR v, GM_ADDR beta, GM_ADDR g,
+                                                              GM_ADDR packet, GM_ADDR indices, GM_ADDR output,
+                                                              uint32_t batch, uint32_t heads, uint32_t keyHeads,
+                                                              uint32_t blocks, uint32_t stride) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  LeapQuant op;
+  op.Init(&pipe, packet, indices, batch, heads, blocks, D, stride);
+  op.Decode(q, k, v, beta, g, output, keyHeads);
+}
+extern "C" void leapquant_padded_decode_launch(uint32_t cores, void* stream, void* q, void* k, void* v, void* beta,
+                                               void* g, void* packet, void* indices, void* output, uint32_t batch,
+                                               uint32_t heads, uint32_t keyHeads, uint32_t blocks, uint32_t stride) {
+  leapquant_padded_decode<<<cores, nullptr, stream>>>((uint8_t*)q, (uint8_t*)k, (uint8_t*)v, (uint8_t*)beta,
+                                                      (uint8_t*)g, (uint8_t*)packet, (uint8_t*)indices,
+                                                      (uint8_t*)output, batch, heads, keyHeads, blocks, stride);
+}
+extern "C" __global__ __aicore__ void leapquant_padded_export(GM_ADDR packet, GM_ADDR indices, GM_ADDR mask,
+                                                              GM_ADDR output, uint32_t batch, uint32_t heads,
+                                                              uint32_t blocks, uint32_t stride) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  LeapQuant op;
+  op.Init(&pipe, packet, indices, batch, heads, blocks, D, stride);
+  op.Export(output, mask);
+}
+extern "C" void leapquant_padded_export_launch(uint32_t cores, void* stream, void* packet, void* indices, void* mask,
+                                               void* output, uint32_t batch, uint32_t heads, uint32_t blocks,
+                                               uint32_t stride) {
+  leapquant_padded_export<<<cores, nullptr, stream>>>((uint8_t*)packet, (uint8_t*)indices, (uint8_t*)mask,
+                                                      (uint8_t*)output, batch, heads, blocks, stride);
 }

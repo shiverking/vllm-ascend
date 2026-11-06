@@ -418,3 +418,75 @@ def test_cube_gdn_window_graph_counterfactual(native_library):
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         torch.testing.assert_close(diagnostic.packet, full.packet, rtol=0, atol=0)
         torch.testing.assert_close(diagnostic.weights, full.weights, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("storage_bytes", [27744, 32768])
+def test_native_export_pending_records_and_slot_copy(native_library, storage_bytes):
+    torch.npu.set_device(0)
+    torch.manual_seed(4210)
+    backend = NativeLeapQuant(str(native_library))
+    packet = torch.empty((7, 32, storage_bytes), dtype=torch.uint8, device="npu")
+    indices = torch.tensor([1, 4], dtype=torch.int32, device="npu")
+    backend.encode_state(torch.randn(2, 32, 128, 128, device="npu") * 0.02, packet, indices)
+    mask = torch.ones(2, dtype=torch.bool, device="npu")
+    for step in range(20):
+        if step in (0, 7, 16, 19):
+            selected = packet[indices.long()].cpu()
+            reference = []
+            for row in selected:
+                state = row[:, :16384].contiguous().view(torch.int8).float().view(32, 128, 128)
+                scale = row[:, 16384:16896].contiguous().view(torch.float32)
+                smooth = row[:, 16896:17408].contiguous().view(torch.float32)
+                left = row[:, 17408:18432].contiguous().view(torch.float16).float().view(32, 4, 128)
+                right = row[:, 18432:19456].contiguous().view(torch.float16).float().view(32, 4, 128)
+                keys = row[:, 19456:23552].contiguous().view(torch.float16).float().view(32, 16, 128)
+                values = row[:, 23552:27648].contiguous().view(torch.float16).float().view(32, 16, 128)
+                decay = row[:, 27648:27652].contiguous().view(torch.float32).flatten()
+                cursor = row[:, 27652:27656].contiguous().view(torch.int32).flatten()
+                times = row[:, 27680:27744].contiguous().view(torch.float32)
+                state = state * scale.unsqueeze(-1) * smooth.unsqueeze(-2) + left.transpose(-1, -2) @ right
+                state *= decay.exp()[:, None, None]
+                weights = (decay[:, None] - times).exp()
+                weights *= torch.arange(16)[None, :] < cursor[:, None]
+                state += (values * weights[:, :, None]).transpose(-1, -2) @ keys
+                reference.append(state)
+            actual = backend.export_state(packet, indices, mask)
+            torch.testing.assert_close(actual.cpu(), torch.stack(reference), rtol=1e-4, atol=2e-6, msg=f"step={step}")
+            # Prefix checkpoint and resume copy the complete packet, including
+            # pending records/cursor. No separate FP32 pool is required.
+            packet[5].copy_(packet[1])
+            copied = backend.export_state(packet, torch.tensor([5], dtype=torch.int32, device="npu"), mask[:1])
+            torch.testing.assert_close(copied, actual[:1], rtol=0, atol=0)
+        backend.decode(*_inputs(), packet, indices)
+    # A new sequence must ignore an invalid/previously used cache slot.
+    packet[0].fill_(255)
+    absent = backend.export_state(packet, torch.tensor([0, -1], dtype=torch.int32, device="npu"), ~mask)
+    assert absent.count_nonzero() == 0
+    with pytest.raises(ValueError, match="bool"):
+        backend.export_state(packet, indices, mask.int())
+
+
+def test_padded_serving_graph_preserves_packet_and_padding(native_library):
+    torch.npu.set_device(0)
+    torch.manual_seed(4211)
+    backend = NativeLeapQuant(str(native_library))
+    padded = torch.full((7, 32, 32768), 127, dtype=torch.uint8, device="npu")
+    compact = torch.empty((7, 32, PACKET_BYTES), dtype=torch.uint8, device="npu")
+    state = torch.randn(2, 32, 128, 128, device="npu") * 0.02
+    indices = torch.tensor([1, 4], dtype=torch.int32, device="npu")
+    backend.encode_state(state, compact, indices)
+    backend.encode_state(state, padded, indices)
+    initial = padded.clone()
+    inputs = _inputs()
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        output = backend.decode(*inputs, padded, indices)
+    padded.copy_(initial)
+    for _ in range(33):
+        expected = backend.decode(*inputs, compact, indices)
+        graph.replay()
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    torch.testing.assert_close(padded[indices.long(), :, :PACKET_BYTES], compact[indices.long()], rtol=0, atol=0)
+    assert (padded[..., PACKET_BYTES:] == 127).all()
+    for slot in (0, 2, 3, 5, 6):
+        torch.testing.assert_close(padded[slot], initial[slot], rtol=0, atol=0)

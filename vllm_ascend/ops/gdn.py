@@ -19,7 +19,9 @@ import torch
 from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
+from vllm.logger import logger
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
+from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.triton_utils import triton
@@ -30,6 +32,8 @@ from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm_ascend.attention.utils import maybe_save_kv_layer_to_connector
 from vllm_ascend.device.device_op import DeviceOperator
 from vllm_ascend.ops.gdn_attn_builder import AscendGDNAttentionBackend
+from vllm_ascend.ops.leapquant_config import LeapQuantConfig
+from vllm_ascend.ops.leapquant_native import SERVING_PACKET_BYTES, NativeLeapQuant
 from vllm_ascend.ops.triton.fla.chunk import chunk_gated_delta_rule
 from vllm_ascend.ops.triton.fla.fused_qkvzba_split_reshape import fused_qkvzba_split_reshape_cat
 from vllm_ascend.ops.triton.fla.utils import clear_ssm_states
@@ -37,6 +41,40 @@ from vllm_ascend.ops.triton.mamba.causal_conv1d import extract_last_width
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def get_kv_cache_spec(self, vllm_config):
+        options = LeapQuantConfig.from_vllm_config(vllm_config)
+        if options.enabled and getattr(self, "leapquant", None) is None:
+            backend = NativeLeapQuant(options.library, cores=options.cores)
+            if backend._export is None or backend._padded_decode is None:
+                raise ValueError("Rebuild the LeapQuant library with prefill export support")
+            self.leapquant = backend
+            logger.info(
+                "LeapQuant GDN cache: layer=%s packet_bytes/head=%d cores=%d",
+                self.prefix,
+                SERVING_PACKET_BYTES,
+                options.cores,
+            )
+        return MambaBase.get_kv_cache_spec(self, vllm_config)
+
+    def get_state_dtype(self):
+        conv_dtype, temporal_dtype = GatedDeltaNetAttention.get_state_dtype(self)
+        return conv_dtype, torch.uint8 if getattr(self, "leapquant", None) is not None else temporal_dtype
+
+    def _run_recurrent(self, query, key, value, g, beta, state, actual_seq_lengths, ssm_state_indices):
+        if getattr(self, "leapquant", None) is not None:
+            return self.leapquant.decode(query, key, value, beta, g, state, ssm_state_indices)
+        return torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            query=query,
+            key=key,
+            value=value,
+            g=g,
+            beta=beta,
+            state=state,
+            scale=key.shape[-1] ** -0.5,
+            actual_seq_lengths=actual_seq_lengths,
+            ssm_state_indices=ssm_state_indices,
+        )
+
     def _split_ba_for_tp(self, ba: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if hasattr(self, "split_ba"):
             return self.split_ba(ba)
@@ -45,7 +83,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
-        return MambaStateShapeCalculator.gated_delta_net_state_shape(
+        shapes = MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
             self.num_v_heads,
@@ -54,6 +92,10 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             self.conv_kernel_size,
             self.num_spec,
         )
+
+        if getattr(self, "leapquant", None) is not None:
+            return shapes[0], (32, SERVING_PACKET_BYTES)
+        return shapes
 
     def _warmup_prefill_kernels(self, qkv_or_qkvz: torch.Tensor, v_dim: int) -> None:
         return
@@ -366,14 +408,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             actual_seq_lengths = attn_metadata.non_spec_decode_metadata.actual_seq_lengths
             query_decode = l2norm_fwd(query_decode)
             key_decode = l2norm_fwd(key_decode)
-            core_attn_out_decode = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_decode = self._run_recurrent(
                 query=query_decode.squeeze(0),
                 key=key_decode.squeeze(0),
                 value=value_decode.squeeze(0),
                 g=g_non_spec[:, :num_decode_tokens].squeeze(0),
                 beta=beta_non_spec[:, :num_decode_tokens].squeeze(0),
                 state=ssm_state,
-                scale=key_decode.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor[: attn_metadata.num_decodes],
             ).unsqueeze(0)
@@ -397,8 +438,15 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 g_non_spec = g_non_spec[:, num_decode_tokens:]
                 beta_non_spec = beta_non_spec[:, num_decode_tokens:]
 
-            initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
-            clear_ssm_states(initial_state, prefill_has_initial_state)
+            if getattr(self, "leapquant", None) is not None:
+                initial_state = (
+                    self.leapquant.export_state(ssm_state, prefill_state_indices, prefill_has_initial_state)
+                    .transpose(-1, -2)
+                    .contiguous()
+                )
+            else:
+                initial_state = ssm_state[prefill_state_indices].transpose(-1, -2).contiguous()
+                clear_ssm_states(initial_state, prefill_has_initial_state)
             (core_attn_out_non_spec, last_recurrent_state) = chunk_gated_delta_rule(
                 q=query_non_spec,
                 k=key_non_spec,
@@ -412,7 +460,14 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            ssm_state[prefill_state_indices] = last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+            if getattr(self, "leapquant", None) is not None:
+                self.leapquant.encode_state(
+                    last_recurrent_state.transpose(-1, -2).contiguous().float(), ssm_state, prefill_state_indices
+                )
+            else:
+                ssm_state[prefill_state_indices] = (
+                    last_recurrent_state.transpose(-1, -2).contiguous().to(ssm_state.dtype)
+                )
             if split_non_spec:
                 core_attn_out_non_spec = torch.cat(
                     [core_attn_out_decode, core_attn_out_non_spec],
@@ -424,14 +479,13 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
             key_non_spec = l2norm_fwd(key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
-            core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
+            core_attn_out_non_spec = self._run_recurrent(
                 query=query_non_spec.squeeze(0),
                 key=key_non_spec.squeeze(0),
                 value=value_non_spec.squeeze(0),
                 g=g_non_spec.squeeze(0) if g_non_spec is not None else g_non_spec,
                 beta=beta_non_spec.squeeze(0) if beta_non_spec is not None else beta_non_spec,
                 state=ssm_state,
-                scale=key_non_spec.shape[-1] ** -0.5,
                 actual_seq_lengths=actual_seq_lengths,
                 ssm_state_indices=non_spec_state_indices_tensor,
             ).unsqueeze(0)
