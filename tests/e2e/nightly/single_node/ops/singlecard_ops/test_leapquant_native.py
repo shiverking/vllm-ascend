@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Isolated native library tests. Build in pytest's temporary directory only."""
 
+import ctypes
 import subprocess
 import sys
 from pathlib import Path
@@ -14,8 +15,11 @@ from vllm_ascend.ops.leapquant_native import PACKET_BYTES, NativeCubeGDN, Native
 
 @pytest.fixture(scope="module")
 def native_library(tmp_path_factory):
+    return _build_library(tmp_path_factory.mktemp("leapquant_native"))
+
+
+def _build_library(build, **options):
     source = Path(__file__).resolve().parents[6] / "csrc/experimental/leapquant"
-    build = tmp_path_factory.mktemp("leapquant_native")
     subprocess.run(
         [
             "cmake",
@@ -25,12 +29,27 @@ def native_library(tmp_path_factory):
             str(build),
             f"-DASCEND_PYTHON_EXECUTABLE={sys.executable}",
             "-DLEAPQUANT_POWER_ITERS=8",
+            *(f"-D{key}={value}" for key, value in options.items()),
         ],
         check=True,
         capture_output=True,
     )
     subprocess.run(["cmake", "--build", str(build), "-j4"], check=True, capture_output=True)
     return build / "lib/libleapquant_native.so"
+
+
+@pytest.fixture(scope="module")
+def staged_libraries(tmp_path_factory):
+    """Compile both historical staging branches, including direct Div reference."""
+    return {
+        half: _build_library(
+            tmp_path_factory.mktemp(f"leapquant_staged_{half}"),
+            LEAPQUANT_HALF_BASE=half,
+            LEAPQUANT_V4_DIRECT_BASE_RESULTS=0,
+            LEAPQUANT_USE_NEWTON_DIV=0,
+        )
+        for half in (0, 1)
+    }
 
 
 @pytest.fixture(scope="module", params=[(128, False), (64, False), (32, False), (128, True)])
@@ -490,3 +509,127 @@ def test_padded_serving_graph_preserves_packet_and_padding(native_library):
     assert (padded[..., PACKET_BYTES:] == 127).all()
     for slot in (0, 2, 3, 5, 6):
         torch.testing.assert_close(padded[slot], initial[slot], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("tile", [16, 32, 64, 128])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8, 16, 32])
+def test_native_tiled_full_window_bounds(native_library, tile, batch):
+    """Cover 24-row contraction at tile16 and FP32 masks at tile128."""
+    torch.npu.set_device(0)
+    torch.manual_seed(4310 + batch)
+    backend = NativeLeapQuant(str(native_library))
+    packet = torch.zeros(batch, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.arange(batch, dtype=torch.int32, device="npu")
+    backend.encode_state(torch.randn(batch, 32, 128, 128, device="npu") * 0.01, packet, indices)
+    reference_packet = packet.clone()
+    launch = backend.library.leapquant_tiled_launch
+    launch.argtypes = [ctypes.c_uint32] + [ctypes.c_void_p] * 9 + [ctypes.c_uint32] * 5
+    launch.restype = None
+    for step in range(32):
+        inputs = _inputs(batch)
+        expected = backend.decode(*inputs, reference_packet, indices)
+        actual = torch.empty_like(inputs[2])
+        launch(
+            backend.cores,
+            backend._stream(packet.device),
+            *(t.data_ptr() for t in inputs),
+            packet.data_ptr(),
+            indices.data_ptr(),
+            actual.data_ptr(),
+            batch,
+            32,
+            16,
+            batch,
+            tile,
+        )
+        relative_rms = ((actual.float() - expected.float()).square().mean() / expected.float().square().mean()).sqrt()
+        assert torch.isfinite(actual).all() and relative_rms < 0.02, (tile, batch, step)
+    mask = torch.ones(batch, dtype=torch.bool, device="npu")
+    actual_state = backend.export_state(packet, indices, mask)
+    expected_state = backend.export_state(reference_packet, indices, mask)
+    error = ((actual_state - expected_state).square().mean() / expected_state.square().mean()).sqrt()
+    assert torch.isfinite(actual_state).all() and error < 0.02
+
+
+@pytest.mark.parametrize("half", [0, 1])
+def test_native_staging_does_not_read_overwritten_vectors(native_library, staged_libraries, half):
+    """Legacy predQ must survive Brcb; HALF already produces the final vectors."""
+    torch.npu.set_device(0)
+    torch.manual_seed(4311)
+    reference = NativeLeapQuant(str(native_library))
+    candidate = NativeLeapQuant(str(staged_libraries[half]))
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    reference.encode_state(torch.randn(1, 32, 128, 128, device="npu") * 0.02, packet, indices)
+    candidate_packet = packet.clone()
+    for step in range(65):
+        inputs = _inputs(1)
+        expected = reference.decode(*inputs, packet, indices).float()
+        actual = candidate.decode(*inputs, candidate_packet, indices).float()
+        relative_rms = ((actual - expected).square().mean() / expected.square().mean()).sqrt()
+        assert torch.isfinite(actual).all() and relative_rms < 0.02, (half, step)
+
+
+def _audit_matrix(backend, matrix, vector, mode):
+    output = torch.empty_like(vector) if mode < 2 else torch.empty_like(matrix)
+    launch = backend.library.leapquant_audit_mat_launch
+    launch.argtypes = [ctypes.c_void_p] * 4 + [ctypes.c_uint32] * 2
+    launch.restype = None
+    launch(
+        backend._stream(matrix.device),
+        matrix.data_ptr(),
+        vector.data_ptr(),
+        output.data_ptr(),
+        matrix.shape[0],
+        mode,
+    )
+    return output
+
+
+@pytest.mark.parametrize("rows", [*range(8, 25), 64, 128])
+@pytest.mark.parametrize("mode", [0, 1])
+def test_native_matrix_contractions(native_library, rows, mode):
+    torch.npu.set_device(0)
+    torch.manual_seed(4312 + rows)
+    backend = NativeLeapQuant(str(native_library))
+    matrix = torch.randn(rows, 128)
+    vector = torch.randn(128)
+    expected = matrix @ vector if mode == 0 else matrix.T @ vector[:rows]
+    actual = _audit_matrix(backend, matrix.npu(), vector.npu(), mode).cpu()
+    actual = actual[:rows] if mode == 0 else actual
+    torch.testing.assert_close(actual, expected, rtol=2e-5, atol=2e-5)
+
+
+@pytest.mark.parametrize("mode", [2, 3])
+def test_native_newton_extremes_match_direct_div(native_library, staged_libraries, mode):
+    """Compare to CANN Div itself, including device subnormal/nonfinite semantics."""
+    torch.npu.set_device(0)
+    guarded = NativeLeapQuant(str(native_library))
+    direct = NativeLeapQuant(str(staged_libraries[0]))
+    matrix = torch.full((128, 128), 1e-10, device="npu")
+    values = (0.0, 1e-40, 1e-30, 1e-6, 1.0, -1.0, 1e30, 3e38, float("inf"), float("nan"))
+    vectors = [torch.full((128,), value, device="npu") for value in values]
+    vectors.append(torch.tensor(values * 13, device="npu")[:128].contiguous())
+    for vector in vectors:
+        actual = _audit_matrix(guarded, matrix, vector, mode)
+        expected = _audit_matrix(direct, matrix, vector, mode)
+        torch.testing.assert_close(actual, expected, rtol=2e-5, atol=1e-30, equal_nan=True)
+
+
+def test_native_half_guard_uses_fp32_readout(native_library, staged_libraries):
+    torch.npu.set_device(0)
+    torch.manual_seed(4313)
+    guarded = NativeLeapQuant(str(native_library))
+    direct = NativeLeapQuant(str(staged_libraries[0]))
+    packet = torch.zeros(1, 32, PACKET_BYTES, dtype=torch.uint8, device="npu")
+    indices = torch.zeros(1, dtype=torch.int32, device="npu")
+    guarded.encode_state(torch.randn(1, 32, 128, 128, device="npu") * 0.1, packet, indices)
+    other = packet.clone()
+    q, k, v, beta, g = _inputs(1)
+    q.fill_(100)
+    k.fill_(100)
+    beta.zero_()
+    g.zero_()
+    actual = guarded.decode(q, k, v, beta, g, packet, indices)
+    expected = direct.decode(q, k, v, beta, g, other, indices)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)

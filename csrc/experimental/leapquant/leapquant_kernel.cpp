@@ -1,5 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // Isolated Ascend910B3 experiment. Not included in the production build.
+// V4.1: fix Reconstruct scratch alias; measured regression defaults to V3 Decode.
+// Optional pair-read avoids redundant materialization on ordinary fold tokens.
+// CANN compilation, device validation, and benchmarking remain mandatory.
+
 #include "kernel_operator.h"
 #include "leapquant_build_config.h"
 
@@ -23,6 +27,54 @@ constexpr uint32_t TAG = 27656;
 constexpr uint32_t LOG_TIMES = 27680;
 constexpr uint32_t MAGIC = 0x4c513034;  // LQ04: prevents mixing with Triton v1 packets.
 constexpr uint32_t VEC_BYTES = 36864;
+// FP32 Brcb with 8 repeats writes 8 * 8 * 32 = 2048 bytes.
+// The broadcast workspace at vec_[68*D] therefore occupies groups 68..71.
+constexpr uint32_t BRDC_START_BYTES = 68 * D * sizeof(float);
+constexpr uint32_t BRDC_LENGTH_BYTES = 8 * 8 * 32;
+constexpr uint32_t FUSED_DECAY_SCRATCH_BYTES = 3 * D * sizeof(float);
+static_assert(BRDC_START_BYTES + BRDC_LENGTH_BYTES <= VEC_BYTES, "Brcb workspace outside vecBuf");
+static_assert(FUSED_DECAY_SCRATCH_BYTES + D * sizeof(float) <= BRDC_START_BYTES,
+              "Reconstruct decayScale overlaps ScaleRows Brcb workspace");
+
+// V3 micro-optimizations. Set a flag to 0 when bisecting correctness or latency.
+// No change to packet format (LQ04), RANK, W, or Fold mathematics.
+#ifndef LEAPQUANT_OPT_TARGETED_VEC_INIT
+#define LEAPQUANT_OPT_TARGETED_VEC_INIT 1
+#endif
+#ifndef LEAPQUANT_OPT_TRIM_COEFF
+#define LEAPQUANT_OPT_TRIM_COEFF 1
+#endif
+#ifndef LEAPQUANT_OPT_TRIM_TILED
+#define LEAPQUANT_OPT_TRIM_TILED 1
+#endif
+#ifndef LEAPQUANT_OPT_OMIT_WEIGHT_ZERO
+#define LEAPQUANT_OPT_OMIT_WEIGHT_ZERO 1
+#endif
+
+// V4 advanced switches (all ABI/packet compatible).
+// Pair-read measured slower than V3 (~15%) in the user's workload: default OFF.
+// If enabled, only ordinary non-fold tokens use it; on count == W-1, prefer
+// V3 materialization so the same full matrix can be reused by Reconstruct.
+// Explicit streaming entrypoint behavior is preserved.
+#ifndef LEAPQUANT_V4_RESIDUAL_PAIR
+#define LEAPQUANT_V4_RESIDUAL_PAIR 0
+#endif
+// Removes the predK/predQ staging copies when using full-matrix fallback.
+#ifndef LEAPQUANT_V4_DIRECT_BASE_RESULTS
+#define LEAPQUANT_V4_DIRECT_BASE_RESULTS 1
+#endif
+// EXPERIMENTAL, disabled by default: combines the per-row scale and scalar
+// decay in Reconstruct into one vector, saving a full FP32 128x128 Muls pass.
+// Floating-point association changes; compare long-context accuracy.
+#ifndef LEAPQUANT_V4_FUSED_RECONSTRUCT_SCALE
+#define LEAPQUANT_V4_FUSED_RECONSTRUCT_SCALE 0
+#endif
+// Required for safe trimmed Tiled Brcb: the last 8-scalar source group is
+// read even when its padded elements are masked out downstream.
+#ifndef LEAPQUANT_V4_1_SAFE_TILE_PADDING
+#define LEAPQUANT_V4_1_SAFE_TILE_PADDING 1
+#endif
+
 #ifndef LEAPQUANT_POWER_ITERS
   #define LEAPQUANT_POWER_ITERS 8
 #endif
@@ -57,6 +109,11 @@ __aicore__ inline void StoreDone() {
   WaitFlag<HardEvent::MTE3_S>(0);
 }
 
+#ifndef LEAPQUANT_DUAL_MATVEC
+#define LEAPQUANT_DUAL_MATVEC 0
+#endif
+static_assert(PACKET + 2 * N * sizeof(float) + VEC_BYTES <= 192 * 1024,
+              "Full decode UB exceeds 192KiB");
 class LeapQuant {
  public:
   __aicore__ inline void Init(TPipe* pipe, GM_ADDR packet, GM_ADDR indices, uint32_t batch, uint32_t heads,
@@ -69,7 +126,10 @@ class LeapQuant {
     indexGm_.SetGlobalBuffer((__gm__ int32_t*)indices);
     pipe->InitBuffer(packetBuf_, PACKET);
     pipe->InitBuffer(stateBuf_, tile * D * sizeof(float));
-    pipe->InitBuffer(workBuf_, tile * D * sizeof(float));
+    // ReadTile contracts up to 24 rows even when tile=16. The conservative
+    // bound covers MatRows (24*D), packed FMA, and tiled row reduction.
+    const uint32_t workRows = tile > 24 ? tile : 24;
+    pipe->InitBuffer(workBuf_, workRows * D * sizeof(float));
     pipe->InitBuffer(vecBuf_, VEC_BYTES);
     s_ = stateBuf_.Get<float>();
     work_ = workBuf_.Get<float>();
@@ -86,7 +146,15 @@ class LeapQuant {
     tag_ = packetBuf_.GetWithOffset<uint32_t>(6, TAG);
     logTimes_ = packetBuf_.GetWithOffset<float>(W, LOG_TIMES);
     coefficients_ = vec_[65 * D];
+#if LEAPQUANT_OPT_TARGETED_VEC_INIT
+    // Only the four padding rows in each of the two factor matrices are
+    // read without being overwritten. Everything else has a producer before
+    // its first use. Tiles pack the left/value rows at width `tile`.
+    Duplicate(vec_[16 * D + RANK * D], 0.0f, (8 - RANK) * D);
+    Duplicate(vec_[40 * D + RANK * tile], 0.0f, (8 - RANK) * tile);
+#else
     Duplicate(vec_, 0.0f, VEC_BYTES / sizeof(float));
+#endif
     VSync();
   }
 
@@ -105,8 +173,8 @@ class LeapQuant {
         tag_.SetValue(pad, 0);
       }
       Fold();
-      Duplicate(logTimes_, 0.f, W);
-      VSync();
+      // Fold() already zeroes logTimes_ at the end of its own body;
+      // doing it again here was pure duplicate work.
       Duplicate(keys_, (half)0, 2 * W * D);
       VSync();
       tag_.SetValue(0, MAGIC);
@@ -126,8 +194,6 @@ class LeapQuant {
     for (uint32_t job = GetBlockIdx(); job < batch_ * heads_; job += GetBlockNum()) {
       uint32_t b = job / heads_, h = job % heads_;
       int32_t slot = indexGm_.GetValue(b);
-      Duplicate(s_, 0.f, N);
-      VSync();
       if (maskGm.GetValue(b) && slot >= 0 && static_cast<uint32_t>(slot) < blocks_) {
         DataCopy(packet_, packetGm_[(static_cast<uint64_t>(slot) * heads_ + h) * packetStride_], PACKET);
         LoadSync();
@@ -138,20 +204,40 @@ class LeapQuant {
         } else {
           MaterializeResidual();
           auto kr = vec_[24 * D], vr = vec_[48 * D];
-          Cast(kr, keys_, RoundMode::CAST_NONE, W * D);
-          Cast(vr, values_, RoundMode::CAST_NONE, W * D);
+          // Only [0,count) entries are live in the window.
+          if (count) {
+            Cast(kr, keys_, RoundMode::CAST_NONE, count * D);
+            Cast(vr, values_, RoundMode::CAST_NONE, count * D);
+          }
+          float logDecay = decay_.GetValue(0);
+#if LEAPQUANT_OPT_TRIM_COEFF
+          if (count) {
+            Muls(coefficients_[8], logTimes_, -1.f, count);
+            VSync();
+            Adds(coefficients_[8], coefficients_[8], logDecay, count);
+          }
+          Duplicate(coefficients_, logDecay, 8);
+          VSync();
+          Exp(coefficients_, coefficients_, 8 + count);
+#else
           Muls(coefficients_[8], logTimes_, -1.f, W);
           VSync();
-          float logDecay = decay_.GetValue(0);
           Adds(coefficients_[8], coefficients_[8], logDecay, W);
           Duplicate(coefficients_, logDecay, 8);
           VSync();
           Exp(coefficients_, coefficients_, 8 + W);
+#endif
           VSync();
           VS();
           float decay = coefficients_.GetValue(0);
           Reconstruct(decay, kr, vr, count);
         }
+      } else {
+        // No recurrent state for this (batch, head): the caller expects
+        // zeros, not whatever a previous loop iteration left in s_. Only
+        // this branch needs the zero-fill now, instead of every job.
+        Duplicate(s_, 0.f, N);
+        VSync();
       }
       StoreSync();
       DataCopy(outGm[static_cast<uint64_t>(job) * N], s_, N);
@@ -181,6 +267,11 @@ class LeapQuant {
     auto qv = vec_[0 * D], kv = vec_[1 * D], vv = vec_[2 * D];
     auto pred = vec_[6 * D], out = vec_[7 * D];
     auto baseQ = vec_[5 * D];
+#if !LEAPQUANT_V4_DIRECT_BASE_RESULTS
+    // V3 fallback staging, retained for controlled A/B comparisons.
+    // Live through JointRead: do not use Brcb workspace groups 68..71.
+    auto predK = vec_[4 * D], predQ = vec_[12 * D];
+#endif
     auto nextPacket = stateBuf_.GetWithOffset<uint8_t>(PACKET, N * sizeof(float) / 2);
     bool prefetched = false;
     for (uint32_t job = GetBlockIdx(); job < batch_ * heads_; job += GetBlockNum()) {
@@ -253,10 +344,17 @@ class LeapQuant {
       VS();
       float decay = gateVec.GetValue(0);
 
+      // Avoid pair-read followed by another complete materialization at the
+      // fold boundary. For normal Decode the V3 full-matrix path is faster
+      // in the reported measurements. Streaming retains its original path.
+      const bool usePairRead = streaming || (LEAPQUANT_V4_RESIDUAL_PAIR && count + 1 != W);
       if (products != nullptr) {
         ReconstructProducts(pred, baseQ);
-      } else if (streaming) {
-        if (LEAPQUANT_STREAM_PREFETCH && count + 1 != W && job + GetBlockNum() < batch_ * heads_) {
+      } else if (usePairRead) {
+        // Only enable next-job prefetch for the explicitly streaming path;
+        // the ordinary Decode entrypoint has no prefetch contract.
+        if (streaming && LEAPQUANT_STREAM_PREFETCH && count + 1 != W &&
+            job + GetBlockNum() < batch_ * heads_) {
           uint32_t nextJob = job + GetBlockNum(), nextHead = nextJob % heads_;
           int32_t nextSlot = indexGm_.GetValue(nextJob / heads_);
           if (nextSlot >= 0 && static_cast<uint32_t>(nextSlot) < blocks_ && (nextSlot != slot || nextHead != h)) {
@@ -267,40 +365,67 @@ class LeapQuant {
         }
         ReadResidualPair(pred, baseQ, kv, qv);
       } else {
+        // V4 fallback: keep V3 full-matrix materialization available.
+#if LEAPQUANT_HALF_BASE
+        ReadBaseHalf(pred, baseQ, kv, qv);
+#else
         MaterializeResidual();
+#if LEAPQUANT_V4_DIRECT_BASE_RESULTS
+        // These outputs remain live until used; there is no need to stage
+        // predK and predQ in two additional UB vectors.
+        ReadBasePair(pred, baseQ, kv, qv);
+#else
+        ReadBasePair(predK, predQ, kv, qv);
+#endif
+#endif
       }
       // Retain rank-major factors in vector storage for both Q and K readouts.
       Cast(vec_[40 * D], left_, RoundMode::CAST_NONE, RANK * D);
-      VSync();
       Cast(vec_[16 * D], right_, RoundMode::CAST_NONE, RANK * D);
-      VSync();
+
       auto keyRecords = vec_[24 * D], valRecords = vec_[48 * D], weights = vec_[64 * D];
-      if (!streaming) {
-        Cast(keyRecords, keys_, RoundMode::CAST_NONE, W * D);
-        VSync();
-        Cast(valRecords, values_, RoundMode::CAST_NONE, W * D);
-        VSync();
-      } else if (count) {
+      // JointRead below only ever contracts the first (8 + count) rows of
+      // its (compensator + window) matrix, so slots [count, W) are never
+      // read regardless of streaming mode. The old !streaming branch cast
+      // all W=16 slots every token anyway (up to 16x more than needed
+      // right after a fold, when count is small) — only cast what will
+      // actually be used.
+      if (count) {
         Cast(keyRecords, keys_, RoundMode::CAST_NONE, count * D);
         Cast(valRecords, values_, RoundMode::CAST_NONE, count * D);
-        VSync();
       }
+      VSync();
       // Preserve FP16 updates exactly as inserted. All intervening decay is
       // represented in FP32 log coefficients, avoiding per-token FP16 rounding.
+      // [0,count) is the only live history. The current record's
+      // coefficient is explicitly set to 1 below, after its insertion.
+#if LEAPQUANT_OPT_TRIM_COEFF
+      if (count) {
+        Muls(coefficients_[8], logTimes_, -1.f, count);
+        VSync();
+        Adds(coefficients_[8], coefficients_[8], currentLog, count);
+        VSync();
+        Exp(coefficients_[8], coefficients_[8], count);
+        VSync();
+      }
+#else
       Muls(coefficients_[8], logTimes_, -1.f, W);
       VSync();
       Adds(coefficients_[8], coefficients_[8], currentLog, W);
       VSync();
       Exp(coefficients_[8], coefficients_[8], W);
       VSync();
+#endif
       Duplicate(coefficients_, decay, 8);
       VSync();
-      if (!streaming && products == nullptr) {
-        ReadBase(pred, kv);
+#if !LEAPQUANT_V4_DIRECT_BASE_RESULTS && !LEAPQUANT_HALF_BASE
+      if (products == nullptr && !usePairRead) {
+        DataCopy(pred, predK, D);
+        VSync();
       }
+#endif
       Muls(pred, pred, decay, D);
-      VSync();
-      JointRead(out, weights, kv, count, streaming);
+      JointRead(out, weights, kv, count);
       Add(pred, pred, out, D);
       VSync();
       Sub(vv, vv, pred, D);
@@ -315,32 +440,35 @@ class LeapQuant {
       Maxs(buffered, buffered, -65504.f, D);
       VSync();
       Cast(values_[count * D], buffered, RoundMode::CAST_RINT, D);
-      VSync();
       DataCopy(valRecords[count * D], vv, D);
-      VSync();
       Cast(keys_[count * D], kv, RoundMode::CAST_RINT, D);
-      VSync();
       DataCopy(keyRecords[count * D], kv, D);
       VSync();
       logTimes_.SetValue(count, currentLog);
       coefficients_.SetValue(8 + count, 1.f);
       SV();
-      if (streaming || products != nullptr) {
+#if LEAPQUANT_V4_DIRECT_BASE_RESULTS
+      DataCopy(pred, baseQ, D);
+#else
+      if (products != nullptr || usePairRead || LEAPQUANT_HALF_BASE) {
         DataCopy(pred, baseQ, D);
-        VSync();
       } else {
-        ReadBase(pred, qv);
+        DataCopy(pred, predQ, D);
       }
-      Muls(pred, pred, decay, D);
+#endif
       VSync();
-      JointRead(out, weights, qv, count + 1, streaming);
+      Muls(pred, pred, decay, D);
+      JointRead(out, weights, qv, count + 1);
       Add(out, out, pred, D);
       VSync();
       Cast(io, out, RoundMode::CAST_RINT, D);
       VSync();
       StoreSync();
       DataCopy(outGm[static_cast<uint64_t>(job) * D], io, D);
+#if !LEAPQUANT_DELAY_OUTPUT_STORE
       StoreDone();
+#endif
+      // Opt-in overlap retains io through Fold; conservative mode waits here.
 
       if (count + 1 == W) {
         // Fold the FP16 buffer, while this token's output used FP32 delta.
@@ -350,7 +478,9 @@ class LeapQuant {
           DataCopy(packet_, packetGm_[offset], N);
           LoadSync();
         }
-        if (streaming || products != nullptr) {
+        // The pair-read path only materializes 64-column tiles. Fold must
+        // rebuild the ENTIRE 128x128 FP32 state before Reconstruct.
+        if (products != nullptr || usePairRead || LEAPQUANT_HALF_BASE) {
           MaterializeResidual();
         }
         Reconstruct(decay, keyRecords, valRecords);
@@ -462,15 +592,34 @@ class LeapQuant {
       VSync();
       Cast(s_, halfTmp, RoundMode::CAST_NONE, tile * D);
       Cast(vec_[16 * D], right_, RoundMode::CAST_NONE, RANK * D);
-      Cast(vec_[24 * D], keys_, RoundMode::CAST_NONE, W * D);
       Cast(vec_[40 * D], left_, RoundMode::CAST_NONE, RANK * tile);
+#if LEAPQUANT_OPT_TRIM_TILED
+      if (count) {
+        Cast(vec_[24 * D], keys_, RoundMode::CAST_NONE, count * D);
+        Cast(vec_[40 * D + 8 * tile], values_, RoundMode::CAST_NONE, count * tile);
+      }
+#else
+      Cast(vec_[24 * D], keys_, RoundMode::CAST_NONE, W * D);
       Cast(vec_[40 * D + 8 * tile], values_, RoundMode::CAST_NONE, W * tile);
+#endif
       VSync();
+#if LEAPQUANT_OPT_TRIM_COEFF
+      if (count) {
+        Muls(coefficients_[8], logTimes_, -1.f, count);
+        VSync();
+        Adds(coefficients_[8], coefficients_[8], currentLog, count);
+        VSync();
+        Exp(coefficients_[8], coefficients_[8], count);
+        VSync();
+      }
+#else
       Muls(coefficients_[8], logTimes_, -1.f, W);
       VSync();
       Adds(coefficients_[8], coefficients_[8], currentLog, W);
       VSync();
       Exp(coefficients_[8], coefficients_[8], W);
+      VSync();
+#endif
       Duplicate(coefficients_, decay, 8);
       VSync();
       ReadTile(pred, kv, weights, count, tile, decay);
@@ -572,11 +721,61 @@ class LeapQuant {
     }
   }
 
+  __aicore__ inline void AuditMat(GM_ADDR matrix, GM_ADDR vector, GM_ADDR output,
+                                  uint32_t rows, uint32_t mode) {
+    GlobalTensor<float> a, x, y;
+    a.SetGlobalBuffer((__gm__ float*)matrix);
+    x.SetGlobalBuffer((__gm__ float*)vector);
+    y.SetGlobalBuffer((__gm__ float*)output);
+    auto input = vec_[0], result = vec_[D];
+    DataCopy(s_, a, rows * D);
+    DataCopy(input, x, D);
+    LoadSync();
+    if (mode == 0) MatRows(result, s_, input, rows);
+    if (mode == 1) MatCols(result, s_, input, rows);
+    if (mode == 2) ElemColumns(s_, s_, input, rows, true);
+    if (mode == 3) ScaleRows(s_, s_, input, rows, true);
+    StoreSync();
+    if (mode < 2) DataCopy(y, result, D);
+    else DataCopy(y, s_, rows * D);
+    StoreDone();
+  }
+
  private:
   // One matrix and one scratch matrix occupy 128 KiB of the 192 KiB UB.
   // All fitting passes reuse them; no FP32 recurrent matrix goes to HBM.
+  // Newton's reciprocal is unsafe on zero/subnormal/very large denominators.
+  // These scratch vectors are dead during Fold normalization and test division.
+  __aicore__ inline bool NewtonSafe(LocalTensor<float> vector, uint32_t count) {
+    auto magnitude = vec_[66 * D], low = vec_[12 * D], high = vec_[13 * D];
+    Abs(magnitude, vector, count);
+    VSync();
+    for (uint32_t offset = 0; offset < count; offset += 64) {
+      const uint32_t lanes = count - offset < 64 ? count - offset : 64;
+      WholeReduceMin(low, magnitude[offset], lanes, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+      WholeReduceMax(high, magnitude[offset], lanes, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+      VSync();
+      VS();
+      if (!(low.GetValue(0) >= 1.e-30f && high.GetValue(0) <= 1.e30f)) return false;
+    }
+    return true;
+  }
   __aicore__ inline void ElemColumns(LocalTensor<float> dst, LocalTensor<float> matrix, LocalTensor<float> vector,
                                      uint32_t rows, bool divide = false) {
+    if (divide && LEAPQUANT_USE_NEWTON_DIV && NewtonSafe(vector, D)) {
+      auto inverse = vec_[67 * D];
+      Reciprocal(inverse, vector, D);
+      VSync();
+      // Two Newton steps repair the approximate reciprocal before quantization.
+      auto error = vec_[66 * D];
+      for (uint32_t refine = 0; refine < 2; ++refine) {
+        Mul(error, vector, inverse, D); VSync();
+        Muls(error, error, -1.f, D); VSync();
+        Adds(error, error, 2.f, D); VSync();
+        Mul(inverse, inverse, error, D); VSync();
+      }
+      vector = inverse; divide = false;
+    }
     for (uint32_t col = 0; col < D; col += 64) {
       if (divide) {
         Div(dst[col], matrix[col], vector[col], 64, rows, {1, 1, 1, 16, 16, 0});
@@ -600,8 +799,18 @@ class LeapQuant {
   }
   __aicore__ inline void MatRows(LocalTensor<float> dst, LocalTensor<float> matrix, LocalTensor<float> vector,
                                  uint32_t rows) {
+#if LEAPQUANT_FMA_ROWS
+    // Pack the two half-row products into one 64-wide accumulator.
+    Mul(work_, matrix, vector, 64, rows, {1, 1, 1, 8, 16, 0});
+    VSync();
+    MulAddDst(work_, matrix[64], vector[64], 64, rows, {1, 1, 1, 8, 16, 0});
+    VSync();
+    WholeReduceSum(dst, work_, 64, rows, 1, 1, 8);
+    VSync();
+#else
     ElemColumns(work_, matrix, vector, rows);
     RowsReduce(dst, rows);
+#endif
   }
   __aicore__ inline void ColsReduce(LocalTensor<float> dst, uint32_t rows, bool maximum = false) {
     uint32_t power = 1;
@@ -629,6 +838,20 @@ class LeapQuant {
   }
   __aicore__ inline void ScaleRows(LocalTensor<float> dst, LocalTensor<float> matrix, LocalTensor<float> vector,
                                    uint32_t rows, bool divide = false) {
+    if (divide && LEAPQUANT_USE_NEWTON_DIV && NewtonSafe(vector, rows)) {
+      auto inverse = vec_[67 * D];
+      Reciprocal(inverse, vector, rows);
+      VSync();
+      // Two Newton steps repair the approximate reciprocal before quantization.
+      auto error = vec_[66 * D];
+      for (uint32_t refine = 0; refine < 2; ++refine) {
+        Mul(error, vector, inverse, rows); VSync();
+        Muls(error, error, -1.f, rows); VSync();
+        Adds(error, error, 2.f, rows); VSync();
+        Mul(inverse, inverse, error, rows); VSync();
+      }
+      vector = inverse; divide = false;
+    }
     auto repeated = vec_[68 * D];
     for (uint32_t row = 0; row < rows; row += 64) {
       uint32_t count = rows - row < 64 ? rows - row : 64;
@@ -646,6 +869,25 @@ class LeapQuant {
   }
   __aicore__ inline void MatCols(LocalTensor<float> dst, LocalTensor<float> matrix, LocalTensor<float> vector,
                                  uint32_t rows) {
+#if LEAPQUANT_FMA_COLS
+    if (rows == D) {
+      auto repeated = vec_[68 * D];
+      Brcb(repeated, vector, 8, {1, 8});
+      VSync();
+      for (uint32_t col = 0; col < D; col += 64) {
+        Mul(work_[col], matrix[col], repeated, 64, 64, {1, 1, 0, 16, 16, 1});
+      }
+      VSync();
+      Brcb(repeated, vector[64], 8, {1, 8});
+      VSync();
+      for (uint32_t col = 0; col < D; col += 64) {
+        MulAddDst(work_[col], matrix[64 * D + col], repeated, 64, 64, {1, 1, 0, 16, 16, 1});
+      }
+      VSync();
+      ColsReduce(dst, 64);
+      return;
+    }
+#endif
     ScaleRows(work_, matrix, vector, rows);
     ColsReduce(dst, rows);
   }
@@ -793,25 +1035,105 @@ class LeapQuant {
     Mul(output, output, scale_, D);
     VSync();
   }
-  __aicore__ inline void ReadBase(LocalTensor<float> dst, LocalTensor<float> vector) {
-    auto scaled = vec_[66 * D];
-    Mul(scaled, vector, smooth_, D);
+  // Computes S @ (key .* smooth_) and S @ (query .* smooth_) (the "base",
+  // pre-window-fold contribution to the K and Q reads). s_ does not change
+  // between the two reads this replaces — it is only rewritten by Fold()
+  // at a window boundary, which happens later in the same token step —
+  // so the smooth_ pre-scale and the trailing scale_ multiply are batched
+  // for both vectors under one VSync each instead of two. Still two full
+  // MatRows passes over s_ (one per vector): this does not reduce the
+  // arithmetic, only the instruction/sync count around it.
+  // Only the compressed residual's readout uses FP16. State fit/update stay FP32.
+  __aicore__ inline void ReadBaseHalf(LocalTensor<float> dstK, LocalTensor<float> dstQ,
+                                     LocalTensor<float> key, LocalTensor<float> query) {
+    auto scaledK = vec_[66 * D], scaledQ = vec_[67 * D];
+    Mul(scaledK, key, smooth_, D);
+    Mul(scaledQ, query, smooth_, D);
     VSync();
-    MatRows(dst, s_, scaled, D);
-    Mul(dst, dst, scale_, D);
+#if LEAPQUANT_HALF_GUARD
+    // INT8 residual <=127 and 128 terms. Bound absolute half sum below 32768.
+    auto magnitudes = vec_[11 * D];
+    auto maximum = vec_[13 * D];
+    Abs(magnitudes, scaledK, 2 * D);
+    VSync();
+    WholeReduceMax(maximum, magnitudes, 64, 4, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+    VSync();
+    WholeReduceMax(magnitudes, maximum, 4, 1, 1, 1, 8, ReduceOrder::ORDER_ONLY_VALUE);
+    VSync();
+    VS();
+    if (magnitudes.GetValue(0) > 2.f) {
+      MaterializeResidual();
+      ReadBasePair(dstK, dstQ, key, query);
+      return;
+    }
+#endif
+    auto halfMatrix = stateBuf_.Get<half>();
+    auto halfWork = workBuf_.Get<half>();
+    auto halfK = vecBuf_.GetWithOffset<half>(D, 8 * D * sizeof(float));
+    auto halfQ = vecBuf_.GetWithOffset<half>(D, 8 * D * sizeof(float) + D * sizeof(half));
+    auto halfOutput = vecBuf_.GetWithOffset<half>(D, 10 * D * sizeof(float));
+    Cast(halfMatrix, packetBuf_.Get<int8_t>(), RoundMode::CAST_NONE, N);
+    Cast(halfK, scaledK, RoundMode::CAST_RINT, D);
+    Cast(halfQ, scaledQ, RoundMode::CAST_RINT, D);
+    VSync();
+    Mul(halfWork, halfMatrix, halfK, 128, D, {1, 1, 1, 8, 8, 0});
+    VSync();
+    WholeReduceSum(halfOutput, halfWork, 128, D, 1, 1, 8);
+    VSync();
+    Cast(dstK, halfOutput, RoundMode::CAST_NONE, D);
+    Mul(halfWork, halfMatrix, halfQ, 128, D, {1, 1, 1, 8, 8, 0});
+    VSync();
+    WholeReduceSum(halfOutput, halfWork, 128, D, 1, 1, 8);
+    VSync();
+    Cast(dstQ, halfOutput, RoundMode::CAST_NONE, D);
+    VSync();
+    Mul(dstK, dstK, scale_, D);
+    Mul(dstQ, dstQ, scale_, D);
+    VSync();
+  }
+  __aicore__ inline void ReadBasePair(LocalTensor<float> dstK, LocalTensor<float> dstQ, LocalTensor<float> key,
+                                      LocalTensor<float> query) {
+    auto scaledK = vec_[66 * D], scaledQ = vec_[67 * D];
+    Mul(scaledK, key, smooth_, D);
+    Mul(scaledQ, query, smooth_, D);
+    VSync();
+#if LEAPQUANT_DUAL_MATVEC
+    // Two packed FP32 accumulators share the existing work matrix.
+    // Keep full residual materialization; do not use the slower pair-read path.
+    Mul(work_, s_, scaledK, 64, D, {1, 1, 1, 8, 16, 0});
+    Mul(work_[N / 2], s_, scaledQ, 64, D, {1, 1, 1, 8, 16, 0});
+    VSync();
+    MulAddDst(work_, s_[64], scaledK[64], 64, D, {1, 1, 1, 8, 16, 0});
+    MulAddDst(work_[N / 2], s_[64], scaledQ[64], 64, D, {1, 1, 1, 8, 16, 0});
+    VSync();
+    WholeReduceSum(dstK, work_, 64, D, 1, 1, 8);
+    WholeReduceSum(dstQ, work_[N / 2], 64, D, 1, 1, 8);
+    VSync();
+#else
+    MatRows(dstK, s_, scaledK, D);
+    MatRows(dstQ, s_, scaledQ, D);
+#endif
+    Mul(dstK, dstK, scale_, D);
+    Mul(dstQ, dstQ, scale_, D);
     VSync();
   }
   __aicore__ inline void JointRead(LocalTensor<float> dst, LocalTensor<float> weights, LocalTensor<float> vector,
-                                   uint32_t count, bool activeOnly = false) {
+                                   uint32_t count) {
     // Four compensators and four zero padding rows precede the 16 real
     // records. Shared contraction removes two pairs of small matrix ops.
+    // Rows [8 + count, 24) correspond to window slots that have not been
+    // written yet this window; MatCols' ColsReduce handles any row count
+    // (not just powers of two), so there is no need to pad the
+    // contraction out to the full 24 rows just to multiply zeros.
+#if !LEAPQUANT_OPT_OMIT_WEIGHT_ZERO
     Duplicate(weights, 0.f, D);
     VSync();
+#endif
+    // MatRows writes every coefficient that MatCols will consume.
     MatRows(weights, vec_[16 * D], vector, 8 + count);
-    uint32_t rows = activeOnly ? 8 + count : 24;
-    Mul(weights, weights, coefficients_, rows);
+    Mul(weights, weights, coefficients_, 8 + count);
     VSync();
-    MatCols(dst, vec_[40 * D], weights, rows);
+    MatCols(dst, vec_[40 * D], weights, 8 + count);
   }
   __aicore__ inline void ReadTile(LocalTensor<float> dst, LocalTensor<float> vector, LocalTensor<float> weights,
                                   uint32_t count, uint32_t tile, float decay) {
@@ -822,15 +1144,57 @@ class LeapQuant {
     Mul(dst, dst, scale_, tile);
     VSync();
     Muls(dst, dst, decay, tile);
+#if !LEAPQUANT_OPT_OMIT_WEIGHT_ZERO || !LEAPQUANT_OPT_TRIM_TILED
+    // Legacy 24-row path must initialize trailing weight slots.
     Duplicate(weights, 0.f, D);
     VSync();
-    MatRows(weights, vec_[16 * D], vector, 8 + count);
+#elif LEAPQUANT_V4_1_SAFE_TILE_PADDING
+    // Brcb reads ceil(active/8)*8 FP32 values, not only 'active'. Since
+    // active <= 23, 32 initialized FP32 elements cover all padded reads.
+    // This is only 128 bytes (vs the original 512-byte weight clear).
+    Duplicate(weights, 0.f, 32);
+    VSync();
+#endif
+    const uint32_t active = 8 + count;
+    MatRows(weights, vec_[16 * D], vector, active);
+#if LEAPQUANT_OPT_TRIM_TILED
+    // Contract only the live 4 compensators + 4 padding + count updates.
+    // Brcb broadcasts 8 scalars per repeat, including the last partial group.
+    Mul(weights, weights, coefficients_, active);
+    VSync();
+    Brcb(repeated, weights, (active + 7) / 8, {1, 8});
+    VSync();
+    // FP32 repeat mask is at most 64 lanes, including experimental tile128.
+    for (uint32_t col = 0; col < tile; col += 64) {
+      const uint32_t lanes = tile < 64 ? tile : 64;
+      Mul(work_[col], vec_[40 * D + col], repeated, lanes, active,
+          {1, 1, 0, static_cast<uint8_t>(tile / 8), static_cast<uint8_t>(tile / 8), 1});
+    }
+    VSync();
+    // Reduce arbitrary row counts without touching unwritten tiles.
+    uint32_t power = 1;
+    while (power * 2 <= active) {
+      power *= 2;
+    }
+    if (active > power) {
+      Add(work_, work_, work_[power * tile], (active - power) * tile);
+      VSync();
+    }
+    for (uint32_t stride = power / 2; stride; stride /= 2) {
+      Add(work_, work_, work_[stride * tile], stride * tile);
+      VSync();
+    }
+#else
     Mul(weights, weights, coefficients_, 24);
     VSync();
     Brcb(repeated, weights, 3, {1, 8});
     VSync();
-    Mul(work_, vec_[40 * D], repeated, tile, 24,
-        {1, 1, 0, static_cast<uint8_t>(tile / 8), static_cast<uint8_t>(tile / 8), 1});
+    // FP32 repeat mask is at most 64 lanes, including experimental tile128.
+    for (uint32_t col = 0; col < tile; col += 64) {
+      const uint32_t lanes = tile < 64 ? tile : 64;
+      Mul(work_[col], vec_[40 * D + col], repeated, lanes, 24,
+          {1, 1, 0, static_cast<uint8_t>(tile / 8), static_cast<uint8_t>(tile / 8), 1});
+    }
     VSync();
     Add(work_, work_, work_[16 * tile], 8 * tile);
     VSync();
@@ -838,22 +1202,42 @@ class LeapQuant {
       Add(work_, work_, work_[stride * tile], stride * tile);
       VSync();
     }
+#endif
     Add(dst, dst, work_, tile);
     VSync();
   }
   __aicore__ inline void Reconstruct(float decay, LocalTensor<float> kr, LocalTensor<float> vr, uint32_t count = W) {
+#if LEAPQUANT_V4_FUSED_RECONSTRUCT_SCALE
+    // Avoid one full N-element multiply by fusing decay into row scales.
+    // IMPORTANT: ScaleRows Brcb writes 2048 bytes into vec_[68*D ... 72*D).
+    // The old vec_[69*D] scratch overlapped this region and was corrupted.
+    // vec_[3*D] is dead during Reconstruct (used again only by Fold after it),
+    // and does not overlap broadcast scratch or live kr/vr/coefficients.
+    auto decayScale = vec_[3 * D];
+    Muls(decayScale, scale_, decay, D);
+    VSync();
+    ScaleRows(s_, s_, decayScale, D);
+    ElemColumns(s_, s_, smooth_, D);
+#else
     ScaleRows(s_, s_, scale_, D);
     ElemColumns(s_, s_, smooth_, D);
+#endif
     auto lv = vec_[12 * D], rv = vec_[13 * D];
     for (uint32_t r = 0; r < RANK; ++r) {
       Cast(lv, left_[r * D], RoundMode::CAST_NONE, D);
       VSync();
       Cast(rv, right_[r * D], RoundMode::CAST_NONE, D);
       VSync();
+#if LEAPQUANT_V4_FUSED_RECONSTRUCT_SCALE
+      Muls(lv, lv, decay, D);
+      VSync();
+#endif
       Outer(lv, rv, false);
     }
+#if !LEAPQUANT_V4_FUSED_RECONSTRUCT_SCALE
     Muls(s_, s_, decay, N);
     VSync();
+#endif
     if (count) {
       ScaleRows(vr, vr, coefficients_[8], count);
     }
@@ -915,11 +1299,16 @@ class LeapQuant {
     VSync();
     Maxs(smooth_, smooth_, 1.e-6f, D);
     VSync();
+#if LEAPQUANT_DIRECT_NORM
+    // No producer needs the unnormalized residual after this point.
+    ElemColumns(s_, s_, smooth_, D, true);
+    Abs(work_, s_, N);
+#else
     ElemColumns(work_, s_, smooth_, D, true);
-    // RowsReduce uses work_, so preserve normalized residual in s_.
     DataCopy(s_, work_, N);
     VSync();
     Abs(work_, work_, N);
+#endif
     VSync();
     RowsReduce(scale_, D, true);
     auto mask = vecBuf_.GetWithOffset<uint8_t>(32, 15 * D * sizeof(float));
@@ -1323,4 +1712,17 @@ extern "C" void leapquant_padded_export_launch(uint32_t cores, void* stream, voi
                                                uint32_t stride) {
   leapquant_padded_export<<<cores, nullptr, stream>>>((uint8_t*)packet, (uint8_t*)indices, (uint8_t*)mask,
                                                       (uint8_t*)output, batch, heads, blocks, stride);
+}
+
+extern "C" __global__ __aicore__ void leapquant_audit_mat(GM_ADDR a, GM_ADDR x,
+    GM_ADDR y, uint32_t rows, uint32_t mode) {
+  KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
+  TPipe pipe;
+  LeapQuant op;
+  op.Init(&pipe, nullptr, nullptr, 1, 32, 1);
+  op.AuditMat(a, x, y, rows, mode);
+}
+extern "C" void leapquant_audit_mat_launch(void* stream, void* a, void* x, void* y,
+    uint32_t rows, uint32_t mode) {
+  leapquant_audit_mat<<<1, nullptr, stream>>>((uint8_t*)a, (uint8_t*)x, (uint8_t*)y, rows, mode);
 }

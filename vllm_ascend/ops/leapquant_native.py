@@ -2,7 +2,8 @@
 """Explicit opt-in loader for the isolated AscendC LeapQuant experiment.
 
 The native v4 packet is distinct from the Triton v1 representation. No library
-is built or loaded by importing this module. It is not dispatched by models.
+is built or loaded by importing this module. GDN serving explicitly enables it
+through ``additional_config.leapquant_config``.
 """
 
 import ctypes
