@@ -29,6 +29,8 @@ from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGra
 
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
 
+AUDIO_ATTENTION_ALIGNMENT = 128
+
 # ---------------------------------------------------------------------------
 # Per–encoder-budget ACL graph bookkeeping (ViT FIA tasks)
 # ---------------------------------------------------------------------------
@@ -88,6 +90,7 @@ class EncoderForwardContext:
     token_budget: int | None = None
     capturing: bool = False
     cu_seqlens_cpu: torch.Tensor | None = None
+    attention_mask: torch.Tensor | None = None
 
 
 _context = EncoderForwardContext()
@@ -103,6 +106,7 @@ def _reset_encoder_forward_context() -> None:
     _context.token_budget = None
     _context.capturing = False
     _context.cu_seqlens_cpu = None
+    _context.attention_mask = None
 
 
 @contextmanager
@@ -111,6 +115,7 @@ def set_encoder_forward_context(
     capturing: bool,
     *,
     cu_seqlens_cpu: torch.Tensor | None = None,
+    attention_mask: torch.Tensor | None = None,
 ):
     """Enter encoder graph replay (FIA host args): callers must pass lengths each time.
 
@@ -121,6 +126,7 @@ def set_encoder_forward_context(
     _context.token_budget = token_budget
     _context.capturing = capturing
     _context.cu_seqlens_cpu = cu_seqlens_cpu
+    _context.attention_mask = attention_mask
     try:
         yield _context
     finally:
@@ -256,20 +262,56 @@ def update_encoder_graph_params(
 class EncoderAclGraphManager(EncoderCudaGraphManager):
     """Hooks encoder capture/replay into Ascend FIA graph-task infrastructure."""
 
+    supports_runtime_sequence_lengths = True
+
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.graph_pool = current_platform.get_global_graph_pool()
         self.update_stream: torch.npu.Stream | None = None
+        self._is_qwen3_asr = self.model.__class__.__name__ == "Qwen3ASRForConditionalGeneration"
+        self._qwen_audio_pool = None
+        if self._is_qwen3_asr and self.config.modalities:
+            from vllm_ascend.worker.qwen3_audio_encoder_graph import Qwen3AudioEncoderGraphPool
+
+            tower = self.model.audio_tower
+            if (
+                self.vllm_config.parallel_config.tensor_parallel_size == 1
+                and tower.dtype == torch.float16
+                and tower.device.type == "npu"
+                and not self.vllm_config.model_config.enforce_eager
+            ):
+                window = tower.get_attention_window_tokens()
+                budgets = self.vllm_config.compilation_config.encoder_cudagraph_token_budgets or [
+                    window // 4, window, 2 * window, 4 * window
+                ]
+                self._qwen_audio_pool = Qwen3AudioEncoderGraphPool(self.model, self.device, budgets)
+                self.token_budgets = list(self._qwen_audio_pool.budgets)
 
     def capture(self, graph_pool: Any | None = None):
         encoder_graph_pool = graph_pool if graph_pool is not None else self.graph_pool
         self.graph_pool = encoder_graph_pool
+
+        if self._qwen_audio_pool is not None:
+            self._qwen_audio_pool.capture(encoder_graph_pool)
+            return
+        if self._is_qwen3_asr:
+            return
 
         set_encoder_graph_params(self.token_budgets)
 
         super().capture(graph_pool=encoder_graph_pool)
 
         weak_ref_workspaces()
+
+    def supports_modality(self, modality: str) -> bool:
+        if self._is_qwen3_asr:
+            return modality == "audio" and self._qwen_audio_pool is not None
+        return super().supports_modality(modality)
+
+    def execute(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
+        if self._qwen_audio_pool is not None:
+            return self._qwen_audio_pool.execute(mm_kwargs)
+        return super().execute(mm_kwargs)
 
     def _capture_budget_graph(self, token_budget: int, path: str = "default"):
         logger.debug(
