@@ -226,13 +226,8 @@ class Qwen3AudioEncoderGraphPool:
         self.device = device
         self.budgets = tuple(sorted(set(budgets)))
         window = model.audio_tower.get_attention_window_tokens()
-        expected = (window // 4, window, 2 * window, 4 * window)
-        if window % 4 or self.budgets != expected:
-            raise ValueError(
-                "Qwen3-ASR audio graph budgets must be "
-                f"{list(expected)} for attention window {window}; "
-                f"got {list(self.budgets)}"
-            )
+        if not self.budgets or any(budget <= 0 for budget in self.budgets):
+            raise ValueError("Qwen3-ASR audio graph budgets must be positive")
         self.runners = {
             budget: FixedAudioEncoderGraph(model, budget, device)
             for budget in self.budgets
