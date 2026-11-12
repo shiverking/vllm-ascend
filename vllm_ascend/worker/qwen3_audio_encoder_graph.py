@@ -1,5 +1,3 @@
-# SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM Ascend project
 """Fixed-shape masked ACLGraphs for the Qwen3-ASR audio encoder body.
 
 The convolutional frontend and final per-audio split remain outside the graph.
@@ -19,44 +17,9 @@ from vllm.logger import logger
 from vllm.platforms import current_platform
 
 from vllm_ascend.worker.encoder_acl_graph import (
-    AUDIO_ATTENTION_ALIGNMENT,
+    build_audio_attention_mask,
     set_encoder_forward_context,
 )
-
-
-def build_audio_attention_mask(
-    sequence_lengths: torch.Tensor | tuple[int, ...], token_budget: int
-) -> torch.Tensor:
-    """Isolate real sequences, body padding, and attention-alignment padding."""
-    if token_budget <= 0:
-        raise ValueError("Audio graph budget must be positive")
-    if isinstance(sequence_lengths, torch.Tensor):
-        if sequence_lengths.ndim != 1 or sequence_lengths.device.type != "cpu":
-            raise ValueError("Audio graph requires one-dimensional CPU sequence lengths")
-        topology = sequence_lengths.tolist()
-    else:
-        topology = list(sequence_lengths)
-    if not topology or any(length <= 0 for length in topology):
-        raise ValueError("Audio graph requires positive sequence lengths")
-    actual_tokens = sum(topology)
-    if actual_tokens > token_budget:
-        raise ValueError("Audio graph input exceeds its token budget")
-    if actual_tokens < token_budget:
-        topology.append(token_budget - actual_tokens)
-    aligned_tokens = (
-        (token_budget + AUDIO_ATTENTION_ALIGNMENT - 1)
-        // AUDIO_ATTENTION_ALIGNMENT
-        * AUDIO_ATTENTION_ALIGNMENT
-    )
-    if aligned_tokens > token_budget:
-        topology.append(aligned_tokens - token_budget)
-    mask = torch.ones((aligned_tokens, aligned_tokens), dtype=torch.bool)
-    offset = 0
-    for length in topology:
-        end = offset + length
-        mask[offset:end, offset:end] = False
-        offset = end
-    return mask
 
 
 @dataclass(frozen=True)
@@ -341,7 +304,7 @@ class Qwen3AudioEncoderGraphPool:
                 "audio graph outputs do not match per-item token lengths: "
                 f"items={item_lengths}, output={output.shape[0]}"
             )
-        logger.debug(
+        logger.info(
             "[AUDIO_ENCODER_GRAPH] call=%d items=%d item_tokens=%s "
             "actual=%d seq_lens=%s graphs=%s replays=%d "
             "padding=%d eager=%d graph_used=%s graph_hit=%s state=submitted",

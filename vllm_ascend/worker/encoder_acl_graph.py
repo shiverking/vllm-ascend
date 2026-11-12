@@ -29,7 +29,10 @@ from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGra
 
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
 
-AUDIO_ATTENTION_ALIGNMENT = 128
+
+SHORT_AUDIO_MASK_GRAPH_MAX_TOKENS = 26
+SHORT_AUDIO_MASK_ALIGNMENT = 128
+AUDIO_ATTENTION_ALIGNMENT = SHORT_AUDIO_MASK_ALIGNMENT
 
 # ---------------------------------------------------------------------------
 # Per–encoder-budget ACL graph bookkeeping (ViT FIA tasks)
@@ -180,6 +183,79 @@ def maybe_compute_actual_seq_lengths(
     return actual, [end * ratio for end in actual]
 
 
+def prepare_padded_sequence_lengths(
+    sequence_lengths: torch.Tensor,
+    actual_tokens: int,
+    token_budget: int,
+) -> torch.Tensor:
+    sequence_lengths = sequence_lengths.to(
+        device="cpu", dtype=torch.int32
+    ).contiguous()
+    if int(sequence_lengths.sum()) != actual_tokens:
+        raise ValueError(
+            "Encoder graph sequence lengths do not match its input: "
+            f"tokens={actual_tokens}, seq_lens={sequence_lengths.tolist()}"
+        )
+    padding = token_budget - actual_tokens
+    if padding < 0:
+        raise ValueError(
+            "Encoder graph input exceeds its token budget: "
+            f"actual={actual_tokens}, budget={token_budget}"
+        )
+    if padding:
+        sequence_lengths = torch.cat(
+            (
+                sequence_lengths,
+                torch.tensor([padding], dtype=torch.int32),
+            )
+        )
+    return sequence_lengths
+
+
+def build_short_audio_attention_mask(
+    sequence_lengths: torch.Tensor, token_budget: int
+) -> torch.Tensor:
+    """Keep each real sequence and all padding in separate attention blocks."""
+    if token_budget <= 0 or token_budget > SHORT_AUDIO_MASK_GRAPH_MAX_TOKENS:
+        raise ValueError(f"Unsupported short audio graph budget: {token_budget}")
+    return build_audio_attention_mask(sequence_lengths, token_budget)
+
+
+def build_audio_attention_mask(
+    sequence_lengths: torch.Tensor | tuple[int, ...], token_budget: int
+) -> torch.Tensor:
+    """Block-mask real sequences and both body and alignment padding."""
+    if token_budget <= 0:
+        raise ValueError("Audio graph budget must be positive")
+    if not isinstance(sequence_lengths, torch.Tensor):
+        sequence_lengths = torch.tensor(sequence_lengths, dtype=torch.int32)
+    if (
+        sequence_lengths.ndim != 1
+        or sequence_lengths.numel() == 0
+        or sequence_lengths.device.type != "cpu"
+        or bool((sequence_lengths <= 0).any())
+    ):
+        raise ValueError("Audio graph requires positive CPU sequence lengths")
+    actual_tokens = int(sequence_lengths.sum())
+    topology = prepare_padded_sequence_lengths(
+        sequence_lengths, actual_tokens, token_budget
+    ).tolist()
+    aligned_tokens = (
+        (token_budget + SHORT_AUDIO_MASK_ALIGNMENT - 1)
+        // SHORT_AUDIO_MASK_ALIGNMENT
+        * SHORT_AUDIO_MASK_ALIGNMENT
+    )
+    if aligned_tokens > token_budget:
+        topology.append(aligned_tokens - token_budget)
+    mask = torch.ones((aligned_tokens, aligned_tokens), dtype=torch.bool)
+    offset = 0
+    for length in topology:
+        end = offset + length
+        mask[offset:end, offset:end] = False
+        offset = end
+    return mask.contiguous()
+
+
 def update_encoder_graph_params(
     update_stream: torch.npu.Stream,
     token_budget: int,
@@ -268,10 +344,16 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
         super().__init__(*args, **kwargs)
         self.graph_pool = current_platform.get_global_graph_pool()
         self.update_stream: torch.npu.Stream | None = None
-        self._is_qwen3_asr = self.model.__class__.__name__ == "Qwen3ASRForConditionalGeneration"
+        self.short_audio_attention_masks: dict[int, torch.Tensor] = {}
+        self.short_audio_host_masks: dict[int, torch.Tensor] = {}
+        self._is_qwen3_asr = (
+            self.model.__class__.__name__ == "Qwen3ASRForConditionalGeneration"
+        )
         self._qwen_audio_pool = None
         if self._is_qwen3_asr and self.config.modalities:
-            from vllm_ascend.worker.qwen3_audio_encoder_graph import Qwen3AudioEncoderGraphPool
+            from vllm_ascend.worker.qwen3_audio_encoder_graph import (
+                Qwen3AudioEncoderGraphPool,
+            )
 
             tower = self.model.audio_tower
             if (
@@ -281,11 +363,83 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                 and not self.vllm_config.model_config.enforce_eager
             ):
                 window = tower.get_attention_window_tokens()
-                budgets = self.vllm_config.compilation_config.encoder_cudagraph_token_budgets or [
-                    window // 4, window, 2 * window, 4 * window
-                ]
-                self._qwen_audio_pool = Qwen3AudioEncoderGraphPool(self.model, self.device, budgets)
+                budgets = (
+                    self.vllm_config.compilation_config.encoder_cudagraph_token_budgets
+                    or [window // 4, window, 2 * window, 4 * window]
+                )
+                self._qwen_audio_pool = Qwen3AudioEncoderGraphPool(
+                    self.model, self.device, budgets
+                )
+                # The generic manager must not also capture or replay this model.
                 self.token_budgets = list(self._qwen_audio_pool.budgets)
+        self.diagnostic_sync_stage = (self.vllm_config.additional_config or {}).get(
+            "audio_encoder_graph_diag_sync", "off"
+        )
+        if self.diagnostic_sync_stage not in {"off", "capture", "inputs", "replay"}:
+            raise ValueError(
+                "audio_encoder_graph_diag_sync must be one of off, capture, "
+                "inputs, replay"
+            )
+        if self.diagnostic_sync_stage != "off":
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] enabled: sync_stage=%s; diagnostic run only",
+                self.diagnostic_sync_stage,
+            )
+
+    def _diagnostic_sync(self, stage: str, token_budget: int) -> None:
+        if self.diagnostic_sync_stage != stage and not (
+            self.diagnostic_sync_stage == "replay" and stage == "inputs"
+        ):
+            return
+        logger.warning(
+            "[ENCODER_GRAPH_DIAG] sync begin: stage=%s, budget=%d",
+            stage,
+            token_budget,
+        )
+        try:
+            torch.npu.synchronize()
+        except Exception:
+            logger.exception(
+                "[ENCODER_GRAPH_DIAG] sync failed: stage=%s, budget=%d",
+                stage,
+                token_budget,
+            )
+            raise
+        logger.warning(
+            "[ENCODER_GRAPH_DIAG] sync complete: stage=%s, budget=%d",
+            stage,
+            token_budget,
+        )
+
+    def _diagnostic_graph_buffers(
+        self, graph_meta: BudgetGraphMetadata, token_budget: int, phase: str
+    ) -> None:
+        if self.diagnostic_sync_stage == "off":
+            return
+        inputs = {
+            key: (tuple(buf.shape), hex(buf.data_ptr()))
+            for key, buf in graph_meta.input_buffers.items()
+            if isinstance(buf, torch.Tensor)
+        }
+        output = graph_meta.output_buffer
+        mask = self.short_audio_attention_masks.get(token_budget)
+        logger.warning(
+            "[ENCODER_GRAPH_DIAG] graph buffers: phase=%s, budget=%d, "
+            "graph_id=%#x, pool_id=%#x, inputs=%s, output=%s, mask=%s",
+            phase,
+            token_budget,
+            id(graph_meta.graph),
+            id(self.graph_pool),
+            inputs,
+            None if not isinstance(output, torch.Tensor) else hex(output.data_ptr()),
+            None if mask is None else hex(mask.data_ptr()),
+        )
+
+    def _uses_short_audio_mask(self, token_budget: int) -> bool:
+        return (
+            self.model.__class__.__name__ == "Qwen3ASRForConditionalGeneration"
+            and token_budget <= SHORT_AUDIO_MASK_GRAPH_MAX_TOKENS
+        )
 
     def capture(self, graph_pool: Any | None = None):
         encoder_graph_pool = graph_pool if graph_pool is not None else self.graph_pool
@@ -340,16 +494,28 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             )
 
         values = capture_inputs.values
+        attention_mask = None
+        host_attention_mask = None
+        if self._uses_short_audio_mask(token_budget):
+            host_attention_mask = build_short_audio_attention_mask(
+                values["sequence_lengths"], token_budget
+            )
+            attention_mask = host_attention_mask.to(device=self.device)
         with torch.inference_mode():
-            if vllm_version_is("0.23.0"):
-                output = self.model.encoder_cudagraph_forward(dict(values))
-            else:
-                output = self.model.encoder_cudagraph_forward(dict(values), path=path)
+            with set_encoder_forward_context(
+                token_budget, False, attention_mask=attention_mask
+            ):
+                if vllm_version_is("0.23.0"):
+                    output = self.model.encoder_cudagraph_forward(dict(values))
+                else:
+                    output = self.model.encoder_cudagraph_forward(dict(values), path=path)
             output_buffer = torch.empty_like(output)
 
         graph = torch.npu.NPUGraph()
         with (
-            set_encoder_forward_context(token_budget, True),
+            set_encoder_forward_context(
+                token_budget, True, attention_mask=attention_mask
+            ),
             torch.inference_mode(),
             torch.npu.graph(graph, self.graph_pool),
         ):
@@ -367,11 +533,44 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             input_buffers=values,
             output_buffer=weak_ref_tensors(output_buffer),
         )
+        if attention_mask is not None:
+            self.short_audio_attention_masks[token_budget] = attention_mask
+            self.short_audio_host_masks[token_budget] = host_attention_mask
+            logger.info(
+                "Audio encoder graph captured with device-masked attention: "
+                "budget=%d, attention_tokens=%d",
+                token_budget,
+                attention_mask.shape[0],
+            )
         if vllm_version_is("0.23.0"):
             self.budget_graphs[token_budget] = graph_meta
         else:
             graph_set = self._get_graph_set(path)
             graph_set[token_budget] = graph_meta
+        self._diagnostic_graph_buffers(graph_meta, token_budget, "capture")
+        if self.diagnostic_sync_stage != "off":
+            params = get_encoder_graph_params()
+            workspace = None if params is None else params.workspaces.get(token_budget)
+            workspace_bytes = (
+                workspace.numel() * workspace.element_size()
+                if isinstance(workspace, torch.Tensor)
+                else 0
+            )
+            task_count = 0 if params is None else len(params.handles[token_budget])
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] capture stored: budget=%d, attention=%s, "
+                "sequence_lengths=%s, fia_tasks=%d, workspace_bytes=%d",
+                token_budget,
+                "masked_prompt" if attention_mask is not None else "fia",
+                (
+                    None
+                    if values.get("sequence_lengths") is None
+                    else values["sequence_lengths"].tolist()
+                ),
+                task_count,
+                workspace_bytes,
+            )
+            self._diagnostic_sync("capture", token_budget)
 
     def _run_budget_graph(
         self,
@@ -418,23 +617,90 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                 padding_logic = self.config.padding_logics.get(key, self._copy_padded_buffer)
                 padding_logic(buf, src)
 
-        cu_seqlens = graph_meta.input_buffers.get("cu_seqlens")
-        cu_seqlens_cpu = None if cu_seqlens is None else cu_seqlens.cpu()
+        sequence_lengths = replay.values.get("sequence_lengths")
+        if sequence_lengths is not None:
+            actual_tokens = int(sequence_lengths.sum())
+            padded_sequence_lengths = prepare_padded_sequence_lengths(
+                sequence_lengths,
+                actual_tokens,
+                token_budget,
+            )
+            cu_seqlens_cpu = torch.cat(
+                (
+                    torch.zeros(1, dtype=torch.int32),
+                    padded_sequence_lengths.cumsum(
+                        0, dtype=torch.int32
+                    ),
+                )
+            )
+            logger.debug(
+                "Audio encoder ACLGraph replay: actual_tokens=%d, "
+                "budget=%d, padding_tokens=%d",
+                actual_tokens,
+                token_budget,
+                token_budget - actual_tokens,
+            )
+            if self._uses_short_audio_mask(token_budget):
+                mask = build_short_audio_attention_mask(
+                    sequence_lengths, token_budget
+                )
+                host_mask = self.short_audio_host_masks[token_budget]
+                host_mask.copy_(mask)
+                self.short_audio_attention_masks[token_budget].copy_(host_mask)
+        else:
+            cu_seqlens = graph_meta.input_buffers.get("cu_seqlens")
+            cu_seqlens_cpu = (
+                None if cu_seqlens is None else cu_seqlens.cpu()
+            )
+
+        if self.diagnostic_sync_stage != "off":
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] inputs updated: budget=%d, "
+                "sequence_lengths=%s, cu_seqlens=%s, attention=%s",
+                token_budget,
+                None if sequence_lengths is None else sequence_lengths.tolist(),
+                None if cu_seqlens_cpu is None else cu_seqlens_cpu.tolist(),
+                "masked_prompt" if self._uses_short_audio_mask(token_budget) else "fia",
+            )
+            self._diagnostic_sync("inputs", token_budget)
 
         update_stream = self.update_stream
         if update_stream is None:
             update_stream = torch.npu.Stream()
 
+        if self.diagnostic_sync_stage != "off":
+            self._diagnostic_graph_buffers(graph_meta, token_budget, "replay")
+            logger.warning(
+                "[ENCODER_GRAPH_DIAG] replay begin: budget=%d", token_budget
+            )
         graph_meta.graph.replay()
 
-        with set_encoder_forward_context(
-            token_budget,
-            False,
-            cu_seqlens_cpu=cu_seqlens_cpu,
-        ):
-            update_encoder_graph_params(update_stream, token_budget)
+        if not self._uses_short_audio_mask(token_budget):
+            if self.diagnostic_sync_stage != "off":
+                logger.warning(
+                    "[ENCODER_GRAPH_DIAG] FIA update begin: budget=%d", token_budget
+                )
+            with set_encoder_forward_context(
+                token_budget,
+                False,
+                cu_seqlens_cpu=cu_seqlens_cpu,
+            ):
+                update_encoder_graph_params(update_stream, token_budget)
+            if self.diagnostic_sync_stage != "off":
+                logger.warning(
+                    "[ENCODER_GRAPH_DIAG] FIA update submitted: budget=%d",
+                    token_budget,
+                )
+
+        if self.diagnostic_sync_stage != "off":
+            self._diagnostic_sync("replay", token_budget)
 
         self.graph_hits += num_items
+        logger.debug(
+            "Audio encoder ACLGraph replay submitted: budget=%d, attention=%s",
+            token_budget,
+            "masked_prompt" if self._uses_short_audio_mask(token_budget) else "fia",
+        )
         return graph_meta.output_buffer
 
 
