@@ -45,6 +45,18 @@ def random_sample(
 
 
 class AscendSampler(Sampler):
+    def forward(self, logits, sampling_metadata, predict_bonus_token=False, logprobs_mode_override=None):
+        from vllm.v1.outputs import SamplerOutput
+
+        from vllm_ascend.sample.movement import can_sample_without_cast
+
+        flags = get_ascend_config().data_movement_optimizations
+        if flags.greedy_no_fp32_cast and can_sample_without_cast(sampling_metadata, predict_bonus_token):
+            return SamplerOutput(
+                sampled_token_ids=self.greedy_sample(logits).to(torch.int32).unsqueeze(-1), logprobs_tensors=None
+            )
+        return super().forward(logits, sampling_metadata, predict_bonus_token, logprobs_mode_override)
+
     @staticmethod
     def apply_penalties(
         logits: torch.Tensor,

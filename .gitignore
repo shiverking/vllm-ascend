@@ -223,3 +223,8 @@ csrc/third_party/
 .codegraph/
 
 .vllm_ascend/
+
+# Local Direct Guided outputs and standalone AscendC builds
+/direct-guided-output/
+/examples/online_serving/direct_guided/output/
+/csrc/experimental/leapquant/build*/

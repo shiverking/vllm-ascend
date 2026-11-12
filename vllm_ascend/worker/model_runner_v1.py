@@ -1952,6 +1952,10 @@ class NPUModelRunner(GPUModelRunner):
         scheduler_output: "SchedulerOutput",
         intermediate_tensors: IntermediateTensors | None = None,
     ) -> ModelRunnerOutput | IntermediateTensors | None:
+        if scheduler_output.fixed_prefix_copies:
+            from vllm_ascend.worker.fixed_prefix import copy_fixed_prefix_pages
+
+            copy_fixed_prefix_pages(self, scheduler_output.fixed_prefix_copies)
         if self.vllm_config.model_config.enable_return_routed_experts:
             if self.routed_experts_initialized:
                 self.routed_experts_capturer.clear_buffer()
