@@ -28,7 +28,7 @@ from vllm.platforms import current_platform
 from vllm.v1.worker.encoder_cudagraph import BudgetGraphMetadata, EncoderCudaGraphManager
 
 from vllm_ascend.utils import vllm_version_is, weak_ref_tensors
-
+from vllm_ascend.worker.audio_frontend_acl_graph import normalize_frontend_batches
 
 SHORT_AUDIO_MASK_GRAPH_MAX_TOKENS = 26
 SHORT_AUDIO_MASK_ALIGNMENT = 128
@@ -356,6 +356,10 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
             )
 
             tower = self.model.audio_tower
+            frontend_batches = normalize_frontend_batches(
+                (self.vllm_config.additional_config or {}).get("audio_encoder_frontend_graph_batches", []),
+                tower.conv_chunksize,
+            )
             if (
                 self.vllm_config.parallel_config.tensor_parallel_size == 1
                 and tower.dtype == torch.float16
@@ -368,7 +372,7 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                     or [window // 4, window, 2 * window, 4 * window]
                 )
                 self._qwen_audio_pool = Qwen3AudioEncoderGraphPool(
-                    self.model, self.device, budgets
+                    self.model, self.device, budgets, frontend_batches=frontend_batches
                 )
                 # The generic manager must not also capture or replay this model.
                 self.token_budgets = list(self._qwen_audio_pool.budgets)

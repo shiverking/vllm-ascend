@@ -1,21 +1,23 @@
 """Fixed-shape masked ACLGraphs for the Qwen3-ASR audio encoder body.
 
-The convolutional frontend and final per-audio split remain outside the graph.
+The frontend can use a separate CNN graph pool; per-audio split stays outside.
 Each graph uses a device attention mask, so replay does not update FIA tasks.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import accumulate
 from threading import Lock
-from typing import Any, Iterator, Sequence
+from typing import Any
 
 import torch
 from vllm.logger import logger
 from vllm.platforms import current_platform
 
+from vllm_ascend.worker.audio_frontend_acl_graph import AudioFrontendGraphPool
 from vllm_ascend.worker.encoder_acl_graph import (
     build_audio_attention_mask,
     set_encoder_forward_context,
@@ -184,10 +186,17 @@ class FixedAudioEncoderGraph:
 class Qwen3AudioEncoderGraphPool:
     """Capture basis graphs at startup and replay complete attention sequences."""
 
-    def __init__(self, model: Any, device: torch.device, budgets: Sequence[int]):
+    def __init__(
+        self,
+        model: Any,
+        device: torch.device,
+        budgets: Sequence[int],
+        frontend_batches: Sequence[int] = (),
+    ):
         self.model = model
         self.device = device
         self.budgets = tuple(sorted(set(budgets)))
+        self.frontend_pool = AudioFrontendGraphPool(model.audio_tower, frontend_batches) if frontend_batches else None
         window = model.audio_tower.get_attention_window_tokens()
         if not self.budgets or any(budget <= 0 for budget in self.budgets):
             raise ValueError("Qwen3-ASR audio graph budgets must be positive")
@@ -207,6 +216,11 @@ class Qwen3AudioEncoderGraphPool:
         )
 
     def capture(self, graph_pool: Any | None = None) -> None:
+        if self.frontend_pool is not None:
+            self.frontend_pool.capture()
+            # Install only after successful startup capture; retain the original
+            # eager callable in the pool for incompatible time widths.
+            self.model.audio_tower._forward_cnn_frontend = self.frontend_pool
         pool = graph_pool if graph_pool is not None else current_platform.get_global_graph_pool()
         self._stream = torch.npu.Stream()
         self._input_ready = torch.npu.Event()
