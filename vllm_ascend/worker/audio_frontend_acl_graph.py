@@ -6,6 +6,7 @@ from threading import Lock
 from typing import Any
 
 import torch
+import torch_npu
 from tqdm import tqdm
 from vllm.logger import logger
 
@@ -51,6 +52,40 @@ class AudioFrontendGraphPool:
 
     @torch.inference_mode()
     def capture(self) -> None:
+        # Conv2D can dispatch to non-capturable ACLOP if either option is on.
+        # This scope is startup-only: never change process-wide options during
+        # replay or eager fallback. Some TorchNPU versions expose the internal
+        # format config as write-only, so read the underlying option (default on).
+        previous_jit = not torch.npu.is_jit_compile_false()
+        previous_format = torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") != b"disable"
+        failed = False
+        try:
+            torch.npu.synchronize()
+            torch.npu.config.allow_internal_format = False
+            if previous_jit:
+                torch.npu.set_compile_mode(jit_compile=False)
+            logger.info(
+                "[AUDIO_FRONTEND_GRAPH] capture settings: allow_internal_format=%s jit_compile=%s",
+                torch_npu._C._npu_getOption("ALLOW_INTERNAL_FORMAT") != b"disable",
+                not torch.npu.is_jit_compile_false(),
+            )
+            self._capture_impl()
+        except BaseException:
+            failed = True
+            raise
+        finally:
+            try:
+                torch.npu.config.allow_internal_format = previous_format
+                if previous_jit:
+                    torch.npu.set_compile_mode(jit_compile=True)
+            except Exception as exc:
+                # set_compile_mode synchronizes; an invalid capture stream can
+                # fail again here. Preserve the original capture error on exit.
+                if not failed:
+                    raise
+                logger.warning("[AUDIO_FRONTEND_GRAPH] settings restore failed after capture error: %s", exc)
+
+    def _capture_impl(self) -> None:
         # Each graph owns its allocator pool: runtime batch order is arbitrary,
         # and CNN temporaries must not alias Body graphs on another stream.
         self._stream = torch.npu.Stream()
