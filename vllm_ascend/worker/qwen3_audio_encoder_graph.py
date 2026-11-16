@@ -37,6 +37,23 @@ class AudioGraphChunk:
         return self.token_end - self.token_start
 
 
+def build_audio_gather_indices(chunk_lengths: torch.Tensor, padded_tokens: int) -> torch.Tensor:
+    """Map compact token order to flattened CNN rows using CPU metadata only."""
+    if (
+        chunk_lengths.device.type != "cpu"
+        or chunk_lengths.ndim != 1
+        or chunk_lengths.numel() == 0
+        or chunk_lengths.dtype not in (torch.int32, torch.int64)
+    ):
+        raise ValueError("CNN gather requires a nonempty CPU integer length vector")
+    indices = []
+    for row, length in enumerate(chunk_lengths.tolist()):
+        if length <= 0 or length > padded_tokens:
+            raise ValueError("CNN gather length exceeds the padded chunk width")
+        indices.extend(range(row * padded_tokens, row * padded_tokens + length))
+    return torch.tensor(indices, dtype=torch.int64, device="cpu")
+
+
 def plan_audio_graph_chunks(
     topology: Sequence[int], budgets: Sequence[int]
 ) -> tuple[AudioGraphChunk, ...]:
@@ -103,7 +120,7 @@ def plan_audio_graph_chunks(
 class FixedAudioEncoderGraph:
     """One graph with fixed input/output addresses and a mutable device mask."""
 
-    def __init__(self, model: Any, budget: int, device: torch.device):
+    def __init__(self, model: Any, budget: int, device: torch.device, gather_chunk_tokens: int = 0):
         self.model = model
         self.budget = budget
         self.device = device
@@ -114,18 +131,27 @@ class FixedAudioEncoderGraph:
         self.mask: torch.Tensor | None = None
         self.host_mask: torch.Tensor | None = None
         self.output: torch.Tensor | None = None
+        # Each valid token may come from a different padded CNN row. This bound
+        # covers that worst case without sizing buffers by request concurrency.
+        self.source_capacity = budget * gather_chunk_tokens
+        self.gather_source: torch.Tensor | None = None
+        self.gather_indices: torch.Tensor | None = None
+        self.host_indices: torch.Tensor | None = None
 
     def _forward(self) -> torch.Tensor:
-        assert self.hidden_states is not None
+        if self.gather_source is not None:
+            assert self.gather_indices is not None
+            hidden_states = torch.index_select(self.gather_source, 0, self.gather_indices)
+        else:
+            hidden_states = self.hidden_states
+        assert hidden_states is not None
         assert self.cu_seqlens is not None
         assert self.sequence_lengths is not None
         assert self.mask is not None
         tower = self.model.audio_tower
-        with set_encoder_forward_context(
-            self.budget, False, attention_mask=self.mask
-        ):
+        with set_encoder_forward_context(self.budget, False, attention_mask=self.mask):
             return tower._forward_encoder_body(
-                self.hidden_states,
+                hidden_states,
                 self.cu_seqlens,
                 tower.compute_attn_mask_seqlen(self.cu_seqlens),
                 self.sequence_lengths,
@@ -133,15 +159,17 @@ class FixedAudioEncoderGraph:
 
     def capture(self, graph_pool: Any) -> None:
         hidden_size = int(self.model.audio_tower.ln_post.normalized_shape[0])
-        self.hidden_states = torch.zeros(
-            (self.budget, hidden_size), device=self.device, dtype=torch.float16
-        )
-        self.cu_seqlens = torch.tensor(
-            [0, self.budget], device=self.device, dtype=torch.int32
-        )
-        self.sequence_lengths = torch.tensor(
-            [self.budget], device="cpu", dtype=torch.int32
-        )
+        if self.source_capacity:
+            # The last row is a permanent zero sentinel for dummy tokens.
+            self.gather_source = torch.zeros(
+                (self.source_capacity + 1, hidden_size), device=self.device, dtype=torch.float16
+            )
+            self.host_indices = torch.full((self.budget,), self.source_capacity, dtype=torch.int64, device="cpu")
+            self.gather_indices = self.host_indices.to(self.device)
+        else:
+            self.hidden_states = torch.zeros((self.budget, hidden_size), device=self.device, dtype=torch.float16)
+        self.cu_seqlens = torch.tensor([0, self.budget], device=self.device, dtype=torch.int32)
+        self.sequence_lengths = torch.tensor([self.budget], device="cpu", dtype=torch.int32)
         host_mask = build_audio_attention_mask(self.sequence_lengths, self.budget)
         self.host_mask = torch.empty_like(host_mask)
         self.host_mask.copy_(host_mask)
@@ -175,9 +203,32 @@ class FixedAudioEncoderGraph:
         self.hidden_states[:actual].copy_(hidden_states)
         if actual < self.budget:
             self.hidden_states[actual:].zero_()
-        self.host_mask.copy_(
-            build_audio_attention_mask(topology, self.budget)
-        )
+        return self._replay(topology, actual)
+
+    def replay_padded(self, source: torch.Tensor, indices: torch.Tensor, topology: Sequence[int]) -> torch.Tensor:
+        """Copy a bounded CNN span; compact/pad it inside the captured body."""
+        assert self.gather_source is not None
+        assert self.gather_indices is not None and self.host_indices is not None
+        if indices.device.type != "cpu" or indices.dtype != torch.int64 or indices.ndim != 1:
+            raise ValueError("audio gather indices must be a CPU int64 vector")
+        actual = indices.numel()
+        if actual == 0 or actual > self.budget or sum(topology) != actual:
+            raise ValueError("audio gather graph input and sequence lengths do not match")
+        if source.shape[0] > self.source_capacity:
+            raise ValueError("CNN span exceeds the captured gather source capacity")
+        if bool((indices < 0).any()) or bool((indices >= source.shape[0]).any()):
+            raise ValueError("audio gather indices are outside the CNN source span")
+        self.gather_source[: source.shape[0]].copy_(source)
+        self.host_indices.fill_(self.source_capacity)
+        self.host_indices[:actual].copy_(indices)
+        # Blocking host copy keeps the reusable CPU tensor live until consumed.
+        self.gather_indices.copy_(self.host_indices)
+        return self._replay(topology, actual)
+
+    def _replay(self, topology: Sequence[int], actual: int) -> torch.Tensor:
+        assert self.graph is not None and self.output is not None
+        assert self.host_mask is not None and self.mask is not None
+        self.host_mask.copy_(build_audio_attention_mask(topology, self.budget))
         self.mask.copy_(self.host_mask)
         self.graph.replay()
         return self.output[:actual].clone()
@@ -192,17 +243,26 @@ class Qwen3AudioEncoderGraphPool:
         device: torch.device,
         budgets: Sequence[int],
         frontend_batches: Sequence[int] = (),
+        gather: bool = False,
     ):
         self.model = model
         self.device = device
         self.budgets = tuple(sorted(set(budgets)))
+        if type(gather) is not bool:
+            raise ValueError("audio_encoder_graph_gather must be a boolean")
+        self.gather = gather
+        self.gather_chunk_tokens = 0
+        if gather:
+            if not callable(getattr(model, "_prepare_audio_encoder_gather_inputs", None)):
+                raise ValueError("audio_encoder_graph_gather requires the matching vLLM padded CNN input interface")
+            tower = model.audio_tower
+            self.gather_chunk_tokens = int(tower._get_cnn_output_lengths(torch.tensor([2 * tower.n_window]))[0])
         self.frontend_pool = AudioFrontendGraphPool(model.audio_tower, frontend_batches) if frontend_batches else None
         window = model.audio_tower.get_attention_window_tokens()
         if not self.budgets or any(budget <= 0 for budget in self.budgets):
             raise ValueError("Qwen3-ASR audio graph budgets must be positive")
         self.runners = {
-            budget: FixedAudioEncoderGraph(model, budget, device)
-            for budget in self.budgets
+            budget: FixedAudioEncoderGraph(model, budget, device, self.gather_chunk_tokens) for budget in self.budgets
         }
         self._lock = Lock()
         self._stream: Any | None = None
@@ -210,9 +270,10 @@ class Qwen3AudioEncoderGraphPool:
         self._output_ready: Any | None = None
         self._calls = 0
         logger.info(
-            "[AUDIO_ENCODER_GRAPH] enabled: sizes=%s window=%d",
+            "[AUDIO_ENCODER_GRAPH] enabled: sizes=%s window=%d gather_in_graph=%s",
             list(self.budgets),
             window,
+            self.gather,
         )
 
     def capture(self, graph_pool: Any | None = None) -> None:
@@ -228,18 +289,21 @@ class Qwen3AudioEncoderGraphPool:
         with torch.npu.stream(self._stream):
             for budget in self.budgets:
                 try:
-                    self.runners[budget].capture(pool)
+                    # Gather allocates a captured intermediate. Keep each graph's
+                    # private pool alive independently of cross-size replay order.
+                    self.runners[budget].capture(None if self.gather else pool)
                 except Exception as exc:
                     raise RuntimeError(
                         f"Qwen3-ASR audio graph capture failed at {budget} tokens"
                     ) from exc
-        logger.info("[AUDIO_ENCODER_GRAPH] captured sizes=%s", list(self.budgets))
+        logger.info("[AUDIO_ENCODER_GRAPH] captured sizes=%s gather_in_graph=%s", list(self.budgets), self.gather)
 
     def _execute_plan(
         self,
         hidden_states: torch.Tensor,
         topology: tuple[int, ...],
         plan: tuple[AudioGraphChunk, ...],
+        gather_indices: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, list[int], int, int]:
         outputs: list[torch.Tensor] = []
         graph_chunks: list[int] = []
@@ -247,8 +311,17 @@ class Qwen3AudioEncoderGraphPool:
         eager_tokens = 0
         for chunk in plan:
             chunk_topology = topology[chunk.sequence_start : chunk.sequence_end]
-            chunk_input = hidden_states[chunk.token_start : chunk.token_end]
+            if gather_indices is None:
+                chunk_input = hidden_states[chunk.token_start : chunk.token_end]
+            else:
+                # All scalar reads are from CPU metadata, never the NPU output.
+                selected = gather_indices[chunk.token_start : chunk.token_end]
+                start, end = int(selected[0]), int(selected[-1]) + 1
+                chunk_input = hidden_states[start:end]
+                selected = selected - start
             if chunk.budget is None:
+                if gather_indices is not None:
+                    chunk_input = torch.index_select(chunk_input, 0, selected.to(self.device))
                 seq_cpu = torch.tensor(chunk_topology, dtype=torch.int32)
                 cu_cpu = torch.tensor(
                     [0, *accumulate(chunk_topology)], dtype=torch.int32
@@ -265,9 +338,11 @@ class Qwen3AudioEncoderGraphPool:
                 )
                 eager_tokens += chunk.actual_tokens
             else:
-                outputs.append(
-                    self.runners[chunk.budget].replay(chunk_input, chunk_topology)
-                )
+                runner = self.runners[chunk.budget]
+                if gather_indices is None:
+                    outputs.append(runner.replay(chunk_input, chunk_topology))
+                else:
+                    outputs.append(runner.replay_padded(chunk_input, selected, chunk_topology))
                 graph_chunks.append(chunk.budget)
                 padding += chunk.budget - chunk.actual_tokens
         output = outputs[0] if len(outputs) == 1 else torch.cat(outputs, dim=0)
@@ -290,24 +365,40 @@ class Qwen3AudioEncoderGraphPool:
     @torch.inference_mode()
     def execute(self, mm_kwargs: dict[str, Any]) -> list[torch.Tensor]:
         self._calls += 1
-        hidden_states, _, _, sequence_lengths = (
-            self.model._prepare_audio_encoder_graph_inputs(mm_kwargs)
-        )
-        topology = tuple(int(n) for n in sequence_lengths.tolist())
+        gather_indices = None
+        if self.gather:
+            padded, chunk_lengths, sequence_lengths = self.model._prepare_audio_encoder_gather_inputs(mm_kwargs)
+            if (
+                padded.ndim != 3
+                or not padded.is_contiguous()
+                or padded.shape[0] != chunk_lengths.numel()
+                or padded.shape[1] > self.gather_chunk_tokens
+            ):
+                raise ValueError("unsupported padded CNN layout for audio gather graph")
+            gather_indices = build_audio_gather_indices(chunk_lengths, padded.shape[1])
+            hidden_states = padded.view(-1, padded.shape[-1])
+            actual_tokens = gather_indices.numel()
+        else:
+            hidden_states, _, _, sequence_lengths = self.model._prepare_audio_encoder_graph_inputs(mm_kwargs)
+            actual_tokens = hidden_states.shape[0]
         if (
             hidden_states.dtype != torch.float16
             or hidden_states.device.type != "npu"
             or not hidden_states.is_contiguous()
             or sequence_lengths.device.type != "cpu"
             or sequence_lengths.dtype != torch.int32
-            or sum(topology) != hidden_states.shape[0]
         ):
             raise ValueError("unsupported Qwen3-ASR audio graph input")
+        topology = tuple(int(n) for n in sequence_lengths.tolist())
+        if sum(topology) != actual_tokens:
+            raise ValueError("audio sequence lengths do not match the valid CNN tokens")
         plan = plan_audio_graph_chunks(topology, self.budgets)
         with self._ordered_stream():
+            hidden_states.record_stream(torch.npu.current_stream())
             output, graph_chunks, padding, eager_tokens = self._execute_plan(
-                hidden_states, topology, plan
+                hidden_states, topology, plan, gather_indices
             )
+        output.record_stream(torch.npu.current_stream())
 
         item_lengths = [
             spec.output_tokens
@@ -321,11 +412,12 @@ class Qwen3AudioEncoderGraphPool:
         logger.info(
             "[AUDIO_ENCODER_GRAPH] call=%d items=%d item_tokens=%s "
             "actual=%d seq_lens=%s graphs=%s replays=%d "
-            "padding=%d eager=%d graph_used=%s graph_hit=%s state=submitted",
+            "padding=%d eager=%d graph_used=%s graph_hit=%s "
+            "gather_in_graph=%s source_rows=%d state=submitted",
             self._calls,
             len(item_lengths),
             item_lengths,
-            hidden_states.shape[0],
+            actual_tokens,
             list(topology),
             graph_chunks,
             len(graph_chunks),
@@ -333,5 +425,7 @@ class Qwen3AudioEncoderGraphPool:
             eager_tokens,
             bool(graph_chunks),
             bool(graph_chunks) and eager_tokens == 0,
+            self.gather and bool(graph_chunks),
+            hidden_states.shape[0],
         )
         return list(output.split(item_lengths, dim=0))

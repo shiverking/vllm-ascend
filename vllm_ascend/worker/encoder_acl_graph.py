@@ -372,7 +372,11 @@ class EncoderAclGraphManager(EncoderCudaGraphManager):
                     or [window // 4, window, 2 * window, 4 * window]
                 )
                 self._qwen_audio_pool = Qwen3AudioEncoderGraphPool(
-                    self.model, self.device, budgets, frontend_batches=frontend_batches
+                    self.model,
+                    self.device,
+                    budgets,
+                    frontend_batches=frontend_batches,
+                    gather=(self.vllm_config.additional_config or {}).get("audio_encoder_graph_gather", False),
                 )
                 # The generic manager must not also capture or replay this model.
                 self.token_budgets = list(self._qwen_audio_pool.budgets)
