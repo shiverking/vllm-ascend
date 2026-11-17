@@ -130,6 +130,7 @@ class FixedAudioEncoderGraph:
         self.sequence_lengths: torch.Tensor | None = None
         self.mask: torch.Tensor | None = None
         self.host_mask: torch.Tensor | None = None
+        self._mask_topology: tuple[int, ...] | None = None
         self.output: torch.Tensor | None = None
         # Each valid token may come from a different padded CNN row. This bound
         # covers that worst case without sizing buffers by request concurrency.
@@ -170,10 +171,9 @@ class FixedAudioEncoderGraph:
             self.hidden_states = torch.zeros((self.budget, hidden_size), device=self.device, dtype=torch.float16)
         self.cu_seqlens = torch.tensor([0, self.budget], device=self.device, dtype=torch.int32)
         self.sequence_lengths = torch.tensor([self.budget], device="cpu", dtype=torch.int32)
-        host_mask = build_audio_attention_mask(self.sequence_lengths, self.budget)
-        self.host_mask = torch.empty_like(host_mask)
-        self.host_mask.copy_(host_mask)
-        self.mask = host_mask.to(self.device)
+        self._mask_topology = None
+        self.host_mask = build_audio_attention_mask(self.sequence_lengths, self.budget)
+        self.mask = self.host_mask.to(self.device)
 
         with torch.inference_mode():
             for _ in range(2):
@@ -186,6 +186,7 @@ class FixedAudioEncoderGraph:
                 self.output.copy_(output)
             self.graph = graph
             torch.npu.synchronize()
+        self._mask_topology = (self.budget,)
 
     def replay(
         self, hidden_states: torch.Tensor, topology: Sequence[int]
@@ -228,8 +229,25 @@ class FixedAudioEncoderGraph:
     def _replay(self, topology: Sequence[int], actual: int) -> torch.Tensor:
         assert self.graph is not None and self.output is not None
         assert self.host_mask is not None and self.mask is not None
-        self.host_mask.copy_(build_audio_attention_mask(topology, self.budget))
-        self.mask.copy_(self.host_mask)
+        topology = tuple(int(length) for length in topology)
+        if not topology or any(length <= 0 for length in topology) or sum(topology) != actual or actual > self.budget:
+            raise ValueError("audio graph input and sequence lengths do not match")
+        if topology != self._mask_topology:
+            # Serialized by the pool's lock/stream. Invalidate before updating
+            # so a failed copy cannot leave a stale cache hit on the next call.
+            self._mask_topology = None
+            self.host_mask.fill_(True)
+            offset = 0
+            for length in topology:
+                end = offset + length
+                self.host_mask[offset:end, offset:end] = False
+                offset = end
+            # Keep graph padding and operator alignment padding separate, just
+            # like build_audio_attention_mask. Never expose either to real tokens.
+            self.host_mask[actual : self.budget, actual : self.budget] = False
+            self.host_mask[self.budget :, self.budget :] = False
+            self.mask.copy_(self.host_mask)
+            self._mask_topology = topology
         self.graph.replay()
         return self.output[:actual].clone()
 
