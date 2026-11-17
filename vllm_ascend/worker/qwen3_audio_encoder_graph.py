@@ -138,6 +138,8 @@ class FixedAudioEncoderGraph:
         self.gather_source: torch.Tensor | None = None
         self.gather_indices: torch.Tensor | None = None
         self.host_indices: torch.Tensor | None = None
+        self.sentinel_indices: torch.Tensor | None = None
+        self._host_indices_actual = 0
 
     def _forward(self) -> torch.Tensor:
         if self.gather_source is not None:
@@ -166,6 +168,8 @@ class FixedAudioEncoderGraph:
                 (self.source_capacity + 1, hidden_size), device=self.device, dtype=torch.float16
             )
             self.host_indices = torch.full((self.budget,), self.source_capacity, dtype=torch.int64, device="cpu")
+            self.sentinel_indices = self.host_indices.clone()
+            self._host_indices_actual = 0
             self.gather_indices = self.host_indices.to(self.device)
         else:
             self.hidden_states = torch.zeros((self.budget, hidden_size), device=self.device, dtype=torch.float16)
@@ -210,6 +214,7 @@ class FixedAudioEncoderGraph:
         """Copy a bounded CNN span; compact/pad it inside the captured body."""
         assert self.gather_source is not None
         assert self.gather_indices is not None and self.host_indices is not None
+        assert self.sentinel_indices is not None
         if indices.device.type != "cpu" or indices.dtype != torch.int64 or indices.ndim != 1:
             raise ValueError("audio gather indices must be a CPU int64 vector")
         actual = indices.numel()
@@ -220,8 +225,13 @@ class FixedAudioEncoderGraph:
         if bool((indices < 0).any()) or bool((indices >= source.shape[0]).any()):
             raise ValueError("audio gather indices are outside the CNN source span")
         self.gather_source[: source.shape[0]].copy_(source)
-        self.host_indices.fill_(self.source_capacity)
+        previous_actual = self._host_indices_actual
+        # Track every potentially modified entry, even if a host copy fails.
+        self._host_indices_actual = max(previous_actual, actual)
+        if actual < previous_actual:
+            self.host_indices[actual:previous_actual].copy_(self.sentinel_indices[actual:previous_actual])
         self.host_indices[:actual].copy_(indices)
+        self._host_indices_actual = actual
         # Blocking host copy keeps the reusable CPU tensor live until consumed.
         self.gather_indices.copy_(self.host_indices)
         return self._replay(topology, actual)
